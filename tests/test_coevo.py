@@ -367,7 +367,7 @@ def test_agent_system_clean_fails_without_docker(tmp_path, monkeypatch):
 
     monkeypatch.setattr(A, "docker_unavailable", lambda: "docker CLI not found on PATH")
 
-    (tmp_path / "raw").mkdir()
+    (tmp_path / "raw").mkdir(exist_ok=True)
     (tmp_path / "raw" / "problem.md").write_text("solve this")
     system = A.AgentSystem(raw_input_dir=tmp_path / "raw", run_dir=tmp_path / "run",
                            budget_s=60)
@@ -384,7 +384,7 @@ def test_agent_system_clean_fails_without_agent_binary(tmp_path, monkeypatch):
     monkeypatch.setattr(A, "docker_unavailable", lambda: None)
     monkeypatch.setattr(A, "agent_elf_path", lambda: None)
 
-    (tmp_path / "raw").mkdir()
+    (tmp_path / "raw").mkdir(exist_ok=True)
     (tmp_path / "raw" / "problem.md").write_text("solve this")
     system = A.AgentSystem(raw_input_dir=tmp_path / "raw", run_dir=tmp_path / "run",
                            budget_s=60)
@@ -404,7 +404,7 @@ def test_agent_bootstrap_recovers_authored_verifier_offline(tmp_path, monkeypatc
     from coscientist.coevo.eval_service import FeedbackLevel
 
     raw = tmp_path / "raw"
-    raw.mkdir()
+    raw.mkdir(exist_ok=True)
     (raw / "problem.md").write_text("maximize the value field, honestly")
 
     system = A.AgentSystem(raw_input_dir=raw, run_dir=tmp_path / "run", budget_s=120,
@@ -456,3 +456,421 @@ def test_agent_bootstrap_recovers_authored_verifier_offline(tmp_path, monkeypatc
     # v0 recorded at the boundary with agent origin
     v0 = (Path(system.run_dir) / "supervisor" / "verifier_versions" / "v0.py")
     assert v0.is_file() and "def verify" in v0.read_text()
+
+
+def _bootstrapped_system(tmp_path, monkeypatch, *, budget_s=120):
+    """An AgentSystem past bootstrap (V0 live), with docker/codex stubbed out, ready
+    to drive solve_and_evolve. Shared by the loop-guarantee tests below."""
+    from coscientist.coevo import agent_system as A
+    from coscientist.coevo.container import AgentSession, GatewayConfig
+    from coscientist.coevo.eval_service import FeedbackLevel
+
+    raw = tmp_path / "raw"
+    raw.mkdir(exist_ok=True)
+    (raw / "problem.md").write_text("maximize the value field, honestly")
+
+    system = A.AgentSystem(raw_input_dir=raw, run_dir=tmp_path / "run", budget_s=budget_s,
+                           feedback_level=FeedbackLevel.WITH_ARTIFACTS)
+    system.gateway = GatewayConfig(codex_home=Path("/nonexistent/.codex"), model="m")
+    system.agent_elf = Path("/nonexistent/codex")
+
+    verifier = (
+        "def verify(payload, ctx):\n"
+        "    try:\n"
+        "        v = float(payload.get('value', 0))\n"
+        "    except Exception:\n"
+        "        return {'feasible': False, 'raw': -1e9, 'artifacts': {}}\n"
+        "    cap = ctx.get('cap', 10)\n"
+        "    feasible = 0 <= v <= cap\n"
+        "    raw = v if feasible else -1e9\n"
+        "    return {'feasible': feasible, 'raw': raw, 'artifacts': {'value': v}}\n"
+    )
+
+    def fake_one_shot(ws, gateway, agent_elf, prompt, *, timeout_s, image,
+                      disallowed_tools=None):
+        ws = Path(ws)
+        (ws / "verifier.py").write_text(verifier)
+        (ws / "ctx.json").write_text(json.dumps({"cap": 10}))
+        (ws / "seed_solution.json").write_text(json.dumps({"value": 1}))
+        (ws / "probes.json").write_text(json.dumps([
+            {"description": "over cap", "solution": {"value": 9999}}]))
+        (ws / "SOLVER_BRIEF.md").write_text("produce {\"value\": float}")
+        (ws / "BOOTSTRAP_DONE").write_text("done")
+        return AgentSession(ok=True, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(A, "one_shot_agent", fake_one_shot)
+    system.bootstrap()
+    return system, A
+
+
+def test_loop_guarantees_a_solve_turn_after_every_harden(tmp_path, monkeypatch):
+    """The load-bearing co-evolution invariant: solve -> harden -> solve-AGAIN. When
+    a review moves V, the loop MUST run one more Solver turn so it re-baselines under
+    the new verifier. This is what the first Chowla run failed to do (harden fired at
+    the deadline and the loop broke before re-solving). Driven fully offline with a
+    fake container + fake harden — no docker, no codex."""
+    from coscientist.coevo.container import AgentSession
+
+    system, A = _bootstrapped_system(tmp_path, monkeypatch)
+
+    turns_seen = []
+    review_written = {"done": False}
+
+    class FakeContainer:
+        def __init__(self, *, workdir, gateway, agent_elf, image, **kw):
+            self.ws = Path(workdir)
+        def start(self):
+            return self
+        def stop(self):
+            pass
+        def exec_agent(self, prompt, *, timeout_s, **kw):
+            turns_seen.append({"budget": timeout_s})
+            # turn 1: leave a review request (the agent's reason for exiting).
+            if not review_written["done"]:
+                review_written["done"] = True
+                (self.ws / "review_request.json").write_text(json.dumps(
+                    {"solution": {"value": 8}, "question": "am I gaming V?"}))
+                (self.ws / "solution_out.json").write_text(json.dumps({"value": 8}))
+            else:
+                # post-harden turn: re-baseline, write a fresh best, DON'T ask again.
+                (self.ws / "solution_out.json").write_text(json.dumps({"value": 6}))
+            return AgentSession(ok=True, returncode=0, stdout="", stderr="")
+
+    class FakeControl:
+        def __init__(self, *, workdir, handler, **kw):
+            pass
+        def seed_shims(self, ws):
+            pass
+        def start(self):
+            return self
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(A, "DockerContainer", FakeContainer)
+    monkeypatch.setattr(A, "ControlSocket", FakeControl)
+
+    # a fake harden that always installs a stricter v1 (caps at 5) exactly once.
+    stricter = (
+        "def verify(payload, ctx):\n"
+        "    try:\n"
+        "        v = float(payload.get('value', 0))\n"
+        "    except Exception:\n"
+        "        return {'feasible': False, 'raw': -1e9, 'artifacts': {}}\n"
+        "    feasible = 0 <= v <= 5\n"
+        "    return {'feasible': feasible, 'raw': (v if feasible else -1e9),"
+        " 'artifacts': {'value': v}}\n"
+    )
+
+    def fake_harden(best, sol_ws, *, trigger):
+        if system.eval_service.current_version() == 0:
+            system.eval_service.install_verifier(stricter, origin="agent", note="harden")
+            system.hardenings += 1
+            system.store.event("harden_start", trigger=trigger, remaining_s=0.0)
+    monkeypatch.setattr(system, "_run_supervisor_harden", fake_harden)
+
+    system.solve_and_evolve(max_turns=8)
+
+    # exactly one harden happened, and a solve turn RAN after it.
+    assert system.hardenings == 1
+    assert system._post_harden_solves >= 1, "no re-baseline solve turn after harden"
+    assert len(turns_seen) >= 2, "loop stopped before the post-harden solve turn"
+    # V evolved and the run finalized recording the post-harden solve.
+    manifest = json.loads((Path(system.run_dir) / "manifest.json").read_text())
+    assert manifest["final_verifier_version"] == 1
+    assert manifest["post_harden_solves"] >= 1
+
+
+def test_wall_clock_turn_still_drives_a_harden(tmp_path, monkeypatch):
+    """The smoke_peak gap: a NORMAL turn that hits its wall-clock cap (codex just kept
+    working, never left a review_request) must STILL let the orchestrator drive the
+    evolve step. The old loop `break`ed on a wall-clock hit before _proactive_supervise
+    could run, so hardenings stayed 0 and the second loop never engaged. Here the fake
+    agent never asks for review and always times out; the loop must harden anyway."""
+    from coscientist.coevo.container import AgentSession
+
+    system, A = _bootstrapped_system(tmp_path, monkeypatch)
+
+    turns = {"n": 0}
+
+    class FakeContainer:
+        def __init__(self, *, workdir, gateway, agent_elf, image, **kw):
+            self.ws = Path(workdir)
+        def start(self):
+            return self
+        def stop(self):
+            pass
+        def exec_agent(self, prompt, *, timeout_s, **kw):
+            turns["n"] += 1
+            # never write review_request; always report a wall-clock timeout.
+            (self.ws / "solution_out.json").write_text(json.dumps({"value": 7}))
+            return AgentSession(ok=True, returncode=124, stdout="", stderr="",
+                                note="agent hit the wall-clock budget")
+
+    class FakeControl:
+        def __init__(self, *, workdir, handler, **kw):
+            pass
+        def seed_shims(self, ws):
+            pass
+        def start(self):
+            return self
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(A, "DockerContainer", FakeContainer)
+    monkeypatch.setattr(A, "ControlSocket", FakeControl)
+
+    stricter = (
+        "def verify(payload, ctx):\n"
+        "    try:\n"
+        "        v = float(payload.get('value', 0))\n"
+        "    except Exception:\n"
+        "        return {'feasible': False, 'raw': -1e9, 'artifacts': {}}\n"
+        "    feasible = 0 <= v <= 5\n"
+        "    return {'feasible': feasible, 'raw': (v if feasible else -1e9),"
+        " 'artifacts': {'value': v}}\n"
+    )
+    hardened = {"n": 0}
+
+    def fake_harden(best, sol_ws, *, trigger):
+        hardened["n"] += 1
+        # harden exactly once so the loop terminates (owed solve, then stable V).
+        if system.eval_service.current_version() == 0:
+            system.eval_service.install_verifier(stricter, origin="agent", note="harden")
+            system.hardenings += 1
+    monkeypatch.setattr(system, "_run_supervisor_harden", fake_harden)
+
+    system.solve_and_evolve(max_turns=4)
+
+    # the wall-clock turn drove a harden even though the agent never asked for review.
+    assert hardened["n"] >= 1, "wall-clock turn did not drive a harden (the smoke_peak bug)"
+    assert system.hardenings == 1
+    assert system._post_harden_solves >= 1, "no re-baseline solve after the wall-clock harden"
+
+
+def test_last_review_before_deadline_still_hardens_and_resolves(tmp_path, monkeypatch):
+    """Even when the review fires with almost no budget left, the reserved slices let
+    the harden complete AND the owed post-harden solve run — the exact deadline-edge
+    case the first Chowla run hit. We force it by exhausting the clock on turn 1."""
+    from coscientist.coevo.container import AgentSession
+    from coscientist.coevo.budget import Deadline
+
+    system, A = _bootstrapped_system(tmp_path, monkeypatch, budget_s=1000)
+
+    # a hand-driven clock: turn 1 consumes almost the whole budget before the review.
+    clock = {"t": 0.0}
+    system.deadline = Deadline(budget_s=1000, clock=lambda: clock["t"])
+
+    calls = {"n": 0}
+
+    class FakeContainer:
+        def __init__(self, *, workdir, gateway, agent_elf, image, **kw):
+            self.ws = Path(workdir)
+        def start(self):
+            return self
+        def stop(self):
+            pass
+        def exec_agent(self, prompt, *, timeout_s, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                clock["t"] = 995.0   # burn the budget: only 5s nominal remaining
+                (self.ws / "review_request.json").write_text(json.dumps(
+                    {"solution": {"value": 8}, "question": "?"}))
+                (self.ws / "solution_out.json").write_text(json.dumps({"value": 8}))
+            else:
+                (self.ws / "solution_out.json").write_text(json.dumps({"value": 4}))
+            return AgentSession(ok=True, returncode=0, stdout="", stderr="")
+
+    class FakeControl:
+        def __init__(self, *, workdir, handler, **kw):
+            pass
+        def seed_shims(self, ws):
+            pass
+        def start(self):
+            return self
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(A, "DockerContainer", FakeContainer)
+    monkeypatch.setattr(A, "ControlSocket", FakeControl)
+
+    hardened = {"n": 0}
+
+    def fake_harden(best, sol_ws, *, trigger):
+        # harden must be REACHED despite the near-zero remaining budget.
+        hardened["n"] += 1
+        if system.eval_service.current_version() == 0:
+            system.eval_service.install_verifier(
+                system.eval_service.current_source(), origin="agent", note="harden")
+            system.hardenings += 1
+    monkeypatch.setattr(system, "_run_supervisor_harden", fake_harden)
+
+    system.solve_and_evolve(max_turns=8)
+
+    assert hardened["n"] >= 1, "harden was skipped at the deadline edge (the old bug)"
+    assert system._post_harden_solves >= 1, "no post-harden solve at the deadline edge"
+
+
+def test_resume_rebuilds_verifier_chain_and_best_from_disk(tmp_path):
+    """8h runs must survive a crash. A resume reconstructs the evolving evaluator, the
+    hardening count, and the best-so-far entirely from runs/<id>/ — no re-bootstrap and
+    no in-memory state. We lay down a realistic tree (v0 authored, v1 hardened, one
+    candidate best under v0 that becomes infeasible under v1) and assert the resume
+    lands on v1, counts one hardening, and re-scores the best under the CURRENT V."""
+    from coscientist.coevo import agent_system as A
+    from coscientist.coevo.eval_service import FeedbackLevel
+
+    raw = tmp_path / "raw"
+    raw.mkdir(exist_ok=True)
+    (raw / "problem.md").write_text("maximize value up to a cap")
+    run_dir = tmp_path / "run"
+
+    # v0: caps at 10.  v1 (a harden): caps at 5 — so a value=8 best goes infeasible.
+    def verifier(cap):
+        return (
+            "def verify(payload, ctx):\n"
+            "    try:\n"
+            "        v = float(payload.get('value', 0))\n"
+            "    except Exception:\n"
+            "        return {'feasible': False, 'raw': -1e9, 'artifacts': {}}\n"
+            f"    feasible = 0 <= v <= {cap}\n"
+            "    return {'feasible': feasible, 'raw': (v if feasible else -1e9),"
+            " 'artifacts': {}}\n"
+        )
+
+    # bootstrap_ws (the instance + authored v0), as bootstrap() would have left it.
+    bws = run_dir / "bootstrap_ws"
+    bws.mkdir(parents=True)
+    (bws / "verifier.py").write_text(verifier(10))
+    (bws / "ctx.json").write_text(json.dumps({}))
+    (bws / "seed_solution.json").write_text(json.dumps({"value": 1}))
+    (bws / "probes.json").write_text(json.dumps(
+        [{"description": "over cap", "solution": {"value": 9999}}]))
+    (bws / "BOOTSTRAP_DONE").write_text("done")
+
+    # the recorded version chain: v0 (bootstrap) then v1 (harden).
+    vdir = run_dir / "supervisor" / "verifier_versions"
+    vdir.mkdir(parents=True)
+    (vdir / "v0.py").write_text(verifier(10))
+    (vdir / "v1.py").write_text(verifier(5))
+    (run_dir / "supervisor").mkdir(exist_ok=True)
+    (run_dir / "supervisor" / "versions.jsonl").write_text(
+        json.dumps({"version": 0, "origin": "agent", "note": "bootstrap"}) + "\n"
+        + json.dumps({"version": 1, "origin": "agent", "note": "harden"}) + "\n")
+
+    # a couple of prior events (one review already handled) + a best candidate under v0.
+    (run_dir / "events.jsonl").write_text(
+        json.dumps({"t": 1.0, "kind": "review_request", "question": "?"}) + "\n")
+    cdir = run_dir / "solver" / "candidates"
+    cdir.mkdir(parents=True)
+    (cdir / "cand_00000.json").write_text(json.dumps(
+        {"id": "cand_00000", "payload": {"value": 8}, "score": 8.0}))  # good under v0
+    (cdir / "cand_00001.json").write_text(json.dumps(
+        {"id": "cand_00001", "payload": {"value": 4}, "score": 4.0}))  # good under v1
+    (run_dir / "manifest.json").write_text(json.dumps(
+        {"mode": "agent_system", "best_solution": {"value": 8}, "best_score": 8.0}))
+
+    system = A.AgentSystem(raw_input_dir=raw, run_dir=run_dir, budget_s=60,
+                           feedback_level=FeedbackLevel.WITH_ARTIFACTS)
+    assert system.can_resume()
+    system._resume_from_disk()
+
+    # chain rebuilt to v1; exactly one hardening; the earlier review counted.
+    assert system.eval_service.current_version() == 1
+    assert system.hardenings == 1
+    assert system.reviews_handled == 1
+    # best re-scored under CURRENT V: value=8 is infeasible at cap 5, so the honest
+    # best is value=4 (=4.0), NOT the stale 8.0 the manifest recorded under v0.
+    assert system._best_payload == {"value": 4}
+    assert system._best_score == 4.0
+
+
+def test_can_resume_false_before_bootstrap(tmp_path):
+    """A fresh run_dir with no completed bootstrap must NOT be treated as resumable
+    (else --resume on a first launch would silently skip authoring the evaluator)."""
+    from coscientist.coevo import agent_system as A
+    raw = tmp_path / "raw"
+    raw.mkdir(exist_ok=True)
+    (raw / "p.md").write_text("x")
+    system = A.AgentSystem(raw_input_dir=raw, run_dir=tmp_path / "run", budget_s=60)
+    assert system.can_resume() is False
+
+
+# ---------------------------------------------------------------------------
+# parallel launcher: unique run-ids, resume-friendly spawn, disk-based status
+# ---------------------------------------------------------------------------
+def test_launcher_assigns_unique_run_ids_and_resume(tmp_path, monkeypatch):
+    """start() spawns one detached child per input with a distinct run_id, and every
+    child launches with --resume so a re-run continues from disk. We capture the argv
+    instead of really spawning (no codex/docker), and feed two inputs whose basenames
+    collide to prove run-ids are de-duplicated."""
+    from coscientist.coevo import launcher as L
+
+    calls = []
+
+    class FakePopen:
+        def __init__(self, argv, **kw):
+            calls.append({"argv": argv, "kw": kw})
+            self.pid = 1000 + len(calls)
+
+    monkeypatch.setattr(L.subprocess, "Popen", FakePopen)
+
+    a = tmp_path / "dirA" / "chowla"; a.mkdir(parents=True)
+    b = tmp_path / "dirB" / "chowla"; b.mkdir(parents=True)   # same basename
+    batch = L.Batch("case2026", runs_dir=tmp_path / "runs")
+    specs = batch.start([a, b], hours=8.0)
+
+    assert len(specs) == 2
+    ids = [s.run_id for s in specs]
+    assert len(set(ids)) == 2, f"run-ids collided: {ids}"
+    assert ids[0] == "case2026__chowla" and ids[1] == "case2026__chowla_2"
+    for c in calls:
+        assert "--resume" in c["argv"], "every child must launch resume-able"
+        assert "--solver" in c["argv"] and "codex" in c["argv"]
+        # 8h budget threaded through as seconds
+        assert str(8.0 * 3600.0) in c["argv"]
+        assert c["kw"].get("start_new_session") is True, "child must be detached"
+    # the batch manifest records pids + run-ids for later monitoring.
+    man = json.loads((tmp_path / "runs" / "case2026" / "batch.json").read_text())
+    assert {r["run_id"] for r in man["runs"]} == set(ids)
+    assert all(isinstance(r["pid"], int) for r in man["runs"])
+
+
+def test_launcher_status_reads_progress_from_disk(tmp_path):
+    """status() renders one row per run purely from each run's own tree — so it works
+    on a detached run, after a crash, or from another shell. We synthesize a run that
+    bootstrapped, took two turns (one post-harden) and stopped with one hardening."""
+    from coscientist.coevo import launcher as L
+
+    runs = tmp_path / "runs"
+    batch = L.Batch("b", runs_dir=runs)
+    run_id = "b__demo"
+    rd = runs / run_id
+    rd.mkdir(parents=True)
+    (rd / "manifest.json").write_text(json.dumps({
+        "final_verifier_version": 1, "verifier_hardenings": 1,
+        "post_harden_solves": 1, "best_score": -0.42}))
+    (rd / "events.jsonl").write_text("\n".join(json.dumps(e) for e in [
+        {"kind": "run_start"}, {"kind": "bootstrap_done"},
+        {"kind": "solver_turn_start", "post_harden": False},
+        {"kind": "harden_start"},
+        {"kind": "solver_turn_start", "post_harden": True},
+        {"kind": "run_stop", "hardenings": 1, "post_harden_solves": 1,
+         "best_score": -0.42},
+    ]) + "\n")
+    # a batch manifest pointing at a dead pid (0 => not alive).
+    (runs / "b").mkdir(parents=True, exist_ok=True)
+    (runs / "b" / "batch.json").write_text(json.dumps(
+        {"batch": "b", "runs": [{"run_id": run_id, "pid": 0}]}))
+
+    rows = batch.status()
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["bootstrapped"] is True
+    assert r["solver_turns"] == 2
+    assert r["post_harden_solves"] == 1
+    assert r["hardenings"] == 1
+    assert r["final_verifier_version"] == 1
+    assert r["best_score"] == -0.42
+    assert r["stopped"] is True
+    assert r["alive"] is False
+

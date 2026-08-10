@@ -173,6 +173,13 @@ class AgentSystem:
     feedback_level: FeedbackLevel = FeedbackLevel.WITH_ARTIFACTS
     bootstrap_timeout_s: float = 900.0
     harden_timeout_s: float = 600.0
+    # A harden is only meaningful if the Solver then RE-BASELINES under the new V.
+    # We keep a protected slice for that guaranteed post-harden solve turn, and a
+    # floor so a budget-squeezed normal turn still gets usable time. Normal turns
+    # are capped to leave (harden_timeout_s + post_harden_solve_s) in reserve, so
+    # even the LAST review before the deadline can still harden AND re-solve.
+    post_harden_solve_s: float = 900.0
+    min_solver_turn_s: float = 60.0
 
     gateway: Optional[GatewayConfig] = None
     agent_elf: Optional[Path] = None
@@ -188,6 +195,11 @@ class AgentSystem:
     _best_score: float = field(default=float("-inf"), init=False)
     hardenings: int = field(default=0, init=False)
     reviews_handled: int = field(default=0, init=False)
+    # set True whenever a harden moves V; the loop then OWES one solve turn so the
+    # Solver re-baselines under the new verifier (a co-evolution round is only
+    # complete as solve -> harden -> solve-again). Cleared once that turn runs.
+    _owe_post_harden_solve: bool = field(default=False, init=False)
+    _post_harden_solves: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         self.raw_input_dir = Path(self.raw_input_dir).resolve()
@@ -293,15 +305,41 @@ class AgentSystem:
         try:
             container.start()
             turn = 0
-            while turn < max_turns and not self.deadline.expired():
+            while True:
+                # A harden that moved V leaves us OWING one solve turn so the
+                # Solver re-baselines under the new verifier — that owed turn runs
+                # even past the nominal deadline. Otherwise stop on turns/deadline.
+                owed = self._owe_post_harden_solve
+                if not owed:
+                    if turn >= max_turns or self.deadline.expired():
+                        break
                 turn += 1
+                # Normal turns leave a reserve so the LAST review before the
+                # deadline can still harden AND get its post-harden solve. The owed
+                # turn itself is not reserve-capped — it is the post-harden solve.
                 remaining = self.deadline.remaining()
-                if remaining <= 5:
-                    break
+                if owed:
+                    turn_budget = max(self.min_solver_turn_s,
+                                      min(self.post_harden_solve_s, remaining)
+                                      if remaining > 0 else self.post_harden_solve_s)
+                else:
+                    reserve = self.harden_timeout_s + self.post_harden_solve_s
+                    turn_budget = remaining - reserve
+                    if turn_budget < self.min_solver_turn_s:
+                        # not enough left for a normal turn; only proceed if we can
+                        # still fit the floor, else stop and let finalize run.
+                        if remaining <= self.min_solver_turn_s:
+                            break
+                        turn_budget = self.min_solver_turn_s
                 self.store.event("solver_turn_start", turn=turn,
-                                 remaining_s=round(remaining, 1))
+                                 remaining_s=round(remaining, 1),
+                                 turn_budget_s=round(turn_budget, 1),
+                                 post_harden=owed)
+                if owed:
+                    self._owe_post_harden_solve = False
+                    self._post_harden_solves += 1
                 session = container.exec_agent(
-                    self._solver_prompt(turn), timeout_s=remaining)
+                    self._solver_prompt(turn), timeout_s=turn_budget)
                 self.store.cost(who="solver", kind="agent_turn", calls=1,
                                 ok=session.ok, turn=turn)
                 self._extract_best(sol_ws)
@@ -309,15 +347,37 @@ class AgentSystem:
                 # did the agent leave a review request? (its reason for exiting)
                 review_req = sol_ws / "review_request.json"
                 if review_req.is_file():
+                    before = self.eval_service.current_version()  # type: ignore[union-attr]
                     self._handle_review_request(review_req, sol_ws)
                     review_req.unlink()
+                    # if V moved, OWE a re-baseline solve turn (guaranteed to run).
+                    if self.eval_service.current_version() > before:  # type: ignore[union-attr]
+                        self._owe_post_harden_solve = True
                     continue   # resume: next turn in the SAME container
+
+                # The turn we just ran WAS the guaranteed post-harden re-baseline; do
+                # NOT harden again right after it. Loop to the top so a fresh normal
+                # turn (if budget remains) drives the next round, else we stop there.
+                # This bounds over-run to the single owed turn already in flight.
+                if owed:
+                    continue
+
+                # A NORMAL turn finished — cleanly OR by hitting its wall-clock cap.
+                # In BOTH cases the ORCHESTRATOR (not the agent) drives the evolve
+                # step: red-team + maybe harden. This is "the system moves the second
+                # Solver" the design calls for — we never depend on the agent
+                # voluntarily exiting (codex often just works until it is stopped, as
+                # the first Chowla/peak runs showed). A timed-out normal turn still
+                # has the reserved harden+post-harden budget, so hardening is safe.
+                if self._proactive_supervise(sol_ws):
+                    self._owe_post_harden_solve = True
+                    continue
+                # V is stable. If the agent hit its wall clock it still had work to
+                # do → give it another turn (more compute on the same V). If it
+                # finished on its own with a stable V, nothing is left to do → stop.
                 if session.note.startswith("agent hit the wall-clock"):
-                    break
-                # agent finished without asking — one proactive supervisor pass,
-                # then stop if nothing changed.
-                if not self._proactive_supervise(sol_ws):
-                    break
+                    continue
+                break
         finally:
             container.stop()
             control.stop()
@@ -371,8 +431,6 @@ class AgentSystem:
 
     def _run_supervisor_harden(self, best: dict, sol_ws: Path, *, trigger: str) -> None:
         assert self.gateway and self.agent_elf and self.eval_service
-        if self.deadline.expired():
-            return
         ws = self.run_dir / "harden_ws"
         if ws.exists():
             _rmtree(ws)
@@ -386,11 +444,15 @@ class AgentSystem:
             json.dumps(self._probe_report(), indent=2))
 
         remaining = self.deadline.remaining()
+        # Harden runs on its OWN protected timeout, not `remaining`: the loop keeps
+        # (harden_timeout_s + post_harden_solve_s) in reserve, so even a review that
+        # fires right at the deadline still gets a full harden. Capping by `remaining`
+        # here is what starved the harden to ~0s in the first Chowla run.
         self.store.event("harden_start", trigger=trigger,
                          remaining_s=round(remaining, 1))
         session = one_shot_agent(
             ws, self.gateway, self.agent_elf, _HARDEN_PROMPT,
-            timeout_s=min(self.harden_timeout_s, remaining), image=self.image)
+            timeout_s=self.harden_timeout_s, image=self.image)
         self.store.cost(who="supervisor", kind="harden_session", calls=1, ok=session.ok)
 
         verdict = _read_json(ws / "verdict.json", default={})
@@ -482,18 +544,109 @@ class AgentSystem:
         final_v = svc.current_version() if svc else -1
         self.store.event("run_stop", final_verifier_version=final_v,
                          hardenings=self.hardenings, reviews=self.reviews_handled,
+                         post_harden_solves=self._post_harden_solves,
                          best_score=self._best_score)
         self.store.finalize_manifest({
             "final_verifier_version": final_v,
             "verifier_hardenings": self.hardenings,
             "reviews_handled": self.reviews_handled,
+            "post_harden_solves": self._post_harden_solves,
             "best_score": self._best_score if self._best_score != float("-inf") else None,
             "best_solution": self._best_payload,
         })
 
+    # -- resume -----------------------------------------------------------
+    def can_resume(self) -> bool:
+        """True if this run_dir already holds a completed bootstrap to resume from.
+
+        The 8h runs must survive a crash/OOM/host reboot. Everything needed to
+        continue is already on disk (the store never depended on in-memory state):
+        the authored evaluator chain (``verifier_versions/v*.py``), the instance
+        (``bootstrap_ws/{ctx,seed_solution,probes}.json``), and the best-so-far
+        (``manifest.json`` / ``solver/candidates/``). ``can_resume`` just checks the
+        bootstrap boundary was crossed."""
+        bws = self.run_dir / "bootstrap_ws"
+        return ((bws / "verifier.py").is_file()
+                and (self.run_dir / "supervisor" / "verifier_versions" / "v0.py").is_file())
+
+    def _resume_from_disk(self) -> None:
+        """Rebuild evaluator + counters + best-so-far from ``runs/<id>/`` (no re-bootstrap)."""
+        vdir = self.run_dir / "supervisor" / "verifier_versions"
+        bws = self.run_dir / "bootstrap_ws"
+        # 1. rebuild the FULL version chain in order (v0 = bootstrap, v1.. = hardens).
+        metas = {}
+        for line in _read_lines(vdir.parent / "versions.jsonl"):
+            try:
+                m = json.loads(line)
+                metas[int(m.get("version", -1))] = m
+            except (json.JSONDecodeError, ValueError):
+                continue
+        from ..demo.evaluator import VerifierVersion
+        self.evaluator = Evaluator()
+        n = 0
+        while (vdir / f"v{n}.py").is_file():
+            src = (vdir / f"v{n}.py").read_text(encoding="utf-8")
+            m = metas.get(n, {})
+            self.evaluator.versions.append(
+                VerifierVersion(n, src, m.get("origin", "agent"), m.get("note", "")))
+            n += 1
+        if not self.evaluator.versions:   # defensive: fall back to the bootstrap source
+            self.evaluator.versions.append(_version0((bws / "verifier.py").read_text()))
+        # each version past v0 is one installed hardening.
+        self.hardenings = max(0, len(self.evaluator.versions) - 1)
+        # 2. instance + red-team, from the bootstrap workspace.
+        self._ctx = _read_json(bws / "ctx.json", default={})
+        self._seed = _read_json(bws / "seed_solution.json", default={})
+        probes_raw = _read_json(bws / "probes.json", default=[])
+        self._probes = [p for p in probes_raw
+                        if isinstance(p, dict) and "solution" in p] \
+            if isinstance(probes_raw, list) else []
+        # 3. reviews handled = count of review_request events already processed.
+        self.reviews_handled = sum(
+            1 for ln in _read_lines(self.run_dir / "events.jsonl")
+            if '"review_request"' in ln)
+        # 4. wire the black box, then recover best-so-far by re-scoring under CURRENT V.
+        self.eval_service = EvalService(
+            evaluator=self.evaluator, ctx_provider=lambda: self._ctx,
+            feedback_level=self.feedback_level)
+        self.eval_service.on_query = lambda rec, res: self.store.query(_query_line(rec))
+        self._recover_best_from_disk()
+        self.store.event("resume", from_version=self.eval_service.current_version(),
+                         hardenings=self.hardenings, reviews=self.reviews_handled,
+                         best_score=(self._best_score
+                                     if self._best_score != float("-inf") else None))
+
+    def _recover_best_from_disk(self) -> None:
+        """Re-score prior candidates + the manifest best under the CURRENT verifier.
+
+        Scores from earlier versions are stale after a harden, so we recompute rather
+        than trust the recorded number — the best under v0 may be infeasible under v2."""
+        svc = self.eval_service
+        assert svc is not None
+        cands: list[dict] = []
+        cdir = self.run_dir / "solver" / "candidates"
+        if cdir.is_dir():
+            for cf in sorted(cdir.glob("cand_*.json")):
+                obj = _read_json(cf, default={})
+                if isinstance(obj, dict) and isinstance(obj.get("payload"), dict):
+                    cands.append(obj["payload"])
+        man = _read_json(self.run_dir / "manifest.json", default={})
+        if isinstance(man.get("best_solution"), dict):
+            cands.append(man["best_solution"])
+        for payload in cands:
+            r = svc.query(payload)
+            if r.ok and r.score is not None and r.score > self._best_score:
+                self._best_score, self._best_payload = r.score, payload
+
     # -- top-level entry --------------------------------------------------
-    def run(self, *, max_turns: int = 12) -> "AgentSystem":
+    def run(self, *, max_turns: int = 12, resume: bool = False) -> "AgentSystem":
         self.preflight()
+        if resume and self.can_resume():
+            self.store.event("run_start", budget_s=self.budget_s, mode="agent_system",
+                             resumed=True)
+            self._resume_from_disk()
+            self.solve_and_evolve(max_turns=max_turns)
+            return self
         self.store.write_manifest({
             "mode": "agent_system",
             "raw_input_dir": str(self.raw_input_dir),
@@ -512,6 +665,7 @@ class AgentSystem:
                 self.eval_service.current_version() if self.eval_service else -1,
             "verifier_hardenings": self.hardenings,
             "reviews_handled": self.reviews_handled,
+            "post_harden_solves": self._post_harden_solves,
             "best_score": self._best_score if self._best_score != float("-inf") else None,
             "best_solution": self._best_payload,
         }
@@ -532,6 +686,15 @@ def _read_json(path: Path, *, default):
         return json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return default
+
+
+def _read_lines(path: Path) -> list[str]:
+    if not path.is_file():
+        return []
+    try:
+        return path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
 
 
 def _copy_tree(src: Path, dst: Path) -> None:

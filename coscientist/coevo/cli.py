@@ -141,13 +141,19 @@ def run_agent_system(args) -> None:
 
     raw = _resolve_raw_input(args)
     run_dir = Path(args.runs_dir) / args.run_id
+    opt = {}
+    if getattr(args, "bootstrap_timeout_s", None):
+        opt["bootstrap_timeout_s"] = args.bootstrap_timeout_s
+    if getattr(args, "harden_timeout_s", None):
+        opt["harden_timeout_s"] = args.harden_timeout_s
+    if getattr(args, "post_harden_solve_s", None):
+        opt["post_harden_solve_s"] = args.post_harden_solve_s
     system = AgentSystem(
         raw_input_dir=raw, run_dir=run_dir,
         budget_s=args.budget_s if args.budget_s is not None
         else args.budget_hours * 3600.0,
         feedback_level=FeedbackLevel(args.feedback),
-        **({"bootstrap_timeout_s": args.bootstrap_timeout_s}
-           if getattr(args, "bootstrap_timeout_s", None) else {}),
+        **opt,
     )
     print("=" * 72)
     print("Co-Scientist coevo — GENERAL agent system (the system builds its own eval)")
@@ -157,7 +163,7 @@ def run_agent_system(args) -> None:
     print(f"budget    : {system.budget_s:.0f}s")
     print("-" * 72)
     try:
-        system.run(max_turns=args.max_turns)
+        system.run(max_turns=args.max_turns, resume=getattr(args, "resume", False))
     except AgentSystemUnavailable as e:
         print(f"\nagent system unavailable (clean stop): {e}")
         print("This path needs docker + the claude agent binary + a model gateway.")
@@ -207,6 +213,16 @@ def main() -> None:
     ap.add_argument("--bootstrap-timeout-s", type=float, default=None,
                     help="wall-clock cap for the Supervisor bootstrap agent turn "
                          "(agent-system path; default in AgentSystem, ~900s)")
+    ap.add_argument("--harden-timeout-s", type=float, default=None,
+                    help="protected wall-clock cap for each Supervisor harden turn "
+                         "(agent-system path; default ~600s)")
+    ap.add_argument("--post-harden-solve-s", type=float, default=None,
+                    help="protected budget for the guaranteed post-harden Solver turn "
+                         "(agent-system path; default ~900s)")
+    ap.add_argument("--resume", action="store_true",
+                    help="resume an interrupted agent-system run from runs/<run-id>/ "
+                         "(rebuilds V chain, hardenings, and best-so-far from disk; "
+                         "skips re-bootstrap). No-op if no completed bootstrap is found.")
     ap.add_argument("--runs-dir", default="runs", help="parent dir for run storage")
     ap.add_argument("--run-id", default="coevo_demo", help="run id (subdir under runs-dir)")
     ap.add_argument("--seed", type=int, default=0)

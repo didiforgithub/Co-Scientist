@@ -20,6 +20,7 @@ env/
 
 # Run artifacts — experiment outputs, never committed
 runs/
+runs_*.log
 
 # Editor / OS
 .vscode/
