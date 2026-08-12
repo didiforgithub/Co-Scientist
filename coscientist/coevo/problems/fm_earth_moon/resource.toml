@@ -10,12 +10,16 @@
 # the verifier never inherits the solver slice.
 #
 # The solver is a codex agent doing math reasoning: no GPU, but give it real
-# CPU/memory headroom. --network none is SAFE here — codex reaches the host
-# gateway over a bind-mounted unix socket (CONTROL_SOCK), never TCP.
+# CPU/memory headroom. INTERNET IS ON (allow_internet=true): codex's own LLM
+# inference goes over the NETWORK to the remote API (auth.json / chatgpt token),
+# NOT over the CONTROL_SOCK unix socket — the socket only carries the
+# orchestrator's eval/status/ask shims. Cutting the network (--network none)
+# would BLIND codex and it could not think at all. If Search must be restricted,
+# do it via the agent's tool policy (--disallowedTools), never by pulling the net.
 [solver]
 image = "python:3.11-slim"
 cpus = 4
 memory_mb = 8192
-allow_internet = false
+allow_internet = true
 
 # [verifier] intentionally omitted -> host-subprocess verify (LLM creds reachable).

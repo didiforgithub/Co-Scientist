@@ -44,9 +44,24 @@ import re
 import signal
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+
+# -- anti-interruption knobs (ported from SForge's resume loop) --------------
+# SForge keeps a run alive to its FULL wall-clock budget with three cooperating
+# ideas (harness/run_agent.py:523-595): (ii) an outer respawn loop where a child
+# exiting BEFORE its budget is treated as premature and relaunched with --resume;
+# a MIN-RUNTIME floor so a child that dies in seconds (systematic failure: bad
+# ELF/creds) is NOT hot-looped; and a hard respawn cap. We mirror all three, but
+# decrement the budget by real wall-clock elapsed so the TOTAL stays ~budget_s
+# across crashes (a fresh Deadline would otherwise grant a full budget on resume).
+MIN_RUNTIME_FOR_RESPAWN_S = 45.0   # died faster than this since last launch => systematic
+MAX_RESPAWNS = 100                 # backstop against a crash-loop (SForge uses 100)
+MIN_REMAINING_TO_RESPAWN_S = 90.0  # don't relaunch for a sliver of budget
+
 
 
 def _slug(text: str) -> str:
@@ -112,11 +127,23 @@ class Batch:
         for spec in specs:
             pid = self._spawn(spec, budget_s=budget_s, python=python,
                               extra_args=extra_args or [])
+            now = time.time()
             records.append({"run_id": spec.run_id, "input_dir": str(spec.input_dir),
                             "log": str(spec.log_path), "pid": pid,
-                            "budget_s": budget_s})
+                            "budget_s": budget_s,
+                            # absolute wall-clock expiry: the TOTAL budget is anchored
+                            # once, so respawns after a crash charge only the REMAINING
+                            # time (a fresh child Deadline would otherwise reset it).
+                            "deadline_epoch": now + budget_s,
+                            "last_launch_epoch": now,
+                            "respawns": 0,
+                            "resource_config":
+                                str(spec.resource_config) if spec.resource_config else None,
+                            "gpu_device": spec.gpu_device})
         self._write_manifest({"batch": self.batch, "hours": hours,
                               "runs_dir": str(self.runs_dir.resolve()),
+                              "python": python,
+                              "extra_args": list(extra_args or []),
                               "runs": records})
         return specs
 
@@ -124,8 +151,13 @@ class Batch:
                     extra_args: list[str]) -> list[str]:
         argv = [python, "-m", "coscientist.coevo.cli",
                 "--input", str(spec.input_dir),
-                "--solver", "codex", "--supervisor", "none",
+                "--solver", "codex", "--supervisor", "no-human-no-proxy",
                 "--budget-s", str(budget_s),
+                # The wall-clock budget is the ONLY intended stop signal (SForge's
+                # "timeout = done" philosophy). The default max_turns=12 would end an
+                # 8h run in minutes, so lift the turn cap far above any real run —
+                # solve_and_evolve then loops until self.deadline.expired().
+                "--max-turns", "100000",
                 "--resume",
                 "--runs-dir", str(self.runs_dir),
                 "--run-id", spec.run_id]
@@ -152,6 +184,111 @@ class Batch:
                                  start_new_session=True, env=env,
                                  cwd=str(Path(__file__).resolve().parents[2]))
         return proc.pid
+
+    # -- anti-interruption: respawn crashed children until budget is spent ----
+    def _respawn_tick(self, *, now: Optional[float] = None) -> list[dict]:
+        """One supervision pass: relaunch any dead-but-not-done run with --resume.
+
+        SForge's insight (harness/run_agent.py:523-595): a child exiting BEFORE its
+        wall-clock budget is *premature*, not *done* — so respawn it (state is on
+        disk; --resume rebuilds the V-chain + best-so-far). Only three things stop a
+        respawn: the run finished cleanly (a ``run_stop`` event), the absolute budget
+        deadline passed, or the child kept dying too fast / too often (systematic
+        failure — see the MIN_RUNTIME / MAX_RESPAWNS floors). Idempotent and
+        disk-driven, so the watcher itself is crash-safe: re-reading the manifest
+        after a watcher restart resumes supervision exactly where it left off.
+
+        Returns one action dict per run describing what happened this tick.
+        """
+        now = time.time() if now is None else now
+        man = self._read_manifest()
+        runs = man.get("runs", [])
+        python = man.get("python", sys.executable)
+        extra_args = man.get("extra_args", []) or []
+        actions = []
+        changed = False
+        for r in runs:
+            run_id = r["run_id"]
+            action = {"run_id": run_id, "action": "none"}
+            if _alive(r.get("pid")):
+                action["action"] = "alive"
+                actions.append(action)
+                continue
+            # dead child. Was it DONE (clean stop) or did it die prematurely?
+            run_dir = self.runs_dir / run_id
+            if self._progress(run_dir).get("stopped"):
+                action["action"] = "done"
+                actions.append(action)
+                continue
+            deadline = r.get("deadline_epoch")
+            if deadline is not None and now >= deadline:
+                action["action"] = "budget_spent"
+                actions.append(action)
+                continue
+            # premature death. Guard against a crash-loop before relaunching.
+            ran_for = now - r.get("last_launch_epoch", now)
+            if ran_for < MIN_RUNTIME_FOR_RESPAWN_S:
+                action.update(action="held_systematic", ran_for=round(ran_for, 1))
+                actions.append(action)
+                continue
+            if r.get("respawns", 0) >= MAX_RESPAWNS:
+                action["action"] = "held_max_respawns"
+                actions.append(action)
+                continue
+            remaining = (deadline - now) if deadline is not None else r.get("budget_s", 0.0)
+            if remaining < MIN_REMAINING_TO_RESPAWN_S:
+                action["action"] = "budget_spent"
+                actions.append(action)
+                continue
+            # relaunch with the REMAINING budget so the total stays ~budget_s.
+            spec = LaunchSpec(
+                run_id=run_id, input_dir=Path(r["input_dir"]),
+                log_path=Path(r["log"]),
+                resource_config=(Path(r["resource_config"])
+                                 if r.get("resource_config") else None),
+                gpu_device=r.get("gpu_device"))
+            pid = self._spawn(spec, budget_s=remaining, python=python,
+                              extra_args=extra_args)
+            r["pid"] = pid
+            r["last_launch_epoch"] = now
+            r["respawns"] = r.get("respawns", 0) + 1
+            changed = True
+            action.update(action="respawned", pid=pid, respawns=r["respawns"],
+                          remaining_s=round(remaining, 1))
+            actions.append(action)
+        if changed:
+            self._write_manifest(man)
+        return actions
+
+    def watch(self, *, interval_s: float = 30.0,
+              max_ticks: Optional[int] = None) -> None:
+        """Block, respawning crashed children until every run is done or budget-spent.
+
+        This is the outer control plane the 8h batch runs under: launch, then
+        ``watch`` keeps them alive to the full wall clock. Exits when no run is still
+        live AND none is respawn-eligible (all done or all budget-spent). Safe to Ctrl-C
+        and re-run — supervision state lives in the batch manifest on disk."""
+        terminal = {"done", "budget_spent", "held_max_respawns"}
+        ticks = 0
+        while True:
+            actions = self._respawn_tick()
+            live = [a for a in actions if a["action"] in ("alive", "respawned")]
+            held = [a for a in actions if a["action"] == "held_systematic"]
+            for a in actions:
+                if a["action"] in ("respawned", "held_max_respawns"):
+                    print(f"  [{time.strftime('%H:%M:%S')}] {a['run_id']}: {a['action']}"
+                          + (f" (respawn #{a.get('respawns')}, "
+                             f"{a.get('remaining_s')}s left)"
+                             if a["action"] == "respawned" else ""))
+            ticks += 1
+            # done when nothing is alive/respawned and nothing is transiently held
+            # (a held_systematic child may still cross the MIN_RUNTIME floor next tick).
+            if not live and not held:
+                if all(a["action"] in terminal for a in actions):
+                    break
+            if max_ticks is not None and ticks >= max_ticks:
+                break
+            time.sleep(max(1.0, interval_s))
 
     # -- monitoring -------------------------------------------------------
     def status(self) -> list[dict]:
@@ -289,10 +426,21 @@ def main(argv: Optional[list[str]] = None) -> None:
     sp.add_argument("--python", default=sys.executable)
     sp.add_argument("--dry-run", action="store_true",
                     help="resolve run-ids + argv and print the launch plan; spawn nothing")
+    sp.add_argument("--watch", action="store_true",
+                    help="after launching, block and respawn any crashed child with "
+                         "--resume until every run is done or its budget is spent "
+                         "(the anti-interruption control plane for 8h runs).")
+    sp.add_argument("--watch-interval-s", type=float, default=30.0,
+                    help="seconds between respawn-supervision passes when --watch is set")
 
     st = sub.add_parser("status", help="show a table of all runs in a batch")
     st.add_argument("--batch", required=True)
     st.add_argument("--runs-dir", default="runs")
+
+    wp = sub.add_parser("watch", help="respawn crashed children until budget is spent")
+    wp.add_argument("--batch", required=True)
+    wp.add_argument("--runs-dir", default="runs")
+    wp.add_argument("--interval-s", type=float, default=30.0)
 
     kp = sub.add_parser("stop", help="SIGTERM every run in a batch (resume-able after)")
     kp.add_argument("--batch", required=True)
@@ -312,10 +460,19 @@ def main(argv: Optional[list[str]] = None) -> None:
               f"({args.hours}h each, parallel, --resume):")
         for s in specs:
             print(f"  {s.run_id:<34} <- {s.input_dir}   log: {s.log_path}")
-        print(f"\nwatch:  python -m coscientist.coevo.launcher status "
+        print(f"\nstatus: python -m coscientist.coevo.launcher status "
               f"--batch {args.batch}")
+        print(f"watch : python -m coscientist.coevo.launcher watch "
+              f"--batch {args.batch}")
+        if args.watch:
+            print("\n[watch] supervising — respawning crashed children until budget "
+                  "is spent (Ctrl-C to detach; runs keep going, re-run watch anytime).")
+            batch.watch(interval_s=args.watch_interval_s)
     elif args.cmd == "status":
         _print_status(batch.status())
+    elif args.cmd == "watch":
+        print(f"[watch] supervising batch {args.batch!r} — Ctrl-C to detach.")
+        batch.watch(interval_s=args.interval_s)
     elif args.cmd == "stop":
         for r in batch.stop():
             print(f"  {r['run_id']:<34} pid={r['pid']} "

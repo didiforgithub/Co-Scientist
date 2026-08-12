@@ -45,7 +45,7 @@ def _small():
     return taskspec.ls_fit(taskspec._FREQ_POOL[:2])
 
 
-def _offline_run(tmp_path: Path, *, mode=SupervisorMode.NONE, budget_s=None,
+def _offline_run(tmp_path: Path, *, mode=SupervisorMode.NO_HUMAN_NO_PROXY, budget_s=None,
                  step_seconds=60.0, max_steps=60):
     """A fully deterministic stub run under a logical clock."""
     cfg = CoevoConfig(
@@ -117,7 +117,7 @@ def test_red_team_detects_v0_hole_then_clean_after_harden():
 
 def test_none_mode_hardens_without_advisor():
     """Autonomy: with no advisor the Supervisor still hardens on probe evidence."""
-    sup = Supervisor(eval=_service(), mode=SupervisorMode.NONE, advisor=None)
+    sup = Supervisor(eval=_service(), mode=SupervisorMode.NO_HUMAN_NO_PROXY, advisor=None)
     assert sup.observe_and_harden() is True
     assert sup.hardened_count == 1
 
@@ -219,7 +219,7 @@ def test_storage_layout_written(tmp_path):
 
 def test_no_gate_the_supervisor_always_changes_v(tmp_path):
     """Structural anti-collapse: even in none mode (no human/proxy) V changes."""
-    run = _offline_run(tmp_path, mode=SupervisorMode.NONE)
+    run = _offline_run(tmp_path, mode=SupervisorMode.NO_HUMAN_NO_PROXY)
     assert run.supervisor.hardened_count >= 1
     events = [json.loads(l) for l in
               (Path(run.store.root) / "events.jsonl").read_text().strip().splitlines()]
@@ -538,13 +538,20 @@ def test_loop_guarantees_a_solve_turn_after_every_harden(tmp_path, monkeypatch):
 
     class FakeControl:
         def __init__(self, *, workdir, handler, **kw):
-            pass
+            self.workdir = workdir
         def seed_shims(self, ws):
             pass
         def start(self):
             return self
         def stop(self):
             pass
+        @property
+        def needs_explicit_mount(self):
+            return False
+        @property
+        def host_path(self):
+            from pathlib import Path as _P
+            return _P(self.workdir) / ".control.sock"
 
     monkeypatch.setattr(A, "DockerContainer", FakeContainer)
     monkeypatch.setattr(A, "ControlSocket", FakeControl)
@@ -608,13 +615,20 @@ def test_wall_clock_turn_still_drives_a_harden(tmp_path, monkeypatch):
 
     class FakeControl:
         def __init__(self, *, workdir, handler, **kw):
-            pass
+            self.workdir = workdir
         def seed_shims(self, ws):
             pass
         def start(self):
             return self
         def stop(self):
             pass
+        @property
+        def needs_explicit_mount(self):
+            return False
+        @property
+        def host_path(self):
+            from pathlib import Path as _P
+            return _P(self.workdir) / ".control.sock"
 
     monkeypatch.setattr(A, "DockerContainer", FakeContainer)
     monkeypatch.setattr(A, "ControlSocket", FakeControl)
@@ -682,13 +696,20 @@ def test_last_review_before_deadline_still_hardens_and_resolves(tmp_path, monkey
 
     class FakeControl:
         def __init__(self, *, workdir, handler, **kw):
-            pass
+            self.workdir = workdir
         def seed_shims(self, ws):
             pass
         def start(self):
             return self
         def stop(self):
             pass
+        @property
+        def needs_explicit_mount(self):
+            return False
+        @property
+        def host_path(self):
+            from pathlib import Path as _P
+            return _P(self.workdir) / ".control.sock"
 
     monkeypatch.setattr(A, "DockerContainer", FakeContainer)
     monkeypatch.setattr(A, "ControlSocket", FakeControl)
@@ -1076,13 +1097,20 @@ def test_plateau_triggers_construction_to_proof_mode_switch(tmp_path, monkeypatc
 
     class FakeControl:
         def __init__(self, *, workdir, handler, **kw):
-            pass
+            self.workdir = workdir
         def seed_shims(self, ws):
             pass
         def start(self):
             return self
         def stop(self):
             pass
+        @property
+        def needs_explicit_mount(self):
+            return False
+        @property
+        def host_path(self):
+            from pathlib import Path as _P
+            return _P(self.workdir) / ".control.sock"
 
     monkeypatch.setattr(A, "DockerContainer", FakeContainer)
     monkeypatch.setattr(A, "ControlSocket", FakeControl)
@@ -1299,13 +1327,20 @@ def test_solver_container_gpu_and_image_knob(tmp_path, monkeypatch):
 
         class FakeControl:
             def __init__(self, *, workdir, handler, **kw):
-                pass
+                self.workdir = workdir
             def seed_shims(self, ws):
                 pass
             def start(self):
                 return self
             def stop(self):
                 pass
+            @property
+            def needs_explicit_mount(self):
+                return False
+            @property
+            def host_path(self):
+                from pathlib import Path as _P
+                return _P(self.workdir) / ".control.sock"
 
         monkeypatch_.setattr(A, "DockerContainer", FakeContainer)
         monkeypatch_.setattr(A, "ControlSocket", FakeControl)
@@ -1658,3 +1693,178 @@ def test_manifest_records_both_resource_slices(tmp_path, monkeypatch):
     assert rs["solver"]["cpus"] == 4.0 and rs["solver"]["image"] == "s:img"
     assert rs["verifier"]["cpus"] == 8.0 and rs["verifier"]["gpus"] == "1"
 
+
+
+# ---------------------------------------------------------------------------
+# anti-interruption (SForge-style): AF_UNIX short-path bind + respawn supervisor
+# ---------------------------------------------------------------------------
+def test_control_socket_uses_short_path_when_workdir_too_long(tmp_path):
+    """A deep runs/<long-id>/solver_ws/.control.sock exceeds the ~108B AF_UNIX limit
+    and would crash at bind(). ControlSocket falls back to a short /tmp bind path and
+    flags that the container must mount that file explicitly at /work/.control.sock."""
+    from coscientist.coevo.container import ControlSocket, _AF_UNIX_SAFE_LEN
+
+    # a workdir whose natural socket path blows past the limit
+    long_ws = tmp_path / ("x" * 120) / "solver_ws"
+    long_ws.mkdir(parents=True)
+    cs = ControlSocket(workdir=long_ws, handler=lambda c, a: {"ok": True})
+    assert len(str(cs._natural_path)) > _AF_UNIX_SAFE_LEN
+    assert cs.needs_explicit_mount is True
+    assert len(str(cs.host_path)) <= _AF_UNIX_SAFE_LEN
+    # stable/deterministic: a second handle on the same workdir binds the same path
+    cs2 = ControlSocket(workdir=long_ws, handler=lambda c, a: {"ok": True})
+    assert cs.host_path == cs2.host_path
+    # actually binds + serves + cleans up at the short path
+    cs.start()
+    try:
+        assert cs.host_path.exists()
+        import socket as _s, json as _j
+        c = _s.socket(_s.AF_UNIX, _s.SOCK_STREAM); c.settimeout(5)
+        c.connect(str(cs.host_path))
+        c.sendall((_j.dumps({"cmd": "status", "arg": {}}) + "\n").encode())
+        buf = b""
+        while not buf.endswith(b"\n"):
+            ch = c.recv(4096)
+            if not ch:
+                break
+            buf += ch
+        c.close()
+        assert _j.loads(buf.decode())["ok"] is True
+    finally:
+        cs.stop()
+    assert not cs.host_path.exists()
+
+
+def test_control_socket_short_workdir_stays_in_workdir(tmp_path):
+    """When the workdir path is short, nothing changes: the socket lives in the
+    workdir (reachable via -v workdir:/work) and no explicit mount is needed."""
+    from coscientist.coevo.container import ControlSocket
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    cs = ControlSocket(workdir=ws, handler=lambda c, a: {"ok": True})
+    assert cs.needs_explicit_mount is False
+    assert cs.host_path == cs._natural_path == ws / ".control.sock"
+
+
+def test_docker_container_mounts_socket_when_bound_outside_workdir(tmp_path, monkeypatch):
+    """When the control socket is bound outside the workdir, DockerContainer adds a
+    -v <host_sock>:/work/.control.sock mount so the in-container shim still finds it."""
+    from coscientist.coevo import container as C
+
+    captured = {}
+
+    class _Proc:
+        returncode = 0
+        stdout = "cid123"
+        stderr = ""
+
+    def fake_run(argv, **kw):
+        if argv[:2] == ["docker", "run"]:
+            captured["argv"] = argv
+        return _Proc()
+
+    monkeypatch.setattr(C.subprocess, "run", fake_run)
+    ws = tmp_path / "ws"; ws.mkdir()
+    gw = C.GatewayConfig(codex_home=tmp_path)
+    # a fake codex_home so _prepare_codex_home doesn't need a real auth.json
+    monkeypatch.setattr(C.shutil, "copy2", lambda *a, **k: None)
+    host_sock = tmp_path / "cs_abcdef012345.sock"
+    dc = C.DockerContainer(workdir=ws, gateway=gw, agent_elf=tmp_path / "codex",
+                           control_sock_host_path=host_sock)
+    dc.start()
+    argv = captured["argv"]
+    joined = " ".join(argv)
+    assert f"{host_sock.resolve()}:/work/.control.sock" in joined
+    dc.stop()
+
+    # and WITHOUT an explicit path, no such extra mount appears.
+    captured.clear()
+    dc2 = C.DockerContainer(workdir=ws, gateway=gw, agent_elf=tmp_path / "codex")
+    dc2.start()
+    assert ":/work/.control.sock" not in " ".join(captured["argv"])
+    dc2.stop()
+
+
+def test_launcher_respawns_crashed_child_with_remaining_budget(tmp_path, monkeypatch):
+    """A child that dies BEFORE its budget (no run_stop event) and ran long enough to
+    not look systematic is respawned with --resume and the REMAINING budget. The
+    respawn count + new pid are persisted so the watcher is itself crash-safe."""
+    from coscientist.coevo import launcher as L
+
+    spawned = []
+
+    def fake_spawn(self, spec, *, budget_s, python, extra_args):
+        spawned.append({"run_id": spec.run_id, "budget_s": budget_s,
+                        "gpu": spec.gpu_device})
+        return 4000 + len(spawned)
+
+    monkeypatch.setattr(L.Batch, "_spawn", fake_spawn)
+    # child looks dead
+    monkeypatch.setattr(L, "_alive", lambda pid: False)
+
+    runs = tmp_path / "runs"
+    batch = L.Batch("b", runs_dir=runs)
+    rid = "b__demo"
+    (runs / rid).mkdir(parents=True)          # run dir exists, but no run_stop event
+    now = 1_000_000.0
+    (runs / "b").mkdir(parents=True, exist_ok=True)
+    (runs / "b" / "batch.json").write_text(json.dumps({
+        "batch": "b", "python": "py", "extra_args": [],
+        "runs": [{"run_id": rid, "pid": 999, "input_dir": str(runs / rid),
+                  "log": str(runs / "b" / f"{rid}.log"),
+                  "budget_s": 28800.0, "deadline_epoch": now + 20000.0,
+                  "last_launch_epoch": now - 5000.0, "respawns": 0,
+                  "resource_config": None, "gpu_device": "3"}]}))
+
+    actions = batch._respawn_tick(now=now)
+    assert actions[0]["action"] == "respawned"
+    assert len(spawned) == 1
+    # remaining budget ~= deadline - now (20000), NOT the full 28800
+    assert abs(spawned[0]["budget_s"] - 20000.0) < 1.0
+    assert spawned[0]["gpu"] == "3"                   # resource pin preserved
+    man = json.loads((runs / "b" / "batch.json").read_text())
+    assert man["runs"][0]["respawns"] == 1
+    assert man["runs"][0]["pid"] == 4001
+
+
+def test_launcher_respawn_respects_done_budget_and_systematic_floors(tmp_path, monkeypatch):
+    """The respawn tick does NOT relaunch when: the run finished (run_stop present),
+    the absolute budget deadline passed, or the child died faster than the
+    MIN_RUNTIME floor (systematic failure — bad ELF/creds)."""
+    from coscientist.coevo import launcher as L
+
+    monkeypatch.setattr(L.Batch, "_spawn",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("must not respawn")))
+    monkeypatch.setattr(L, "_alive", lambda pid: False)
+
+    runs = tmp_path / "runs"
+    batch = L.Batch("b", runs_dir=runs)
+    now = 2_000_000.0
+
+    def _mk(rid, *, stopped, deadline, last_launch):
+        rd = runs / rid
+        rd.mkdir(parents=True, exist_ok=True)
+        events = [{"kind": "bootstrap_done"}]
+        if stopped:
+            events.append({"kind": "run_stop", "best_score": 1.0})
+        (rd / "events.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in events) + "\n")
+        return {"run_id": rid, "pid": 1, "input_dir": str(rd),
+                "log": str(rd / "l.log"), "budget_s": 28800.0,
+                "deadline_epoch": deadline, "last_launch_epoch": last_launch,
+                "respawns": 0, "resource_config": None, "gpu_device": None}
+
+    (runs / "b").mkdir(parents=True, exist_ok=True)
+    (runs / "b" / "batch.json").write_text(json.dumps({
+        "batch": "b", "python": "py", "extra_args": [], "runs": [
+            _mk("b__done", stopped=True, deadline=now + 5000, last_launch=now - 5000),
+            _mk("b__expired", stopped=False, deadline=now - 10, last_launch=now - 5000),
+            _mk("b__systematic", stopped=False, deadline=now + 5000, last_launch=now - 5),
+        ]}))
+
+    actions = {a["run_id"]: a["action"] for a in batch._respawn_tick(now=now)}
+    assert actions["b__done"] == "done"
+    assert actions["b__expired"] == "budget_spent"
+    assert actions["b__systematic"] == "held_systematic"

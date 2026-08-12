@@ -543,12 +543,16 @@ class AgentSystem:
         control.seed_shims(sol_ws)
         control.start()
         sol = self.resource_spec.solver
+        # If the socket had to bind outside the workdir (AF_UNIX path too long),
+        # hand the container the real bind path so it mounts it at /work/.control.sock.
+        sock_mount = control.host_path if control.needs_explicit_mount else None
         container = DockerContainer(workdir=sol_ws, gateway=self.gateway,
                                     agent_elf=self.agent_elf,
                                     image=self.solver_image or self.image,
                                     gpus=self.solver_gpus,
                                     cpus=sol.cpus, memory_mb=sol.memory_mb,
-                                    allow_internet=sol.allow_internet)
+                                    allow_internet=sol.allow_internet,
+                                    control_sock_host_path=sock_mount)
         self.store.event("solver_container_start",
                          image=self.solver_image or self.image, gpus=self.solver_gpus,
                          cpus=sol.cpus, memory_mb=sol.memory_mb,

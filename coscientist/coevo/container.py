@@ -33,16 +33,25 @@ mounted read-only, so this module carries no secrets and no hardcoded credential
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 import socket
 import stat
 import subprocess
+import tempfile
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
+
+# AF_UNIX bind paths are capped at ~108 bytes (sockaddr_un.sun_path, incl. the
+# NUL terminator). A deep ``runs/<long_run_id>/solver_ws/.control.sock`` blows
+# past that and crashes the run at bind() — so when the natural in-workdir path
+# is too long we bind at a short, STABLE /tmp path instead and mount THAT file
+# into the container at the fixed ``/work/.control.sock`` (see ControlSocket).
+_AF_UNIX_SAFE_LEN = 100
 
 
 # ---------------------------------------------------------------------------
@@ -206,10 +215,35 @@ class ControlSocket:
     _server: Optional[socket.socket] = field(default=None, init=False)
     _thread: Optional[threading.Thread] = field(default=None, init=False)
     _stop: bool = field(default=False, init=False)
+    # When the natural in-workdir bind path exceeds the AF_UNIX limit we bind at a
+    # short /tmp path and record it here; the container then bind-mounts THIS file
+    # at ``/work/.control.sock`` rather than relying on the workdir-mounted one.
+    _bind_path: Optional[Path] = field(default=None, init=False)
+
+    @property
+    def _natural_path(self) -> Path:
+        """The socket path inside the (bind-mounted) workdir — visible in-container."""
+        return Path(self.workdir) / self.sock_name
 
     @property
     def host_path(self) -> Path:
-        return Path(self.workdir) / self.sock_name
+        """The path the host actually bind()s. Short /tmp fallback if workdir is too long."""
+        if self._bind_path is not None:
+            return self._bind_path
+        natural = self._natural_path
+        if len(str(natural)) <= _AF_UNIX_SAFE_LEN:
+            return natural
+        # Deterministic short path derived from the workdir, so a resume in the
+        # SAME run rebinds the same file (idempotent; no orphan sockets pile up).
+        h = hashlib.sha1(str(Path(self.workdir).resolve()).encode()).hexdigest()[:12]
+        self._bind_path = Path(tempfile.gettempdir()) / f"cs_{h}.sock"
+        return self._bind_path
+
+    @property
+    def needs_explicit_mount(self) -> bool:
+        """True when host_path is NOT inside the workdir, so the container must
+        bind-mount the socket file explicitly at container_path."""
+        return self.host_path != self._natural_path
 
     @property
     def container_path(self) -> str:
@@ -332,6 +366,12 @@ class DockerContainer:
     cpus: Optional[float] = None
     memory_mb: Optional[int] = None
     allow_internet: bool = False
+    # When the control socket is bound OUTSIDE the workdir (AF_UNIX path-length
+    # fallback), the orchestrator passes the host bind path here so we bind-mount
+    # that file at ``/work/<control_sock_name>`` — otherwise the in-container shim
+    # would find no socket (the workdir mount wouldn't contain it). None => the
+    # socket lives in the workdir and is reachable via the ``-v workdir:/work`` mount.
+    control_sock_host_path: Optional[Path] = None
 
     _cid: Optional[str] = field(default=None, init=False)
     _started: bool = field(default=False, init=False)
@@ -368,6 +408,12 @@ class DockerContainer:
                 "-e", "CODEX_HOME=/codexhome",
                 "-e", f"CONTROL_SOCK=/work/{self.control_sock_name}",
                 "-w", "/work"]
+        if self.control_sock_host_path is not None:
+            # The socket was bound outside the workdir (AF_UNIX path too long) —
+            # mount that exact file at the fixed in-container path so the shim's
+            # CONTROL_SOCK=/work/.control.sock still resolves.
+            host_sock = Path(self.control_sock_host_path).resolve()
+            argv += ["-v", f"{host_sock}:/work/{self.control_sock_name}"]
         if self.name:
             argv += ["--name", self.name]
         # A container is "resourced" when the task's solver slice asked for any
