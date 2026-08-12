@@ -5,7 +5,7 @@ Collapse is prevented structurally: the Supervisor is the defender, and the
 direction it edits V is "harder to game," inherently adversarial to the Solver's
 gaming. Its three modes are *advisor* autonomy levels, not gatekeepers:
 
-    none    — fully autonomous; decides from its own probes + observations.
+    none/no-human-no-proxy — fully autonomous; decides from its own probes + observations.
     proxy   — a V*-holding proxy agent advises (reuses demo.human_port.AutoHuman).
     human   — a real person advises at the CLI (reuses demo.human_port.CliHuman).
 
@@ -19,7 +19,7 @@ Hack detection folds three sources, none of which requires V* (§2):
     2. the Solver's review messages — reasons about a submitted best.
     3. the submission trajectory    — score climbing while method drifts overfit.
 
-Source (1) alone lets the ``none`` mode stand on its own. proxy/human layer more
+Source (1) alone lets the autonomous mode stand on its own. proxy/human layer more
 accurate calibration on top.
 
 Producing the hardened V is pluggable (``VerifierSmith``), per the project's
@@ -40,9 +40,21 @@ from .eval_service import EvalService, FeedbackLevel
 
 
 class SupervisorMode(str, Enum):
-    NONE = "none"
+    # The Supervisor ROLE (red-team + harden) is ALWAYS active and orchestrator-driven;
+    # this enum only selects whether an EXTERNAL advisor sits beside it. The autonomous
+    # value is named for what it actually is — no human, no proxy — because "none" wrongly
+    # read as "no Supervisor at all". "none" stays accepted as a back-compat alias below.
+    NO_HUMAN_NO_PROXY = "no-human-no-proxy"
     PROXY = "proxy"
     HUMAN = "human"
+
+    @classmethod
+    def _missing_(cls, value):
+        # Back-compat: the legacy spelling "none" maps to the autonomous mode, so
+        # in-flight runs launched with `--supervisor none` still resume cleanly.
+        if isinstance(value, str) and value.strip().lower() == "none":
+            return cls.NO_HUMAN_NO_PROXY
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +93,7 @@ class Supervisor:
     """
 
     eval: EvalService
-    mode: SupervisorMode = SupervisorMode.NONE
+    mode: SupervisorMode = SupervisorMode.NO_HUMAN_NO_PROXY
     smith: VerifierSmith = field(default_factory=KnownGoodSmith)
     advisor: Optional[object] = None          # demo.human_port.HumanPort or None
     store: Optional[object] = None            # coevo.store.RunStore or None
@@ -237,7 +249,7 @@ class Supervisor:
         hold. The advisor here does NOT gate structurally — it is an autonomy dial
         the operator chose; ``none`` skips it entirely.
         """
-        if self.mode == SupervisorMode.NONE or self.advisor is None:
+        if self.mode == SupervisorMode.NO_HUMAN_NO_PROXY or self.advisor is None:
             return True
         from ..demo.human_port import Decision, ReviewRequest
 

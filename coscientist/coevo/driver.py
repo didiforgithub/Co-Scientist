@@ -65,7 +65,7 @@ class CoevoConfig:
     supervise_seconds: float = 300.0       # Supervisor observes every N real seconds (threaded path)
     max_steps: Optional[int] = 60          # safety cap for offline/finite runs
     feedback_level: FeedbackLevel = FeedbackLevel.WITH_ARTIFACTS
-    supervisor_mode: SupervisorMode = SupervisorMode.NONE
+    supervisor_mode: SupervisorMode = SupervisorMode.NO_HUMAN_NO_PROXY
     seed: int = 0
 
 

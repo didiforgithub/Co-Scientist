@@ -10,15 +10,15 @@ Examples
     # Fully offline, deterministic: stub solver + autonomous (no-human) supervisor.
     python -m coscientist.coevo.cli
 
-    # Autonomy modes for the Supervisor (§2):
-    python -m coscientist.coevo.cli --supervisor none     # decides from its own probes
+    # External-advisor level beside the ALWAYS-ON Supervisor role (§2):
+    python -m coscientist.coevo.cli --supervisor no-human-no-proxy  # autonomous, no advisor
     python -m coscientist.coevo.cli --supervisor proxy    # a V*-holding proxy advises
     python -m coscientist.coevo.cli --supervisor human    # a person advises at the CLI
 
     # A real coding agent as the Solver (needs codex on PATH):
     python -m coscientist.coevo.cli --solver codex
 
-The default (`--solver stub --supervisor none`) runs anywhere with no network,
+The default (`--solver stub --supervisor no-human-no-proxy`) runs anywhere with no network,
 no keys, and demonstrates the whole arc: the solver games v0, the supervisor's
 red-team catches it, V is hardened WITHOUT a gate, the solver re-baselines and
 retreats to an honest fit.
@@ -63,7 +63,7 @@ def _make_solver(name: str):
 
 def _make_advisor(mode: SupervisorMode):
     """proxy/human advisors reuse the demo HumanPort (it holds V* for proxy)."""
-    if mode == SupervisorMode.NONE:
+    if mode == SupervisorMode.NO_HUMAN_NO_PROXY:
         return None
     evaluator = Evaluator.initial()   # advisor's own handle to score probes
     if mode == SupervisorMode.HUMAN:
@@ -271,9 +271,13 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Co-Scientist coevo — target multi-agent system")
     ap.add_argument("--solver", default="stub", choices=["stub", "none", "no-agent", "codex"],
                     help="solver logic (default: stub, offline & deterministic)")
-    ap.add_argument("--supervisor", default="none", choices=["none", "proxy", "human"],
-                    help="Supervisor autonomy mode (§2): none=autonomous, "
-                         "proxy=V*-holding proxy advises, human=person advises at CLI")
+    ap.add_argument("--supervisor", default="no-human-no-proxy",
+                    choices=["no-human-no-proxy", "none", "proxy", "human"],
+                    help="External-advisor level beside the ALWAYS-ON Supervisor role "
+                         "(§2): no-human-no-proxy=fully autonomous (self-driven red-team "
+                         "+ harden, no advisor); proxy=V*-holding proxy advises; "
+                         "human=person advises at CLI. ('none' is a back-compat alias "
+                         "for no-human-no-proxy.)")
     ap.add_argument("--problem", default="curvefit",
                     help="curvefit (built-in demo, offline) or a built-in raw problem "
                          "name (e.g. chowla) that routes to the general agent system")
