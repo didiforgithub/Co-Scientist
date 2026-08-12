@@ -1,0 +1,39 @@
+# Resource config for K3 rwkv7_longseq — a KERNEL task with a WEAK bundled verifier.
+#
+# Goal of this run: hand the Solver a not-very-strong verifier (forward-only
+# torch.no_grad, loose rtol=atol=1e-2, single --quick shape, non-hidden seed=0),
+# let the Solver find holes (钻空子), and have the Supervisor detect + harden the
+# verifier in the co-evolution loop. So we WRAP the task's own environment/scorer.py
+# rather than replacing it — the bootstrap agent maps its pass/fail + speedup onto
+# {feasible, raw, artifacts} and copies environment/ under checker/.
+#
+# TWO ISOLATED SLICES (never shared):
+#
+# [solver] — the long-lived codex container that develops candidate.py kernels.
+#   INTERNET IS ON: codex's own LLM inference goes over the NETWORK to the remote
+#   API (auth.json / chatgpt token), NOT over the CONTROL_SOCK unix socket. Cutting
+#   the net (--network none) would BLIND codex — it could not think. (The K3
+#   instruction's "do not use the network" rule is about the CANDIDATE at scoring
+#   time; that is enforced on the verifier slice below, which is net-OFF.) It gets
+#   the CUDA image + this task's dedicated GPU so it can compile/run Triton/CUDA and
+#   time kernels while iterating.
+[solver]
+image = "pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel"
+gpus = "device=2"
+cpus = 8
+memory_mb = 32768
+allow_internet = true
+
+# [verifier] — the ISOLATED GPU verify container (the GPU verify seam). Runs the
+#   wrapped torch scorer on the SAME dedicated GPU device as this task's solver
+#   (1 GPU per task, per task.toml gpus=1), but is a SEPARATE, cred-free, NET-OFF
+#   container: the candidate must NOT reach the network or extra GPUs at scoring
+#   time (K3 rule). timeout 3600s matches task.toml [verifier].timeout_sec — a real
+#   torch scorer needs minutes, not the 10s host default.
+[verifier]
+image = "pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel"
+gpus = "device=2"
+cpus = 8
+memory_mb = 32768
+timeout_sec = 3600
+allow_internet = false

@@ -1,0 +1,10 @@
+{
+  "task": "K3_gla_longseq",
+  "baseline_score": 0.9732,
+  "baseline_correct": true,
+  "baseline_matches_ref": true,
+  "naive_score": 0.0022,
+  "naive_vs_baseline": 0.0027,
+  "headroom": 375.0,
+  "real_hard": true
+}
