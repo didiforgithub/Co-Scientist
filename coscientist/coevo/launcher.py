@@ -60,6 +60,11 @@ class LaunchSpec:
     run_id: str
     input_dir: Path
     log_path: Path
+    # Per-run resource config: an explicit --resource-config path (else the run relies
+    # on a resource.toml auto-discovered inside input_dir), and a GPU device to pin via
+    # CUDA_VISIBLE_DEVICES so a batch can place each run on a different GPU.
+    resource_config: Optional[Path] = None
+    gpu_device: Optional[str] = None
 
 
 class Batch:
@@ -117,13 +122,17 @@ class Batch:
 
     def _build_argv(self, spec: LaunchSpec, *, budget_s: float, python: str,
                     extra_args: list[str]) -> list[str]:
-        return [python, "-m", "coscientist.coevo.cli",
+        argv = [python, "-m", "coscientist.coevo.cli",
                 "--input", str(spec.input_dir),
                 "--solver", "codex", "--supervisor", "none",
                 "--budget-s", str(budget_s),
                 "--resume",
                 "--runs-dir", str(self.runs_dir),
-                "--run-id", spec.run_id, *extra_args]
+                "--run-id", spec.run_id]
+        if spec.resource_config is not None:
+            argv += ["--resource-config", str(spec.resource_config)]
+        argv += list(extra_args)
+        return argv
 
     def _spawn(self, spec: LaunchSpec, *, budget_s: float, python: str,
                extra_args: list[str]) -> int:
@@ -131,6 +140,9 @@ class Batch:
                                 extra_args=extra_args)
         env = dict(os.environ)
         env.setdefault("PYTHONPATH", str(Path(__file__).resolve().parents[2]))
+        if spec.gpu_device is not None:
+            # Pin this run to a specific GPU so a batch can spread across devices.
+            env["CUDA_VISIBLE_DEVICES"] = str(spec.gpu_device)
         log = spec.log_path.open("a", encoding="utf-8")
         log.write(f"\n===== launch {spec.run_id} (budget {budget_s:.0f}s, resume) =====\n")
         log.flush()

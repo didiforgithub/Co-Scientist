@@ -95,6 +95,16 @@ class EvalService:
     evaluator: Evaluator
     ctx_provider: Callable[[], dict]
     feedback_level: FeedbackLevel = FeedbackLevel.WITH_ARTIFACTS
+    # Host-side environment injected into the verifier/feedback subprocess (LLM
+    # creds: LLM_API_KEY/BASE_URL/MODEL). Empty by default; set by the orchestrator
+    # only, and only host-side — it NEVER reaches the Solver container. Authored
+    # feedback/verify code reads it via the injected ``llm_client``.
+    _eval_env: dict = field(default_factory=dict)
+    # Optional containerized verify backend (the isolated VERIFIER container, GPU
+    # seam). None ⇒ host-subprocess verify (default). When set, it is applied to the
+    # underlying Evaluator so every verify/feedback/validate runs in that container
+    # — the seam that keeps verifier resources SEPARATE from the Solver container.
+    _verify_backend: Optional[dict] = None
     _t0: float = field(default_factory=time.monotonic)
     _clock: Callable[[], float] = time.monotonic
     _next_qid: int = 0
@@ -103,6 +113,12 @@ class EvalService:
     # boundary hooks (set by the driver; default no-ops keep the service standalone)
     on_query: Optional[Callable[[QueryRecord, QueryResult], None]] = None
     on_install: Optional[Callable[[int, str], None]] = None
+
+    def __post_init__(self) -> None:
+        # Apply the isolated verifier backend to the underlying Evaluator so every
+        # verify/feedback/validate runs in that container. Default None ⇒ unchanged.
+        if self._verify_backend is not None:
+            self.evaluator.exec_backend = self._verify_backend
 
     # ---- Solver-facing: the black box ----------------------------------
     def query(self, payload: dict, *, who: str = "solver") -> QueryResult:
@@ -115,15 +131,22 @@ class EvalService:
         qid = self._next_qid
         self._next_qid += 1
         ver = self.evaluator.current.version
-        r = self.evaluator.run(payload, self.ctx_provider())
+        r = self.evaluator.run(payload, self.ctx_provider(), env=self._eval_env or None)
 
         if r.error is not None:
             result = QueryResult(
                 ok=False, score=None, feasible=False, detail=r.error[-200:],
                 query_id=qid, verifier_version=ver, feedback_level=self.feedback_level.value,
             )
-        else:
+        elif self.evaluator.current.feedback_src is None:
+            # legacy/default path — the frozen FeedbackLevel dial governs disclosure.
             result = self._disclose(r, qid, ver)
+        else:
+            # free-form path — an agent-authored feedback module decides what the
+            # Solver sees. score/feasible stay authoritative from verify; detail +
+            # artifacts come from feedback. A feedback failure falls back to _disclose
+            # so a broken strategy never breaks a solver turn.
+            result = self._disclose_authored(r, qid, ver, payload)
 
         rec = QueryRecord(
             query_id=qid, t=self._clock() - self._t0, who=who,
@@ -155,9 +178,39 @@ class EvalService:
         res.artifacts = dict(r.artifacts or {})
         return res
 
+    def _disclose_authored(self, r, qid: int, ver: int, payload: dict) -> QueryResult:
+        """Run the version's agent-authored feedback module; fall back to _disclose.
+
+        The verifier's score/feasibility remain authoritative — the feedback module
+        only shapes what diagnostic detail the Solver receives (more, less, or NL
+        guidance from an LLM). ``history`` is a bounded tail of prior scores so the
+        strategy can react to a plateau. Any failure → the frozen disclosure."""
+        fb_src = self.evaluator.current.feedback_src
+        history = [q.returned_score for q in self.queries[-8:]
+                   if q.returned_score is not None]
+        try:
+            fb = self.evaluator.run_feedback(
+                payload, self.ctx_provider(),
+                {"feasible": r.feasible, "raw": r.raw, "artifacts": dict(r.artifacts or {})},
+                history, feedback_src=fb_src, env=self._eval_env or None)
+        except Exception:  # noqa: BLE001 — never let feedback break a turn
+            fb = {}
+        if not fb:
+            res = self._disclose(r, qid, ver)
+            return res
+        res = QueryResult(
+            ok=True, score=r.raw, feasible=r.feasible, query_id=qid,
+            verifier_version=ver, feedback_level="authored")
+        art = fb.get("artifacts")
+        res.artifacts = dict(art) if isinstance(art, dict) else None
+        res.detail = str(fb.get("detail", ""))[:2000]
+        return res
+
     @staticmethod
     def _returned_keys(result: QueryResult) -> list:
         keys = []
+        if result.feedback_level == "authored":
+            keys.append("feedback_shape:authored")
         if result.score is not None:
             keys.append("score")
         if result.feasible is not None:
@@ -167,13 +220,17 @@ class EvalService:
         return keys
 
     # ---- Supervisor-facing: owns V, no gate ----------------------------
-    def install_verifier(self, src: str, *, origin: str = "supervisor", note: str = "") -> int:
+    def install_verifier(self, src: str, *, origin: str = "supervisor", note: str = "",
+                         feedback_src: Optional[str] = None) -> int:
         """Commit a rewritten verifier as the next version. NO approval gate (§2).
 
-        The anti-collapse guarantee is structural: the Supervisor is the defender,
-        and the direction it edits V is "harder to game". Returns the new version.
+        The direction the Supervisor edits V is no longer assumed "harder to game":
+        it may tighten, expose more, or switch modality. ``feedback_src`` optionally
+        attaches an agent-authored feedback module to this version. Returns the new
+        version.
         """
-        ver = self.evaluator.evolve(src, origin=origin, note=note)
+        ver = self.evaluator.evolve(src, origin=origin, note=note,
+                                    feedback_src=feedback_src)
         if self.on_install is not None:
             self.on_install(ver.version, note)
         return ver.version
@@ -186,9 +243,63 @@ class EvalService:
         """Read V's source. Supervisor-only — the Solver never gets this handle."""
         return self.evaluator.current.source
 
+    def current_feedback_source(self) -> Optional[str]:
+        """The current version's agent-authored feedback module, or None (enum path)."""
+        return self.evaluator.current.feedback_src
+
     def current_version(self) -> int:
         return self.evaluator.current.version
 
     def validate(self, src: str, sample_payload: dict) -> Optional[str]:
         """Smoke-test a candidate rewrite before installing it."""
         return self.evaluator.validate_source(src, sample_payload, self.ctx_provider())
+
+    def validate_evaluation(self, *, verify_src: str, feedback_src: Optional[str],
+                            seed: dict, reference: Optional[dict],
+                            probes: list, ctx: Optional[dict] = None,
+                            eps: float = 1e-9) -> Optional[str]:
+        """Direction-neutral acceptance gate for an evolved evaluation.
+
+        Replaces the "strictly harder" assumption with a SEPARATION invariant that
+        holds for every evolution direction (tighten / expose-more / switch-modality):
+
+          (a) runs clean: ``verify`` executes without error on ``seed`` and on every
+              probe solution; if ``feedback_src`` is given it must run clean too.
+          (b) separation: the known-good ``reference`` (defaults to ``seed``) scores
+              strictly ABOVE every known-degenerate probe by margin >= ``eps``.
+
+        This accepts an unchanged verifier with richer feedback (expose-more), a
+        tighter verifier (separation widens), and a switched modality (the caller
+        passes the NEW seed/reference/probes in the new representation). It rejects
+        only a rewrite that collapses good vs degenerate. Returns an error string or
+        None if OK. Runs everything out-of-process via the Evaluator; never installs.
+        """
+        use_ctx = ctx if ctx is not None else self.ctx_provider()
+        env = self._eval_env or None
+        # (a) runs clean on seed
+        rs = self.evaluator.run(seed, use_ctx, source=verify_src, env=env)
+        if rs.error:
+            return f"verify fails on seed: {rs.error[:160]}"
+        if feedback_src is not None:
+            fb = self.evaluator.run_feedback(
+                seed, use_ctx,
+                {"feasible": rs.feasible, "raw": rs.raw, "artifacts": rs.artifacts},
+                [], feedback_src=feedback_src, env=env)
+            if not isinstance(fb, dict):
+                return "feedback module did not return a dict on seed"
+        ref = reference if reference is not None else seed
+        rr = self.evaluator.run(ref, use_ctx, source=verify_src, env=env)
+        if rr.error:
+            return f"verify fails on reference: {rr.error[:160]}"
+        # (b) separation: reference strictly above every degenerate probe
+        for i, p in enumerate(probes or []):
+            sol = p.get("solution", {}) if isinstance(p, dict) else {}
+            rp = self.evaluator.run(sol, use_ctx, source=verify_src, env=env)
+            if rp.error:
+                # a probe that crashes the verifier is degenerate-low by construction
+                continue
+            if rr.raw <= rp.raw + eps:
+                desc = (p.get("description", "") if isinstance(p, dict) else "")[:80]
+                return (f"no separation: reference score {rr.raw:.6g} does not exceed "
+                        f"degenerate probe #{i} ({desc!r}) score {rp.raw:.6g}")
+        return None

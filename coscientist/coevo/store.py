@@ -132,13 +132,20 @@ class RunStore:
         self._append("supervisor/reviews.jsonl", {"t": self.t(), **fields})
 
     def verifier_version(self, version: int, source: str, *, origin: str, note: str,
-                         rationale: str = "") -> None:
+                         rationale: str = "", feedback_src: Optional[str] = None) -> None:
         (self.root / "supervisor" / "verifier_versions" / f"v{version}.py").write_text(
             source, encoding="utf-8"
         )
+        # An agent-authored feedback module (the free-form disclosure strategy) is
+        # versioned as a sibling so resume can rebuild the exact (verify, feedback)
+        # pair for each version. Absent → legacy enum path, nothing written.
+        if feedback_src is not None:
+            (self.root / "supervisor" / "verifier_versions"
+             / f"v{version}.feedback.py").write_text(feedback_src, encoding="utf-8")
         self._append("supervisor/versions.jsonl", {
             "t": self.t(), "version": version, "origin": origin,
             "note": note, "rationale": rationale,
+            "has_feedback": feedback_src is not None,
         })
 
     def probe(self, *, description: str, payload: dict, score: Optional[float],

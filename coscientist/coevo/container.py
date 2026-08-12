@@ -319,6 +319,19 @@ class DockerContainer:
     image: str = "python:3.11-slim"
     name: Optional[str] = None
     control_sock_name: str = ".control.sock"
+    # Optional GPU request (e.g. "all" or "1"). When set, ``--gpus <spec>`` is added
+    # to ``docker run`` — needed for kernel tasks whose candidate runs on GPU. Default
+    # None keeps the argv unchanged (no GPU). Domain-agnostic: the core never sets it;
+    # the operator/agent supplies it. Requires the host's nvidia docker runtime.
+    gpus: Optional[str] = None
+    # Optional generic resource caps from a task's ResourceSpec.solver slice. Each is
+    # additive: when set, the corresponding ``--cpus``/``--memory`` flag is added.
+    # ``allow_internet=False`` pins ``--network none`` — but ONLY when this container
+    # is otherwise resourced (any of cpus/memory_mb/gpus/allow_internet set), so a
+    # plain default container keeps today's argv byte-for-byte. Still no cred ``-e``.
+    cpus: Optional[float] = None
+    memory_mb: Optional[int] = None
+    allow_internet: bool = False
 
     _cid: Optional[str] = field(default=None, init=False)
     _started: bool = field(default=False, init=False)
@@ -357,6 +370,23 @@ class DockerContainer:
                 "-w", "/work"]
         if self.name:
             argv += ["--name", self.name]
+        # A container is "resourced" when the task's solver slice asked for any
+        # cap/GPU. Only then do we touch cpus/memory/network — a plain default
+        # container keeps the argv byte-for-byte identical to before.
+        resourced = (self.cpus is not None or self.memory_mb is not None
+                     or self.gpus is not None or self.allow_internet)
+        if self.cpus is not None:
+            argv += ["--cpus", str(self.cpus)]
+        if self.memory_mb is not None:
+            argv += ["--memory", f"{int(self.memory_mb)}m"]
+        if self.gpus:
+            # GPU access for kernel-style tasks. No creds added here — the container
+            # env stays HOME/CODEX_HOME/CONTROL_SOCK only; LLM creds live host-side.
+            argv += ["--gpus", self.gpus]
+        if resourced and not self.allow_internet:
+            # Default-deny network for a resourced container (matches Harbor's
+            # no-network verifier posture). Opt in explicitly via allow_internet.
+            argv += ["--network", "none"]
         # keep the container alive; agent turns are `docker exec` sessions.
         argv += [self.image, "sleep", "infinity"]
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=120)

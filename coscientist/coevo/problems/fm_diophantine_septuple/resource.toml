@@ -1,0 +1,21 @@
+# Resource config for a FrontierMath problem.
+#
+# ONLY the [solver] slice is set. FrontierMath verifiers are pure-stdlib math
+# checks (rational squares, PRP tests, proof-structure adjudication) and some
+# import llm_client for LLM-guided adjudication — both of which MUST run in the
+# host-side Evaluator subprocess where LLM creds are injected. So the verifier
+# slice is deliberately LEFT EMPTY: _verify_backend() then returns None and
+# verify stays on the host subprocess (creds reachable, no wasted GPU, no
+# cred-free container that would break llm_client). Isolation is explicit —
+# the verifier never inherits the solver slice.
+#
+# The solver is a codex agent doing math reasoning: no GPU, but give it real
+# CPU/memory headroom. --network none is SAFE here — codex reaches the host
+# gateway over a bind-mounted unix socket (CONTROL_SOCK), never TCP.
+[solver]
+image = "python:3.11-slim"
+cpus = 4
+memory_mb = 8192
+allow_internet = false
+
+# [verifier] intentionally omitted -> host-subprocess verify (LLM creds reachable).
