@@ -661,6 +661,65 @@ def test_wall_clock_turn_still_drives_a_harden(tmp_path, monkeypatch):
     assert system._post_harden_solves >= 1, "no re-baseline solve after the wall-clock harden"
 
 
+def test_voluntary_exit_does_not_stop_run(tmp_path, monkeypatch):
+    """Wall-clock is the ONLY stop signal. A solver that exits VOLUNTARILY (no
+    review_request, note="" — not a wall-clock hit) with a STABLE verifier used to end
+    the whole run after turn 1. Now the loop must keep giving turns until max_turns (the
+    deadline stand-in here), and each turn after the first must carry the KEEP PUSHING
+    addendum, since the Supervisor looked and deliberately left the game unchanged."""
+    from coscientist.coevo.container import AgentSession
+
+    system, A = _bootstrapped_system(tmp_path, monkeypatch)
+
+    prompts = []
+
+    class FakeContainer:
+        def __init__(self, *, workdir, gateway, agent_elf, image, **kw):
+            self.ws = Path(workdir)
+        def start(self):
+            return self
+        def stop(self):
+            pass
+        def exec_agent(self, prompt, *, timeout_s, **kw):
+            prompts.append(prompt)
+            # voluntary exit: never ask for review, report a clean stop (NOT a timeout).
+            (self.ws / "solution_out.json").write_text(json.dumps({"value": 3}))
+            return AgentSession(ok=True, returncode=0, stdout="", stderr="", note="")
+
+    class FakeControl:
+        def __init__(self, *, workdir, handler, **kw):
+            self.workdir = workdir
+        def seed_shims(self, ws):
+            pass
+        def start(self):
+            return self
+        def stop(self):
+            pass
+        @property
+        def needs_explicit_mount(self):
+            return False
+        @property
+        def host_path(self):
+            from pathlib import Path as _P
+            return _P(self.workdir) / ".control.sock"
+
+    monkeypatch.setattr(A, "DockerContainer", FakeContainer)
+    monkeypatch.setattr(A, "ControlSocket", FakeControl)
+    # Supervisor looks every normal turn but never moves V (stable game).
+    monkeypatch.setattr(system, "_run_supervisor_harden",
+                        lambda best, sol_ws, *, trigger: None)
+
+    system.solve_and_evolve(max_turns=5)
+
+    # the old loop broke after turn 1; now all 5 turns run, stopped only by max_turns.
+    assert len(prompts) == 5, "voluntary exit stopped the run early"
+    assert system.hardenings == 0
+    assert system._post_harden_solves == 0
+    # turn 1 has no push; every turn after a stable-V voluntary exit carries KEEP PUSHING.
+    assert "KEEP PUSHING" not in prompts[0]
+    assert all("KEEP PUSHING" in p for p in prompts[1:]), "repush not applied after exit"
+
+
 def test_last_review_before_deadline_still_hardens_and_resolves(tmp_path, monkeypatch):
     """Even when the review fires with almost no budget left, the reserved slices let
     the harden complete AND the owed post-harden solve run — the exact deadline-edge
@@ -1062,17 +1121,18 @@ def test_llm_creds_reach_eval_subprocess_never_the_container(tmp_path, monkeypat
     cont.stop()
 
 
-def test_plateau_triggers_construction_to_proof_mode_switch(tmp_path, monkeypatch):
-    """The motivating arc: when the construction score plateaus, a harden may SWITCH
-    the game to proof-guidance. Driven through the real loop with a fake harden agent
-    that writes mode_switch.json + a proof verifier + a new contract; the switch must
-    install, _mode flip to 'proof', the brief be rewritten, and the owed re-baseline
-    solve run in the NEW representation."""
+def test_supervisor_can_switch_construction_to_proof(tmp_path, monkeypatch):
+    """The motivating arc: the Supervisor may REFRAME the game to proof-guidance. The
+    full menu (incl. mode_switch) is ALWAYS in the harden prompt — no orchestrator
+    "plateau" gate. Driven through the real loop with a fake harden agent that writes
+    mode_switch.json + a proof verifier + a new contract; the switch must install,
+    _mode flip to 'proof', the brief be rewritten, and the owed re-baseline solve run
+    in the NEW representation."""
     from coscientist.coevo.container import AgentSession
 
     system, A = _bootstrapped_system(tmp_path, monkeypatch)
 
-    # pre-load a flat trajectory so the turn-1 review sees a real plateau.
+    # a flat trajectory is just CONTEXT now (progress.json), not a trigger.
     system._score_trajectory = [3.0, 3.0, 3.0]
 
     class FakeContainer:
@@ -1124,8 +1184,8 @@ def test_plateau_triggers_construction_to_proof_mode_switch(tmp_path, monkeypatc
         (ws / "verdict.json").write_text(json.dumps(
             {"gaming": False, "reasoning": "construction exhausted; switch to proof"}))
         if harden_calls["n"] == 1:
-            # the plateau prompt must have offered the switch.
-            assert "PLATEAU DETECTED" in prompt, "plateau block not spliced into prompt"
+            # the full menu — incl. the reframe mechanism — is ALWAYS present.
+            assert "mode_switch.json" in prompt, "switch mechanism not in harden prompt"
             (ws / "mode_switch.json").write_text(json.dumps(
                 {"switch": True, "to_mode": "proof", "reasoning": "scalar exhausted"}))
             (ws / "verifier.py").write_text(_PROOF_VERIFIER)
@@ -1153,7 +1213,6 @@ def test_plateau_triggers_construction_to_proof_mode_switch(tmp_path, monkeypatc
     events = [json.loads(l) for l in
               (system.run_dir / "events.jsonl").read_text().strip().splitlines()]
     assert any(e["kind"] == "mode_switch" and e.get("to_mode") == "proof" for e in events)
-    assert any(e["kind"] == "plateau_detected" for e in events)
 
 
 def test_validate_evaluation_accepts_a_separating_modality_change(tmp_path, monkeypatch):
@@ -1810,14 +1869,15 @@ def test_launcher_respawns_crashed_child_with_remaining_budget(tmp_path, monkeyp
     now = 1_000_000.0
     (runs / "b").mkdir(parents=True, exist_ok=True)
     (runs / "b" / "batch.json").write_text(json.dumps({
-        "batch": "b", "python": "py", "extra_args": [],
-        "runs": [{"run_id": rid, "pid": 999, "input_dir": str(runs / rid),
+        "batch": "b", "python": "py", "extra_args": [], "gpu_devices": ["3"],
+        "runs": [{"run_id": rid, "pid": 999, "status": "running",
+                  "input_dir": str(runs / rid),
                   "log": str(runs / "b" / f"{rid}.log"),
                   "budget_s": 28800.0, "deadline_epoch": now + 20000.0,
                   "last_launch_epoch": now - 5000.0, "respawns": 0,
                   "resource_config": None, "gpu_device": "3"}]}))
 
-    actions = batch._respawn_tick(now=now)
+    actions = batch._wave_tick(now=now)
     assert actions[0]["action"] == "respawned"
     assert len(spawned) == 1
     # remaining budget ~= deadline - now (20000), NOT the full 28800
@@ -1826,6 +1886,7 @@ def test_launcher_respawns_crashed_child_with_remaining_budget(tmp_path, monkeyp
     man = json.loads((runs / "b" / "batch.json").read_text())
     assert man["runs"][0]["respawns"] == 1
     assert man["runs"][0]["pid"] == 4001
+    assert man["runs"][0]["gpu_device"] == "3"        # respawn keeps its card
 
 
 def test_launcher_respawn_respects_done_budget_and_systematic_floors(tmp_path, monkeypatch):
@@ -1851,20 +1912,189 @@ def test_launcher_respawn_respects_done_budget_and_systematic_floors(tmp_path, m
             events.append({"kind": "run_stop", "best_score": 1.0})
         (rd / "events.jsonl").write_text(
             "\n".join(json.dumps(e) for e in events) + "\n")
-        return {"run_id": rid, "pid": 1, "input_dir": str(rd),
+        return {"run_id": rid, "pid": 1, "status": "running", "input_dir": str(rd),
                 "log": str(rd / "l.log"), "budget_s": 28800.0,
                 "deadline_epoch": deadline, "last_launch_epoch": last_launch,
                 "respawns": 0, "resource_config": None, "gpu_device": None}
 
     (runs / "b").mkdir(parents=True, exist_ok=True)
     (runs / "b" / "batch.json").write_text(json.dumps({
-        "batch": "b", "python": "py", "extra_args": [], "runs": [
+        "batch": "b", "python": "py", "extra_args": [], "gpu_devices": [], "runs": [
             _mk("b__done", stopped=True, deadline=now + 5000, last_launch=now - 5000),
             _mk("b__expired", stopped=False, deadline=now - 10, last_launch=now - 5000),
             _mk("b__systematic", stopped=False, deadline=now + 5000, last_launch=now - 5),
         ]}))
 
-    actions = {a["run_id"]: a["action"] for a in batch._respawn_tick(now=now)}
+    actions = {a["run_id"]: a["action"] for a in batch._wave_tick(now=now)}
     assert actions["b__done"] == "done"
     assert actions["b__expired"] == "budget_spent"
     assert actions["b__systematic"] == "held_systematic"
+
+
+# ---------------------------------------------------------------------------
+# wave scheduling: 8-GPU pool, first-wave launch + pending queue, card handoff on
+# completion, held_systematic keeps its card, idempotent resume. All in-memory:
+# _spawn / _alive / _progress are stubbed, no real process, docker, or GPU.
+# ---------------------------------------------------------------------------
+def _wave_batch(tmp_path, monkeypatch, *, n_inputs, gpus, spawn_log):
+    """Build a Batch whose _spawn is a fake returning incrementing pids, with n_inputs
+    problem dirs and a pool of `gpus`. Returns (L, batch, inputs)."""
+    from coscientist.coevo import launcher as L
+
+    def fake_spawn(self, spec, *, budget_s, python, extra_args):
+        spawn_log.append({"run_id": spec.run_id, "gpu": spec.gpu_device,
+                          "budget_s": budget_s})
+        return 5000 + len(spawn_log)
+
+    monkeypatch.setattr(L.Batch, "_spawn", fake_spawn)
+    inputs = []
+    for i in range(n_inputs):
+        d = tmp_path / "probs" / f"task{i}"
+        d.mkdir(parents=True)
+        inputs.append(d)
+    batch = L.Batch("wave", runs_dir=tmp_path / "runs")
+    return L, batch, inputs
+
+
+def test_wave_first_wave_fills_pool_and_queues_the_rest(tmp_path, monkeypatch):
+    """8-GPU pool + 10 inputs: start() launches exactly 8 runs (each on a distinct card
+    0..7) and records the other 2 as pending with no card, no pid, no charged deadline."""
+    spawn_log = []
+    L, batch, inputs = _wave_batch(tmp_path, monkeypatch, n_inputs=10, gpus=8,
+                                   spawn_log=spawn_log)
+    pool = [str(i) for i in range(8)]
+    batch.start(inputs, hours=4.0, gpu_devices=pool)
+
+    assert len(spawn_log) == 8, "first wave must be exactly pool-size"
+    assert sorted(s["gpu"] for s in spawn_log) == pool, "distinct card each, 0..7"
+    man = json.loads((tmp_path / "runs" / "wave" / "batch.json").read_text())
+    assert man["gpu_devices"] == pool
+    running = [r for r in man["runs"] if r["status"] == "running"]
+    pending = [r for r in man["runs"] if r["status"] == "pending"]
+    assert len(running) == 8 and len(pending) == 2
+    for r in running:
+        assert r["gpu_device"] in pool and r["pid"] and r["deadline_epoch"]
+    for r in pending:
+        assert r["gpu_device"] is None and r["pid"] is None
+        assert r["deadline_epoch"] is None      # budget not charged while queued
+    # every card used once, no double-assignment
+    assert len({r["gpu_device"] for r in running}) == 8
+
+
+def test_wave_freed_card_is_handed_to_next_pending(tmp_path, monkeypatch):
+    """When a running run finishes (run_stop), its card is freed and the next pending
+    run is launched onto THAT card — never a double-assignment."""
+    spawn_log = []
+    L, batch, inputs = _wave_batch(tmp_path, monkeypatch, n_inputs=3, gpus=2,
+                                   spawn_log=spawn_log)
+    pool = ["0", "1"]
+    batch.start(inputs, hours=4.0, gpu_devices=pool)
+    assert len(spawn_log) == 2                 # wave of 2, one pending
+    man = json.loads((tmp_path / "runs" / "wave" / "batch.json").read_text())
+    running = [r for r in man["runs"] if r["status"] == "running"]
+    # pick the run on card "0" and make it finish cleanly.
+    done_run = next(r for r in running if r["gpu_device"] == "0")
+    rd = tmp_path / "runs" / done_run["run_id"]
+    rd.mkdir(parents=True, exist_ok=True)
+    (rd / "events.jsonl").write_text(
+        json.dumps({"kind": "run_stop", "best_score": 1.0}) + "\n")
+    # its pid is now dead; the other running pid + any future pid are alive.
+    monkeypatch.setattr(L, "_alive", lambda pid: pid != done_run["pid"])
+
+    now = 3_000_000.0
+    actions = {a["run_id"]: a["action"] for a in batch._wave_tick(now=now)}
+    assert actions[done_run["run_id"]] == "done"
+    man2 = json.loads((tmp_path / "runs" / "wave" / "batch.json").read_text())
+    # the freed card "0" was handed to the previously-pending run.
+    launched = [s for s in spawn_log[2:]]
+    assert len(launched) == 1 and launched[0]["gpu"] == "0"
+    assert launched[0]["budget_s"] == 4.0 * 3600.0, "pending gets the FULL budget"
+    now_running = [r for r in man2["runs"] if r["status"] == "running"]
+    cards = [r["gpu_device"] for r in now_running]
+    assert sorted(cards) == ["0", "1"], f"no double-assignment: {cards}"
+    # the newly-launched run got its deadline anchored now.
+    newr = next(r for r in man2["runs"] if r["run_id"] == launched[0]["run_id"])
+    assert abs(newr["deadline_epoch"] - (now + 4.0 * 3600.0)) < 1.0
+
+
+def test_wave_held_systematic_keeps_its_card_no_pending_steal(tmp_path, monkeypatch):
+    """A run that dies within MIN_RUNTIME is held_systematic and KEEPS its card; a
+    pending run must NOT be launched onto that still-occupied device."""
+    spawn_log = []
+    L, batch, inputs = _wave_batch(tmp_path, monkeypatch, n_inputs=2, gpus=1,
+                                   spawn_log=spawn_log)
+    pool = ["0"]
+    batch.start(inputs, hours=4.0, gpu_devices=pool)
+    assert len(spawn_log) == 1                 # one running on "0", one pending
+    man = json.loads((tmp_path / "runs" / "wave" / "batch.json").read_text())
+    running = next(r for r in man["runs"] if r["status"] == "running")
+    rd = tmp_path / "runs" / running["run_id"]
+    rd.mkdir(parents=True, exist_ok=True)       # no run_stop => not done
+    monkeypatch.setattr(L, "_alive", lambda pid: False)   # its pid looks dead
+
+    # died just now (< MIN_RUNTIME since last_launch) => systematic hold.
+    now = running["last_launch_epoch"] + 1.0
+    before = len(spawn_log)
+    actions = {a["run_id"]: a["action"] for a in batch._wave_tick(now=now)}
+    assert actions[running["run_id"]] == "held_systematic"
+    assert len(spawn_log) == before, "pending must NOT steal the held card"
+    man2 = json.loads((tmp_path / "runs" / "wave" / "batch.json").read_text())
+    held = next(r for r in man2["runs"] if r["status"] == "held_systematic")
+    assert held["gpu_device"] == "0", "held_systematic keeps its card"
+    assert any(r["status"] == "pending" for r in man2["runs"])
+
+
+def test_wave_start_is_idempotent_resume(tmp_path, monkeypatch):
+    """A second start() against an existing manifest must NOT re-plan: it resumes via a
+    single _wave_tick without resetting status / re-anchoring deadlines / clearing
+    respawns. Live runs stay put; only genuinely-freed cards get filled."""
+    spawn_log = []
+    L, batch, inputs = _wave_batch(tmp_path, monkeypatch, n_inputs=3, gpus=2,
+                                   spawn_log=spawn_log)
+    pool = ["0", "1"]
+    batch.start(inputs, hours=4.0, gpu_devices=pool)
+    man1 = json.loads((tmp_path / "runs" / "wave" / "batch.json").read_text())
+    running1 = {r["run_id"]: dict(r) for r in man1["runs"]
+                if r["status"] == "running"}
+    assert len(spawn_log) == 2
+
+    # everything is alive; a re-run must spawn nothing new and change nothing.
+    monkeypatch.setattr(L, "_alive", lambda pid: True)
+    batch.start(inputs, hours=4.0, gpu_devices=pool)
+    assert len(spawn_log) == 2, "idempotent resume must not spawn while all alive"
+    man2 = json.loads((tmp_path / "runs" / "wave" / "batch.json").read_text())
+    for rid, r1 in running1.items():
+        r2 = next(r for r in man2["runs"] if r["run_id"] == rid)
+        assert r2["status"] == "running" and r2["pid"] == r1["pid"]
+        assert r2["deadline_epoch"] == r1["deadline_epoch"]   # NOT re-anchored
+        assert r2["gpu_device"] == r1["gpu_device"]
+    # the pending run is still pending (both cards still occupied by live runs).
+    assert sum(r["status"] == "pending" for r in man2["runs"]) == 1
+
+
+def test_package_k3_task_is_idempotent(tmp_path):
+    """package_k3_task copies the raw task + writes the resource.toml template, and a
+    second call is a no-op that neither re-copies nor clobbers the resource.toml."""
+    from coscientist.coevo import launcher as L
+
+    tasks_root = tmp_path / "tasks"
+    src = tasks_root / "K3_demo"
+    (src / "environment").mkdir(parents=True)
+    (src / "instruction.md").write_text("solve it")
+    (src / "task.toml").write_text("gpus=1\n")
+    template = tmp_path / "resource.toml"
+    template.write_text('[solver]\ngpus="device=0"\n')
+
+    problems = tmp_path / "problems"
+    dst = L.package_k3_task("K3_demo", tasks_root=tasks_root,
+                            problems_root=problems, template=template)
+    assert (dst / "instruction.md").read_text() == "solve it"
+    assert (dst / "resource.toml").read_text() == template.read_text()
+    assert dst.name == "k3_demo"
+
+    # mutate the packaged copy, then re-package: it must NOT be overwritten.
+    (dst / "resource.toml").write_text("EDITED")
+    dst2 = L.package_k3_task("K3_demo", tasks_root=tasks_root,
+                             problems_root=problems, template=template)
+    assert dst2 == dst
+    assert (dst / "resource.toml").read_text() == "EDITED", "idempotent: no clobber"

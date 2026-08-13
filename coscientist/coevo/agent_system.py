@@ -159,41 +159,21 @@ probe before you finish (run it with python3); if you wrote feedback.py, run it 
 This is the ENTIRE evaluation the rest of the system will use — be rigorous. When done,
 write a one-line `BOOTSTRAP_DONE` marker file.'''
 
-# The plateau block is spliced into the harden prompt ONLY when the orchestrator has
-# detected that the construction game has stalled — that is the only time a MODALITY
-# SWITCH (construction→proof) is on the table. Without a plateau the smith stays in the
-# tighten/expose-more lane and must not switch the game.
-_PLATEAU_BLOCK = '''\
-
-PLATEAU DETECTED. `plateau.json` shows the solver's score has been ~flat for several
-turns under the current construction game — it has likely extracted what a scalar
-construction can reach. You MAY now SWITCH THE MODALITY of the evaluation: keep the
-knowledge the construction revealed, but change the game from "maximize a number" to
-"build a rigorous argument", judged qualitatively. To switch, ALSO write:
-  * `mode_switch.json` — {{"switch": true, "to_mode": "proof", "reasoning": "..."}}
-  * a NEW `verifier.py` in the PROOF representation — verify(payload, ctx) still returns
-    {{feasible, raw, artifacts}}, but `payload` is now a structural/proof argument and
-    the verifier is an LLM-VERIFIER: `import llm_client`, ask the model to assess the
-    argument's rigor/progress, map that onto `raw` (higher = closer to a real proof).
-    Degrade gracefully (finite low `raw`) when `llm_client.available()` is False.
-  * `feedback.py` — returns natural-language guidance in `detail` (via `llm_client`)
-    steering the solver toward a complete proof.
-  * a NEW `seed_solution.json`, `probes.json`, and `SOLVER_BRIEF.md` IN THE PROOF
-    REPRESENTATION (the seed = a minimal honest argument; probes = hand-wavy/circular
-    "proofs" that must score LOW). The system re-baselines the solver on this new game.
-Only switch if the plateau is real and a proof game is the right next step; otherwise
-harden/expose-more as usual and leave mode_switch.json unwritten.'''
-
-_NO_PLATEAU_BLOCK = '''\
-
-No plateau signal. Stay in the tighten / expose-more lane: do NOT switch the game's
-modality (do not write mode_switch.json or a proof-representation verifier).'''
-
+# The harden prompt is the Supervisor's creative brief. It ALWAYS carries the full menu
+# — tighten, expose-more, and switch/reframe the representation — and hands the Supervisor
+# `progress.json` (score trajectory, wall-clock burned in the current game, time left,
+# mode, turn) as CONTEXT. The orchestrator does NOT decide "plateau"; the Supervisor owns
+# the evaluation and judges for itself whether the current game is mined out. Its default
+# bias: while wall-clock remains, bite the current game HARDER; only reframe when a route
+# is genuinely exhausted.
 _HARDEN_PROMPT = '''\
-You are the SUPERVISOR. You OWN THE EVALUATION for a problem — both the hidden verifier
-V and (optionally) a free-form feedback module. A solver has been optimizing against
-your evaluation and may be GAMING it (exploiting a flaw to score high without truly
-solving the problem), or may be STUCK (needs more information to progress).
+You are the SUPERVISOR. You OWN THE EVALUATION for a problem — the hidden verifier V, an
+optional free-form feedback module, AND the very GAME the solver plays (what "solving"
+means: maximize a number, or build a rigorous argument, or disprove a claim, ...). A
+solver has been optimizing against your evaluation and may be GAMING it (exploiting a
+flaw to score high without truly solving the problem), STUCK (needs more information to
+progress), or genuinely near the ceiling of the current game. Be CREATIVE — you are not
+a one-way anti-hack ratchet and you are not locked into forward construction.
 
 In /work you have:
   * `problem/` — the original raw problem input (read it to recall what a real
@@ -203,15 +183,29 @@ In /work you have:
   * `best_solution.json` — the solver's current best candidate,
   * `probe_report.json` — your red-team probes and the score each got under current
     V (a probe scoring competitively high is evidence of a hole),
-  * `plateau.json` — whether the solver's score has stalled.
+  * `progress.json` — CONTEXT for your judgment, not a verdict: the recent score
+    trajectory, how much wall-clock the CURRENT game has already burned, how much time
+    remains, the current mode, and the turn count. YOU decide from this whether the
+    current game still has juice or is mined out. Do NOT treat a flat stretch as an
+    automatic signal to switch — a flat score often just means "keep biting harder".
 
-You may evolve the evaluation in ANY of these directions (this is NOT a one-way
-anti-hack ratchet):
+You may evolve the evaluation in ANY combination of these directions:
   (a) TIGHTEN — rewrite `verifier.py` so exploit/probe solutions score strictly LOWER
       while a genuine solution still scores well (close a gaming hole);
   (b) EXPOSE MORE — write/adjust `feedback.py` to hand the solver richer diagnostics or
       guidance when it is honestly stuck (the numeric score stays authoritative);
-  (c) SWITCH MODALITY — only when a plateau is present (see below).
+  (c) SWITCH / REFRAME THE REPRESENTATION — this is ALWAYS on the table and is YOUR
+      creative call. When you judge the current game mined out, change what the solver
+      is even playing: forward construction → a rigorous PROOF game; or a DISPROOF /
+      counterexample game that tries to refute the target; or another reformulation
+      entirely. Keep the knowledge the old game revealed, change the game.
+
+DEFAULT BIAS: while wall-clock remains, prefer to keep biting the CURRENT game harder
+(tighten / expose-more / demand a sharper candidate). Only reframe (c) when you judge —
+from progress.json and probe_report.json — that the current route is genuinely exhausted
+and a different representation is the right next attack. Reframing early throws away a
+game that still had room; refusing to reframe a truly dead route wastes the clock. Your
+judgment, not a threshold.
 
 Decide and write into /work:
 
@@ -227,7 +221,21 @@ Decide and write into /work:
        def feedback(payload, ctx, verify_result, history) -> dict  # {{"detail","artifacts"}}
    stdlib-only, may `import llm_client` for LLM guidance. Omit to keep current disclosure.
 
-Verify whatever you write runs (python3) on the seed and probes before finishing.{plateau_block}
+4. If — and only if — you choose to SWITCH / REFRAME the representation (c), ALSO write:
+   * `mode_switch.json` — {{"switch": true, "to_mode": "proof"|"disproof"|"<name>",
+     "reasoning": "..."}}
+   * a NEW `verifier.py` IN THE NEW REPRESENTATION. When the new game is qualitative
+     (proof/disproof), make it an LLM-VERIFIER: `import llm_client`, ask the model to
+     assess the argument's rigor/progress, map that onto `raw` (higher = closer to a
+     real proof / a valid refutation). Degrade gracefully (finite low `raw`) when
+     `llm_client.available()` is False.
+   * `feedback.py` — natural-language guidance in `detail` (via `llm_client`) steering
+     the solver in the new game.
+   * a NEW `seed_solution.json`, `probes.json`, and `SOLVER_BRIEF.md` IN THE NEW
+     REPRESENTATION (seed = a minimal honest argument; probes = hand-wavy / circular
+     attempts that MUST score LOW). The system re-baselines the solver on the new game.
+
+Verify whatever you write runs (python3) on the seed and probes before finishing.
 
 Write a one-line `HARDEN_DONE` marker when finished.'''
 
@@ -291,11 +299,12 @@ class AgentSystem:
     _best_score: float = field(default=float("-inf"), init=False)
     hardenings: int = field(default=0, init=False)
     reviews_handled: int = field(default=0, init=False)
-    # The evaluation's current GAME. Starts "construction" (optimize a scalar); a
-    # plateau-driven modality switch moves it to "proof" (an LLM-verifier scores a
-    # structural argument). Recovered on resume by scanning events for mode_switch.
+    # The evaluation's current GAME. Starts "construction" (optimize a scalar); the
+    # Supervisor may REFRAME it (e.g. to "proof": an LLM-verifier scores a structural
+    # argument). Recovered on resume by scanning events for mode_switch.
     _mode: str = field(default="construction", init=False)
-    # Rolling tail of the best score after each extract — the plateau detector's input.
+    # Rolling tail of the best score after each extract — CONTEXT surfaced to the
+    # Supervisor in progress.json (the orchestrator no longer computes "plateau").
     _score_trajectory: list = field(default_factory=list, init=False)
     # Absolute host path to a bundled checker (materialized under run_dir/checker/ when
     # the raw input ships one), injected into ctx["checker_dir"] so host-side verify can
@@ -314,6 +323,12 @@ class AgentSystem:
     # set True when a harden switched the modality; the owed post-harden turn must
     # first re-seed the solver workspace with the NEW contract before it runs.
     _pending_mode_refresh: bool = field(default=False, init=False)
+    # wall-clock (deadline.elapsed()) at which the CURRENT game/mode began — reset on
+    # every modality switch. Feeds progress.json so the Supervisor can judge how long
+    # the current game has been mined without the orchestrator deciding "plateau".
+    _mode_since_s: float = field(default=0.0, init=False)
+    # monotonically increasing normal-turn counter, surfaced in progress.json.
+    _turn: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         self.raw_input_dir = Path(self.raw_input_dir).resolve()
@@ -560,6 +575,7 @@ class AgentSystem:
         try:
             container.start()
             turn = 0
+            repush = False   # set when the LAST turn ended voluntarily before deadline
             while True:
                 # A harden that moved V leaves us OWING one solve turn so the
                 # Solver re-baselines under the new verifier — that owed turn runs
@@ -569,6 +585,7 @@ class AgentSystem:
                     if turn >= max_turns or self.deadline.expired():
                         break
                 turn += 1
+                self._turn = turn
                 # Normal turns leave a reserve so the LAST review before the
                 # deadline can still harden AND get its post-harden solve. The owed
                 # turn itself is not reserve-capped — it is the post-harden solve.
@@ -599,7 +616,9 @@ class AgentSystem:
                         self._refresh_solver_ws(sol_ws)
                         self._pending_mode_refresh = False
                 session = container.exec_agent(
-                    self._solver_prompt(turn), timeout_s=turn_budget)
+                    self._solver_prompt(turn, repush=(repush and not owed)),
+                    timeout_s=turn_budget)
+                repush = False   # consumed; recomputed below for the next turn
                 self.store.cost(who="solver", kind="agent_turn", calls=1,
                                 ok=session.ok, turn=turn)
                 self._extract_best(sol_ws)
@@ -632,12 +651,17 @@ class AgentSystem:
                 if self._proactive_supervise(sol_ws):
                     self._owe_post_harden_solve = True
                     continue
-                # V is stable. If the agent hit its wall clock it still had work to
-                # do → give it another turn (more compute on the same V). If it
-                # finished on its own with a stable V, nothing is left to do → stop.
-                if session.note.startswith("agent hit the wall-clock"):
-                    continue
-                break
+                # V is stable after the Supervisor looked. Wall-clock is the ONLY stop
+                # signal (SForge "timeout = done"): we do NOT stop just because the
+                # agent voluntarily exited with a stable V. If it hit its wall clock it
+                # still had work → give it another turn on the same V. If it stopped on
+                # its own before the deadline, that stop is itself a signal — the
+                # Supervisor just reviewed it and chose NOT to change the game, so the
+                # solver was only slacking: kick it back in with an added push. Either
+                # way, keep going until the deadline (loop-top) or max_turns stops us.
+                if not session.note.startswith("agent hit the wall-clock"):
+                    repush = True
+                continue
         finally:
             container.stop()
             control.stop()
@@ -680,42 +704,17 @@ class AgentSystem:
         best = req.get("solution") or self._best_payload or self._seed
         self.reviews_handled += 1
         self.store.event("review_request", question=str(req.get("question", ""))[:300])
-        self._run_supervisor_harden(best, sol_ws, trigger="review_request",
-                                    plateau=self._plateau_now())
+        self._run_supervisor_harden(best, sol_ws, trigger="review_request")
 
     def _proactive_supervise(self, sol_ws: Path) -> bool:
         """Orchestrator-driven cadence: red-team + maybe harden. Returns True if V moved."""
         best = self._best_payload or self._seed
         before = self.eval_service.current_version()   # type: ignore[union-attr]
-        self._run_supervisor_harden(best, sol_ws, trigger="proactive",
-                                    plateau=self._plateau_now())
+        self._run_supervisor_harden(best, sol_ws, trigger="proactive")
         return self.eval_service.current_version() > before   # type: ignore[union-attr]
 
-    def _plateau_now(self) -> bool:
-        """Is a modality switch on the table right now?
-
-        Only when the construction game has stalled AND we are still in construction
-        mode (a proof game is not itself re-switched). This gates whether the harden
-        prompt offers the construction→proof switch at all."""
-        return self._mode == "construction" and self._is_plateaued()
-
-    def _is_plateaued(self, *, window: int = 3, rel_eps: float = 1e-3) -> bool:
-        """True if the best score has been ~flat over the last ``window`` extracts.
-
-        Uses the tail of ``_score_trajectory``; needs at least ``window+1`` finite,
-        non-degenerate points. Flat = the span across the window is within ``rel_eps``
-        of the magnitude (relative), so it scales across problems' natural units."""
-        pts = [s for s in self._score_trajectory
-               if isinstance(s, (int, float)) and s not in (float("inf"), float("-inf"))]
-        if len(pts) < window + 1:
-            return False
-        tail = pts[-(window + 1):]
-        span = max(tail) - min(tail)
-        scale = max(1e-9, max(abs(v) for v in tail))
-        return (span / scale) <= rel_eps
-
-    def _run_supervisor_harden(self, best: dict, sol_ws: Path, *, trigger: str,
-                               plateau: bool = False) -> None:
+    def _run_supervisor_harden(self, best: dict, sol_ws: Path, *,
+                               trigger: str) -> None:
         assert self.gateway and self.agent_elf and self.eval_service
         ws = self.run_dir / "harden_ws"
         if ws.exists():
@@ -731,33 +730,35 @@ class AgentSystem:
         (ws / "seed_solution.json").write_text(json.dumps(self._seed, indent=2))
         (ws / "probe_report.json").write_text(
             json.dumps(self._probe_report(), indent=2))
-        (ws / "plateau.json").write_text(json.dumps({
-            "plateaued": bool(plateau), "mode": self._mode,
-            "recent_scores": self._score_trajectory[-6:],
+        remaining = self.deadline.remaining()
+        # progress.json is CONTEXT for the Supervisor's own judgment, NOT a "plateau"
+        # verdict the orchestrator computes: the score trajectory, how long the current
+        # game has been mined (wall-clock since the last mode switch), time left, mode,
+        # and turn. The Supervisor decides for itself whether to bite harder or reframe.
+        (ws / "progress.json").write_text(json.dumps({
+            "mode": self._mode,
+            "turn": self._turn,
+            "recent_scores": self._score_trajectory[-8:],
+            "spent_in_mode_s": round(self.deadline.elapsed() - self._mode_since_s, 1),
+            "remaining_s": round(remaining, 1),
         }, indent=2))
 
-        remaining = self.deadline.remaining()
         # Harden runs on its OWN protected timeout, not `remaining`: the loop keeps
         # (harden_timeout_s + post_harden_solve_s) in reserve, so even a review that
         # fires right at the deadline still gets a full harden. Capping by `remaining`
         # here is what starved the harden to ~0s in the first Chowla run.
-        if plateau:
-            self.store.event("plateau_detected", trigger=trigger,
-                             recent_scores=self._score_trajectory[-6:])
-        self.store.event("harden_start", trigger=trigger, plateau=bool(plateau),
+        self.store.event("harden_start", trigger=trigger, mode=self._mode,
                          remaining_s=round(remaining, 1))
-        prompt = _HARDEN_PROMPT.format(
-            plateau_block=_PLATEAU_BLOCK if plateau else _NO_PLATEAU_BLOCK)
+        prompt = _HARDEN_PROMPT.format()
         session = one_shot_agent(
             ws, self.gateway, self.agent_elf, prompt,
             timeout_s=self.harden_timeout_s, image=self.image)
         self.store.cost(who="supervisor", kind="harden_session", calls=1, ok=session.ok)
 
         verdict = _read_json(ws / "verdict.json", default={})
-        self._apply_harden(ws, trigger=trigger, plateau=plateau, verdict=verdict)
+        self._apply_harden(ws, trigger=trigger, verdict=verdict)
 
-    def _apply_harden(self, ws: Path, *, trigger: str, plateau: bool,
-                      verdict: dict) -> None:
+    def _apply_harden(self, ws: Path, *, trigger: str, verdict: dict) -> None:
         """Install whatever the smith authored: a new verifier and/or a feedback module,
         possibly a full modality switch. Direction-neutral acceptance via the separation
         invariant (``validate_evaluation``) — never the old "strictly harder" check."""
@@ -766,7 +767,7 @@ class AgentSystem:
         new_vf = ws / "verifier.py"
         new_ff = ws / "feedback.py"
         switch = _read_json(ws / "mode_switch.json", default={})
-        is_switch = bool(isinstance(switch, dict) and switch.get("switch")) and plateau
+        is_switch = bool(isinstance(switch, dict) and switch.get("switch"))
 
         has_new_verifier = new_vf.is_file()
         has_new_feedback = new_ff.is_file()
@@ -826,7 +827,8 @@ class AgentSystem:
             # bootstrap_ws so both the solve loop and a resume read the NEW contract.
             self._ctx, self._seed, self._probes = val_ctx, val_seed, val_probes
             self._mode = str(switch.get("to_mode", "proof"))
-            self._score_trajectory = []   # a new game resets the plateau window
+            self._score_trajectory = []   # a new game resets the score window
+            self._mode_since_s = self.deadline.elapsed()  # current game starts now
             self._pending_mode_refresh = True
             self._overwrite_bootstrap_contract(ws)
             self.store.event("mode_switch", to_mode=self._mode,
@@ -882,16 +884,31 @@ class AgentSystem:
                 "# Solver scratchpad\n\nRecord findings here so future turns resume "
                 "fast. This file persists across turns.\n", encoding="utf-8")
 
-    def _solver_prompt(self, turn: int) -> str:
+    def _solver_prompt(self, turn: int, *, repush: bool = False) -> str:
         mode_line = ""
         if self._mode != "construction":
             mode_line = (
-                "\n\nNOTE: the evaluation is now in PROOF mode — your solution_out.json "
-                "payload is a STRUCTURAL ARGUMENT (in the shape PROBLEM_BRIEF.md now "
-                "describes), scored qualitatively by a hidden LLM-verifier that returns "
-                "natural-language guidance in the eval response `detail`. Read `detail` "
-                "each eval and follow it toward a complete, rigorous argument — a higher "
-                "score reflects genuine proof progress, not a bigger construction.")
+                f"\n\nNOTE: the evaluation's GAME has been REFRAMED — it is now "
+                f"'{self._mode}' mode. Your solution_out.json payload is no longer a "
+                "bigger construction but the ARGUMENT the reframed PROBLEM_BRIEF.md now "
+                "describes (e.g. a proof, or a disproof/counterexample), scored "
+                "qualitatively by a hidden LLM-verifier that returns natural-language "
+                "guidance in the eval response `detail`. Re-read PROBLEM_BRIEF.md, then "
+                "read `detail` each eval and follow it — a higher score reflects genuine "
+                "progress in this game, not a bigger construction.")
+        repush_line = ""
+        if repush:
+            repush_line = (
+                "\n\nKEEP PUSHING: the run is NOT over — wall-clock remains (check "
+                "./container-status). You exited last turn with the hidden verifier "
+                "UNCHANGED: the Supervisor already reviewed your stop and deliberately "
+                "did NOT change the game, which means you were not actually stuck — you "
+                "stopped early. Do not idle or declare victory. Attack the SAME target "
+                "again from a genuinely different angle (a new algorithmic idea, a "
+                "sharper construction, an assumption you have not tried relaxing) and "
+                "push the score higher. Only if you are truly blocked — not merely done "
+                "— run ./container-ask-supervisor solution_out.json to escalate; do not "
+                "just exit again.")
         return (
             f"You are the SOLVER (turn {turn}). Read PROBLEM_BRIEF.md and scratchpad.md "
             "in this directory (/work) first — scratchpad.md is your own memory from "
@@ -908,7 +925,8 @@ class AgentSystem:
             "verifier flaw, run  ./container-ask-supervisor solution_out.json , then "
             "follow its instruction (write review_request.json and exit) so the "
             "Supervisor can review and you resume next turn with a fresh verifier. "
-            "Otherwise, keep improving until you are confident, then stop." + mode_line
+            "Otherwise, keep improving until you are confident, then stop."
+            + mode_line + repush_line
         )
 
     def _extract_best(self, ws: Path) -> None:
@@ -925,7 +943,7 @@ class AgentSystem:
                              score=r.score)
         if r.ok and r.score is not None and r.score > self._best_score:
             self._best_score, self._best_payload = r.score, payload
-        # Feed the plateau detector: the best-so-far after this extract (finite only).
+        # Feed the score trajectory: the best-so-far after this extract (finite only).
         if self._best_score != float("-inf"):
             self._score_trajectory.append(self._best_score)
         self.store.trajectory(event="best_extracted", best_score=self._best_score,
