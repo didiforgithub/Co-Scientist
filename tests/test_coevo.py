@@ -2072,6 +2072,53 @@ def test_wave_start_is_idempotent_resume(tmp_path, monkeypatch):
     assert sum(r["status"] == "pending" for r in man2["runs"]) == 1
 
 
+def test_alive_treats_zombie_as_dead(tmp_path):
+    """Regression: os.kill(pid,0) SUCCEEDS for a zombie (exited-but-unreaped) child, so a
+    naive liveness check reports a finished run as forever-alive and wave scheduling
+    deadlocks on the first wave (cards never freed, pending never launched). _alive must
+    read /proc and treat state 'Z' as dead."""
+    import os
+    import time as _time
+    from coscientist.coevo import launcher as L
+
+    pid = os.fork()
+    if pid == 0:
+        os._exit(0)                      # child exits immediately -> zombie
+    try:
+        for _ in range(50):              # let it exit; now a zombie (we haven't waited)
+            _time.sleep(0.01)
+            stat = open(f"/proc/{pid}/stat").read()
+            if stat[stat.rfind(")") + 1:].split()[0] == "Z":
+                break
+        assert L._alive(pid) is False, "a zombie child must read as DEAD, not alive"
+    finally:
+        os.waitpid(pid, 0)               # reap so we don't leak the zombie
+
+
+def test_reap_children_clears_exited_children(tmp_path):
+    """_reap_children must non-blockingly reap exited children so they stop being
+    zombies (and stop keeping os.kill(pid,0) alive), and must not raise with no
+    children."""
+    import os
+    import time as _time
+    from coscientist.coevo import launcher as L
+
+    pid = os.fork()
+    if pid == 0:
+        os._exit(0)
+    for _ in range(50):
+        _time.sleep(0.01)
+        try:
+            stat = open(f"/proc/{pid}/stat").read()
+            if stat[stat.rfind(")") + 1:].split()[0] == "Z":
+                break
+        except OSError:
+            break
+    L._reap_children()                    # reap our zombie
+    assert L._alive(pid) is False         # pid gone entirely now
+    L._reap_children()                    # no children left -> harmless no-op
+
+
 def test_package_k3_task_is_idempotent(tmp_path):
     """package_k3_task copies the raw task + writes the resource.toml template, and a
     second call is a no-op that neither re-copies nor clobbers the resource.toml."""

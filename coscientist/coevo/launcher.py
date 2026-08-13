@@ -314,6 +314,7 @@ class Batch:
         Returns one action dict per run for the watch loop's termination check.
         """
         now = time.time() if now is None else now
+        _reap_children()      # reap our exited children so _alive doesn't see zombies
         man = self._read_manifest()
         runs = man.get("runs", [])
         pool = man.get("gpu_devices", [str(i) for i in range(8)])
@@ -526,6 +527,16 @@ class Batch:
 # helpers
 # ---------------------------------------------------------------------------
 def _alive(pid: Optional[int]) -> bool:
+    """True iff the pid is a live process. A ZOMBIE counts as DEAD.
+
+    Subtlety that once deadlocked wave scheduling: ``os.kill(pid, 0)`` SUCCEEDS for a
+    zombie (a child that exited but the parent hasn't reaped) — it's still in the
+    process table — so a kill-0 liveness check would report a finished run as forever
+    alive, and the scheduler would never free its card or launch a pending run. So we
+    additionally read ``/proc/<pid>/stat`` and treat state ``Z`` as dead. The watcher
+    also reaps its own children each tick (see ``_reap_children``) so they don't linger
+    as zombies; this proc check is the belt-and-suspenders for pids that aren't our
+    direct children (e.g. after a watcher restart)."""
     if not pid:
         return False
     try:
@@ -534,7 +545,31 @@ def _alive(pid: Optional[int]) -> bool:
         return False          # no such process
     except PermissionError:
         return True           # exists but not ours to signal — still alive
+    # exists — but a zombie is a finished process awaiting reap: treat as dead.
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        state = stat[stat.rfind(")") + 1:].split()[0]  # field after "(comm)"
+        if state == "Z":
+            return False
+    except (OSError, IndexError):
+        pass                  # no /proc (non-Linux) or race — fall back to kill-0 result
     return True
+
+
+def _reap_children() -> None:
+    """Reap any of OUR exited children (non-blocking) so finished runs don't linger as
+    zombies. subprocess.Popen children become zombies on exit until the parent wait()s;
+    the watcher never Popen.wait()s (it tracks liveness by pid via the manifest), so it
+    must reap here or the process table fills with <defunct> entries that also keep
+    ``os.kill(pid,0)`` succeeding."""
+    while True:
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return            # no children at all
+        if pid == 0:
+            return            # children exist but none have exited yet
+
 
 
 def _read_json(path: Path, *, default):
