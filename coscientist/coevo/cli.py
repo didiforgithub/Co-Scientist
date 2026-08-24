@@ -43,7 +43,6 @@ import json
 import os
 from pathlib import Path
 
-from ..demo import taskspec
 from ..demo.evaluator import Evaluator
 from ..demo.human_port import AutoHuman, CliHuman
 from .driver import CoevoConfig, LogicalClock, build_run
@@ -222,6 +221,26 @@ def run_agent_system(args) -> None:
         opt["resource_config_path"] = Path(args.resource_config)
     if getattr(args, "freeze_verifier", False):
         opt["freeze_verifier"] = True
+    if getattr(args, "feishu_expert_id", None):
+        opt["human_expert_id"] = args.feishu_expert_id
+        opt["lark_cli_executable"] = getattr(
+            args, "lark_cli_executable", "lark-cli"
+        )
+        opt["human_agent_timeout_s"] = getattr(
+            args, "human_agent_timeout_s", 180.0
+        )
+    if getattr(args, "human_proxy_evaluator", None):
+        opt["human_proxy_evaluator_path"] = Path(args.human_proxy_evaluator)
+        if getattr(args, "human_proxy_evaluator_context", None):
+            opt["human_proxy_evaluator_context_path"] = Path(
+                args.human_proxy_evaluator_context
+            )
+        opt["human_proxy_evaluator_function"] = getattr(
+            args, "human_proxy_evaluator_function", "verify"
+        )
+        opt["human_agent_timeout_s"] = getattr(
+            args, "human_agent_timeout_s", 180.0
+        )
     ov = _build_resource_overrides(args)
     if ov is not None:
         opt["resource_overrides"] = ov
@@ -246,6 +265,12 @@ def run_agent_system(args) -> None:
     if getattr(args, "resource_config", None):
         print(f"resource  : {args.resource_config} "
               "(resource.toml; Eval/Solve containers isolated)")
+    if getattr(args, "feishu_expert_id", None):
+        print(f"human     : Feishu DM to {args.feishu_expert_id} "
+              "(max 5 sessions; unlimited turns/session)")
+    if getattr(args, "human_proxy_evaluator", None):
+        print("human     : evaluator-backed Human Proxy "
+              "(hidden V*; same 5-session contract)")
     if ov is not None:
         print(f"res overr : solver={ov.solver.to_manifest()} "
               f"verifier={ov.verifier.to_manifest()}")
@@ -354,6 +379,28 @@ def main() -> None:
                     help="resume an interrupted agent-system run from runs/<run-id>/ "
                          "(rebuilds V chain, hardenings, and best-so-far from disk; "
                          "skips re-bootstrap). No-op if no completed bootstrap is found.")
+    human_mode = ap.add_mutually_exclusive_group()
+    human_mode.add_argument("--feishu-expert-id", default=None,
+                            help="enable scarce Human Sessions via Feishu DM to this "
+                                 "expert open_id (ou_xxx): max five sessions per Co "
+                                 "run, unlimited natural-language turns until explicit "
+                                 "close confirmation")
+    human_mode.add_argument("--human-proxy-evaluator", default=None,
+                            help="enable an automated Human Proxy with a hidden real "
+                                 "evaluator Python module (same Human Session contract "
+                                 "as Feishu; V* source/results stay control-plane only)")
+    ap.add_argument("--human-proxy-evaluator-context", default=None,
+                    help="optional hidden JSON context object passed only to the Human "
+                         "Proxy evaluator; never copied into the run")
+    ap.add_argument("--human-proxy-evaluator-function", default="verify",
+                    help="callable in --human-proxy-evaluator (default: verify; accepts "
+                         "payload or payload,context and returns feasible + raw/score)")
+    ap.add_argument("--lark-cli-executable", default="lark-cli",
+                    help="lark-cli executable used for bot send/reply and the "
+                         "im.message.receive_v1 long connection")
+    ap.add_argument("--human-agent-timeout-s", type=float, default=180.0,
+                    help="wall-clock cap for one evidence-agent reply during a Human "
+                         "Session (the Feishu session itself has no message-count cap)")
     ap.add_argument("--llm-config", default=None,
                     help="path to a JSON file (kept OUTSIDE repo/runs) with "
                          '{"api_key","base_url","model"} for host-side eval/feedback '

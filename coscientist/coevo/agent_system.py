@@ -40,11 +40,11 @@ instead of the hardcoded curve-fit ones.
 
 from __future__ import annotations
 
+import difflib
 import json
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Protocol
 
 from ..demo.evaluator import Evaluator
 from . import resources as _resources
@@ -52,6 +52,7 @@ from .budget import Deadline
 from .container import (ControlSocket, DockerContainer, GatewayConfig,
                         agent_elf_path, docker_unavailable, one_shot_agent)
 from .eval_service import EvalService, FeedbackLevel
+from .human_sessions import SessionOutcome
 from .store import RunStore
 
 
@@ -83,6 +84,12 @@ class Bootstrap:
 
 class AgentSystemUnavailable(RuntimeError):
     """Raised when docker or the agent binary is absent — a clean, explained stop."""
+
+
+class HumanInteractionPort(Protocol):
+    """Blocking checkpoint used by live Feishu and deterministic tests."""
+
+    def consult(self, *, purpose: str, context: dict) -> Optional[SessionOutcome]: ...
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +385,18 @@ class AgentSystem:
     gateway: Optional[GatewayConfig] = None
     agent_elf: Optional[Path] = None
 
+    # Optional scarce human-expert channel. Tests/custom deployments inject a port
+    # directly; CLI preflight builds either the Feishu or V*-backed Proxy port.
+    # The hard maximum is intentionally not configurable: one Co run gets five
+    # sessions, while each session may have arbitrarily many natural-language turns.
+    human_port: Optional[HumanInteractionPort] = None
+    human_expert_id: Optional[str] = None
+    lark_cli_executable: str = "lark-cli"
+    human_agent_timeout_s: float = 180.0
+    human_proxy_evaluator_path: Optional[Path] = None
+    human_proxy_evaluator_context_path: Optional[Path] = None
+    human_proxy_evaluator_function: str = "verify"
+
     store: RunStore = field(init=False)
     deadline: Deadline = field(init=False)
     evaluator: Optional[Evaluator] = field(default=None, init=False)
@@ -448,6 +467,171 @@ class AgentSystem:
             raise AgentSystemUnavailable(
                 "no codex auth found (need ~/.codex/auth.json)")
         self.gateway = gw
+        human_modes = int(bool(self.human_expert_id)) + int(
+            bool(self.human_proxy_evaluator_path)
+        )
+        if human_modes > 1:
+            raise AgentSystemUnavailable(
+                "choose either a Feishu human or a Human Proxy evaluator, not both"
+            )
+        if human_modes and self.human_port is None:
+            from .feishu_human import FeishuHumanSessionService
+            from .human_evidence import CodexEvidenceAgent
+            from .human_sessions import HumanSessionStore
+
+            human_store = HumanSessionStore(self.run_dir, max_sessions=5)
+            evidence_agent = CodexEvidenceAgent(
+                self.run_dir,
+                self.raw_input_dir,
+                gateway=self.gateway,
+                agent_elf=self.agent_elf,
+                image=self.image,
+                timeout_s=self.human_agent_timeout_s,
+            )
+            if self.human_expert_id:
+                if not self.human_expert_id.startswith("ou_"):
+                    raise AgentSystemUnavailable(
+                        "--feishu-expert-id must be a Feishu open_id beginning with ou_"
+                    )
+                from .feishu_human import BlockingFeishuHumanPort
+                from .feishu_transport import LarkCliTransport
+
+                transport = LarkCliTransport(executable=self.lark_cli_executable)
+                service = FeishuHumanSessionService(
+                    store=human_store,
+                    transport=transport,
+                    agent=evidence_agent,
+                )
+                self.human_port = BlockingFeishuHumanPort(
+                    service=service,
+                    transport=transport,
+                    expert_id=self.human_expert_id,
+                )
+                return
+
+            from .human_proxy_sessions import (
+                EvaluatorBackedHumanProxyAgent,
+                HumanProxySessionPort,
+                LoopbackTransport,
+                PythonReferenceEvaluator,
+            )
+
+            reference_context: dict = {}
+            if self.human_proxy_evaluator_context_path is not None:
+                context_path = Path(self.human_proxy_evaluator_context_path).resolve()
+                try:
+                    reference_context = json.loads(
+                        context_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise AgentSystemUnavailable(
+                        "Human Proxy evaluator context is not readable JSON"
+                    ) from exc
+                if not isinstance(reference_context, dict):
+                    raise AgentSystemUnavailable(
+                        "Human Proxy evaluator context must be a JSON object"
+                    )
+            try:
+                reference = PythonReferenceEvaluator(
+                    Path(self.human_proxy_evaluator_path),
+                    function=self.human_proxy_evaluator_function,
+                    context=reference_context,
+                )
+            except Exception as exc:  # noqa: BLE001 - hide trusted V* internals cleanly
+                raise AgentSystemUnavailable(
+                    f"could not initialize hidden Human Proxy evaluator: {type(exc).__name__}"
+                ) from exc
+            transport = LoopbackTransport()
+            service = FeishuHumanSessionService(
+                store=human_store,
+                transport=transport,
+                agent=evidence_agent,
+            )
+            self.human_port = HumanProxySessionPort(
+                service=service,
+                proxy_agent=EvaluatorBackedHumanProxyAgent(reference),
+            )
+
+    def _consult_human(
+        self,
+        *,
+        purpose: str,
+        context: dict,
+        checkpoint: bool = False,
+    ) -> Optional[SessionOutcome]:
+        """Block at a human checkpoint, persist guidance, and resume safely.
+
+        A completed named checkpoint is replayed from disk on resume without opening
+        another scarce session. A Feishu or Proxy session blocks inside ``consult``;
+        no evaluator mutation can occur until the expert confirms close.
+        """
+        checkpoint_path = self.run_dir / "human" / "checkpoints" / f"{purpose}.json"
+        if checkpoint and checkpoint_path.is_file():
+            try:
+                return SessionOutcome.from_dict(
+                    json.loads(checkpoint_path.read_text(encoding="utf-8"))
+                )
+            except (OSError, json.JSONDecodeError):
+                pass
+        if self.human_port is None:
+            return None
+        self.store.event("human_session_requested", purpose=purpose)
+        outcome = self.human_port.consult(purpose=purpose, context=context)
+        if outcome is None:
+            self.store.event(
+                "human_session_skipped",
+                purpose=purpose,
+                reason="session_budget_exhausted_or_unavailable",
+            )
+            return None
+        self._persist_human_guidance(purpose, outcome)
+        if checkpoint:
+            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = checkpoint_path.with_suffix(".json.tmp")
+            temporary.write_text(
+                json.dumps(outcome.to_dict(), indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            temporary.replace(checkpoint_path)
+        self.store.event(
+            "human_session_closed",
+            purpose=purpose,
+            decision=outcome.decision,
+            unresolved=len(outcome.unresolved_questions),
+        )
+        return outcome
+
+    def _persist_human_guidance(
+        self, purpose: str, outcome: SessionOutcome
+    ) -> None:
+        human_dir = self.run_dir / "human"
+        human_dir.mkdir(parents=True, exist_ok=True)
+        with (human_dir / "guidance.jsonl").open("a", encoding="utf-8") as stream:
+            stream.write(
+                json.dumps(
+                    {"purpose": purpose, **outcome.to_dict()}, ensure_ascii=False
+                )
+                + "\n"
+            )
+        lines = [f"\n## Human Session: {purpose}\n", f"Decision: {outcome.decision}\n"]
+        labels = (
+            ("Task contract updates", outcome.task_contract_updates),
+            ("New risks", outcome.new_risks),
+            ("Approved changes", outcome.approved_changes),
+            ("Rejected changes", outcome.rejected_changes),
+            ("Human guidance", outcome.human_guidance),
+            ("Evidence requested", outcome.evidence_requested),
+            ("Evidence generated", outcome.evidence_generated),
+            ("Unresolved questions", outcome.unresolved_questions),
+        )
+        for label, values in labels:
+            if values:
+                lines.append(f"\n{label}:\n")
+                lines.extend(f"- {value}\n" for value in values)
+        if outcome.human_rationale:
+            lines.append(f"\nHuman rationale:\n{outcome.human_rationale}\n")
+        with (self.run_dir / "human_guidance.md").open("a", encoding="utf-8") as stream:
+            stream.writelines(lines)
 
     # ================================================================
     # LOOP 0 — bootstrap: the Supervisor agent authors the evaluator
@@ -458,6 +642,11 @@ class AgentSystem:
         ws.mkdir(parents=True, exist_ok=True)
         # drop the raw input straight into the Supervisor's workspace.
         _copy_tree(self.raw_input_dir, ws)
+        human_guidance = self.run_dir / "human_guidance.md"
+        if human_guidance.is_file():
+            (ws / "HUMAN_GUIDANCE.md").write_text(
+                human_guidance.read_text(encoding="utf-8"), encoding="utf-8"
+            )
         (ws / "VERIFY_CONTRACT.txt").write_text(_VERIFY_CONTRACT, encoding="utf-8")
 
         self.store.event("bootstrap_start", raw_input=str(self.raw_input_dir))
@@ -836,6 +1025,11 @@ class AgentSystem:
             _rmtree(ws)
         ws.mkdir(parents=True, exist_ok=True)
         _copy_tree(self.raw_input_dir, ws / "problem")
+        human_guidance = self.run_dir / "human_guidance.md"
+        if human_guidance.is_file():
+            (ws / "HUMAN_GUIDANCE.md").write_text(
+                human_guidance.read_text(encoding="utf-8"), encoding="utf-8"
+            )
         (ws / "current_verifier.py").write_text(
             self.eval_service.current_source(), encoding="utf-8")
         cur_fb = self.eval_service.current_feedback_source()
@@ -904,6 +1098,73 @@ class AgentSystem:
 
         verdict = _read_json(ws / "verdict.json", default={})
         self._apply_harden(ws, trigger=trigger, verdict=verdict)
+        human_guidance = self.run_dir / "human_guidance.md"
+        if human_guidance.is_file():
+            (sol_ws / "HUMAN_GUIDANCE.md").write_text(
+                human_guidance.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+
+    def _human_comparison_cases(
+        self,
+        *,
+        current_source: str,
+        proposed_source: str,
+        seed: dict,
+        probes: list[dict],
+        ctx: dict,
+    ) -> list[dict]:
+        """Evaluate a bounded shared case set under current/proposed V, never V*.
+
+        A Human Proxy privately adds V* results later. Keeping that step behind the
+        HumanInteractionPort prevents reference source/results from entering the run
+        context visible to Solver or the ordinary evidence agent.
+        """
+        candidates: list[tuple[str, dict]] = []
+        if isinstance(seed, dict):
+            candidates.append(("seed", seed))
+        for index, probe in enumerate(probes[:6]):
+            if isinstance(probe, dict) and isinstance(probe.get("solution"), dict):
+                candidates.append((f"probe_{index}", probe["solution"]))
+        if isinstance(self._best_payload, dict):
+            candidates.append(("best_candidate", self._best_payload))
+
+        deduplicated: list[tuple[str, dict]] = []
+        fingerprints: set[str] = set()
+        for label, payload in candidates:
+            try:
+                fingerprint = json.dumps(payload, sort_keys=True, default=str)
+            except TypeError:
+                fingerprint = repr(payload)
+            if fingerprint not in fingerprints:
+                fingerprints.add(fingerprint)
+                deduplicated.append((label, payload))
+
+        evaluator = self.evaluator
+        if evaluator is None:
+            return []
+
+        def score(payload: dict, source: str) -> dict:
+            result = evaluator.run(
+                payload,
+                ctx,
+                source=source,
+                env=self._llm_env() or None,
+            )
+            return {
+                "ok": result.error is None,
+                "feasible": bool(result.feasible) if result.error is None else False,
+                "score": result.raw if result.error is None else None,
+            }
+
+        return [
+            {
+                "label": label,
+                "payload": payload,
+                "current": score(payload, current_source),
+                "proposed": score(payload, proposed_source),
+            }
+            for label, payload in deduplicated
+        ]
 
     def _apply_harden(self, ws: Path, *, trigger: str, verdict: dict) -> None:
         """Install whatever the smith authored: a new verifier and/or a feedback module,
@@ -958,6 +1219,59 @@ class AgentSystem:
                               installed=False, mode=self._mode,
                               reasoning=str(verdict.get("reasoning", ""))[:400])
             return
+
+        # The proposal is valid but not yet installed.  A configured Human Session
+        # freezes the evaluator at its current version while the expert inspects the
+        # exact source/diff and talks to the evidence agent.  Only an explicit final
+        # `approve` installs this proposal; guidance/rejection is persisted for the
+        # next Supervisor attempt.  If the five-session budget is exhausted, consult
+        # returns None and the original autonomous semantics continue.
+        if self.human_port is not None:
+            current_source = svc.current_source()
+            proposal_diff = "".join(
+                difflib.unified_diff(
+                    current_source.splitlines(keepends=True),
+                    verify_src.splitlines(keepends=True),
+                    fromfile=f"v{svc.current_version()}.py",
+                    tofile="proposed_verifier.py",
+                )
+            )
+            human_outcome = self._consult_human(
+                purpose="verifier_change",
+                context={
+                    "trigger": trigger,
+                    "current_version": svc.current_version(),
+                    "current_verifier": current_source,
+                    "proposed_verifier": verify_src,
+                    "diff": proposal_diff,
+                    "proposed_feedback": feedback_src,
+                    "verdict": verdict,
+                    "is_mode_switch": is_switch,
+                    "proposed_mode": switch.get("to_mode") if is_switch else self._mode,
+                    "comparison_cases": self._human_comparison_cases(
+                        current_source=current_source,
+                        proposed_source=verify_src,
+                        seed=val_seed,
+                        probes=val_probes,
+                        ctx=val_ctx,
+                    ),
+                },
+            )
+            if human_outcome is not None and human_outcome.decision.lower() != "approve":
+                self.store.event(
+                    "harden_held_for_human",
+                    decision=human_outcome.decision,
+                    trigger=trigger,
+                )
+                self.store.review(
+                    trigger=trigger,
+                    gaming=bool(verdict.get("gaming")),
+                    installed=False,
+                    mode=self._mode,
+                    human_decision=human_outcome.decision,
+                    reasoning=str(verdict.get("reasoning", ""))[:400],
+                )
+                return
 
         ver = svc.install_verifier(
             verify_src, origin="agent", feedback_src=feedback_src,
@@ -1024,6 +1338,11 @@ class AgentSystem:
         if brief.is_file():
             (ws / "PROBLEM_BRIEF.md").write_text(brief.read_text(encoding="utf-8"),
                                                  encoding="utf-8")
+        human_guidance = self.run_dir / "human_guidance.md"
+        if human_guidance.is_file():
+            (ws / "HUMAN_GUIDANCE.md").write_text(
+                human_guidance.read_text(encoding="utf-8"), encoding="utf-8"
+            )
         (ws / "seed_solution.json").write_text(json.dumps(self._seed, indent=2))
         (ws / "solution_out.json").write_text(json.dumps(self._seed))
         if not (ws / "scratchpad.md").exists():
@@ -1033,6 +1352,12 @@ class AgentSystem:
 
     def _solver_prompt(self, turn: int, *, repush: bool = False) -> str:
         mode_line = ""
+        human_line = ""
+        if (self.run_dir / "human_guidance.md").is_file():
+            human_line = (
+                " Read HUMAN_GUIDANCE.md too: it contains authoritative expert "
+                "clarifications and evidence requests from completed Human Sessions."
+            )
         if self._mode != "construction":
             mode_line = (
                 f"\n\nNOTE: the evaluation's GAME has been REFRAMED — it is now "
@@ -1059,7 +1384,7 @@ class AgentSystem:
         return (
             f"You are the SOLVER (turn {turn}). Read PROBLEM_BRIEF.md and scratchpad.md "
             "in this directory (/work) first — scratchpad.md is your own memory from "
-            "previous turns, keep appending to it.\n\n"
+            f"previous turns, keep appending to it.{human_line}\n\n"
             "Score any candidate solution with:  ./container-eval <solution.json>  "
             "(higher score is better; it returns verifier_version too). Check remaining "
             "time with:  ./container-status .\n\n"
@@ -1246,6 +1571,11 @@ class AgentSystem:
         if resume and self.can_resume():
             self.store.event("run_start", budget_s=self.budget_s, mode="agent_system",
                              resumed=True)
+            self._consult_human(
+                purpose="task_definition",
+                context={"phase": "resume_before_solving"},
+                checkpoint=True,
+            )
             self._resume_from_disk()
             self.solve_and_evolve(max_turns=max_turns)
             return self
@@ -1257,6 +1587,11 @@ class AgentSystem:
             "initial_feedback_level": self.feedback_level.value,
         })
         self.store.event("run_start", budget_s=self.budget_s, mode="agent_system")
+        self._consult_human(
+            purpose="task_definition",
+            context={"phase": "before_bootstrap"},
+            checkpoint=True,
+        )
         self.bootstrap()
         self.solve_and_evolve(max_turns=max_turns)
         return self

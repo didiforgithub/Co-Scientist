@@ -17,8 +17,9 @@ Roles
                    sees V's source). Pluggable: StubSolver (offline) and
                    CodexSolver (a real coding agent) share one interface.
     Supervisor   — = Eval Proposer. Owns and rewrites V; runs red-team probes in
-                   the eval container; ALWAYS able to change V (no approval gate);
-                   three advisor modes (none / V*-proxy / human).
+                   the eval container. Autonomous mode installs validated changes;
+                   optional Human Sessions freeze a proposed change until a Feishu
+                   expert or V*-holding Proxy finishes the shared conversation contract.
     driver       — plain code (not an LLM): starts the roles, owns the two-day
                    wall clock, routes the two channels, records everything.
 

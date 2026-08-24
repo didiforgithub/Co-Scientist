@@ -142,6 +142,11 @@ class ConcurrentAgentSystem:
             self._resumed = True
             self.store.event("run_start", mode="concurrent_agent_system",
                              resumed=True, concurrency=self.concurrency)
+            self.base._consult_human(
+                purpose="task_definition",
+                context={"phase": "resume_before_concurrent_solving"},
+                checkpoint=True,
+            )
             self.base._resume_from_disk()
             self._resume_concurrent_state()
         else:
@@ -155,6 +160,11 @@ class ConcurrentAgentSystem:
             })
             self.store.event("run_start", mode="concurrent_agent_system",
                              budget_s=self.base.budget_s, concurrency=self.concurrency)
+            self.base._consult_human(
+                purpose="task_definition",
+                context={"phase": "before_bootstrap", "solver_strength": "strong"},
+                checkpoint=True,
+            )
             self.base.bootstrap()
         self.solve_and_evolve_concurrent(max_generations=mg)
         return self
@@ -442,6 +452,11 @@ class ConcurrentAgentSystem:
             for f in src_dir.glob("*.md"):
                 (dst_dir / f.name).write_text(
                     f.read_text(encoding="utf-8"), encoding="utf-8")
+        human_guidance = self.base.run_dir / "human_guidance.md"
+        if human_guidance.is_file():
+            (slot.ws / "HUMAN_GUIDANCE.md").write_text(
+                human_guidance.read_text(encoding="utf-8"), encoding="utf-8"
+            )
         lines = [f"# Blackboard — generation {self._gen}", ""]
         lines.append(f"Current BAR (clean, Supervisor-verified best to beat): "
                      f"{self._bar_or_none()}")
