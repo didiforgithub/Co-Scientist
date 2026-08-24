@@ -169,20 +169,23 @@ def test_event_stream_retries_a_transient_startup_failure():
         "content": {"text": "connected"},
         "timestamp": "1",
     }
-    failed = _FakeProcess(
-        stdout_lines=[],
-        stderr_lines=[
-            (
-                '{"ok":false,"error":{"type":"authentication",'
-                '"message":"lookup accounts.feishu.cn: i/o timeout"}}'
-            )
-        ],
-    )
+    def failed_process():
+        return _FakeProcess(
+            stdout_lines=[],
+            stderr_lines=[
+                (
+                    '{"ok":false,"error":{"type":"authentication",'
+                    '"message":"lookup accounts.feishu.cn: i/o timeout"}}'
+                )
+            ],
+        )
+
+    failed = [failed_process() for _ in range(3)]
     recovered = _FakeProcess(
         stdout_lines=[json.dumps(payload)],
         stderr_lines=["[event] ready event_key=im.message.receive_v1"],
     )
-    processes = iter([failed, recovered])
+    processes = iter([*failed, recovered])
     attempts = []
 
     def fake_popen(argv, **kwargs):
@@ -193,8 +196,8 @@ def test_event_stream_retries_a_transient_startup_failure():
     events = list(transport.consume_events(ready_timeout_s=0.01))
 
     assert [event.text for event in events] == ["connected"]
-    assert len(attempts) == 2
-    assert failed.terminated
+    assert len(attempts) == 4
+    assert all(process.terminated for process in failed)
     assert recovered.terminated
 
 

@@ -28,6 +28,7 @@ class FeishuMessageEvent:
 
 class LarkCliTransport:
     EVENT_KEY = "im.message.receive_v1"
+    STARTUP_ATTEMPTS = 10
 
     def __init__(
         self,
@@ -190,7 +191,7 @@ class LarkCliTransport:
         ]
         process = None
         last_detail = "ready marker not received"
-        for attempt in range(3):
+        for attempt in range(self.STARTUP_ATTEMPTS):
             try:
                 candidate = self.process_factory(
                     argv,
@@ -201,7 +202,7 @@ class LarkCliTransport:
                     bufsize=1,
                 )
             except OSError as exc:
-                if attempt == 2:
+                if attempt == self.STARTUP_ATTEMPTS - 1:
                     raise LarkCliError(
                         f"could not start lark-cli event consumer: {exc}"
                     ) from exc
@@ -211,12 +212,14 @@ class LarkCliTransport:
                 raise LarkCliError("lark-cli event consumer has no output pipes")
 
             ready = threading.Event()
+            settled = threading.Event()
             stderr_tail: list[str] = []
 
             def drain_stderr(
                 stream=candidate.stderr,
                 tail=stderr_tail,
                 ready_event=ready,
+                settled_event=settled,
             ) -> None:
                 for line in stream:
                     stripped = line.strip()
@@ -225,19 +228,25 @@ class LarkCliTransport:
                         del tail[:-20]
                     if "[event] ready" in stripped and self.EVENT_KEY in stripped:
                         ready_event.set()
+                        settled_event.set()
+                settled_event.set()
 
             stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
             stderr_thread.start()
-            if ready.wait(timeout=ready_timeout_s):
+            settled.wait(timeout=ready_timeout_s)
+            if ready.is_set():
                 process = candidate
                 break
             self._terminate(candidate)
             last_detail = (
-                stderr_tail[-1] if stderr_tail else "ready marker not received"
+                " ".join(stderr_tail)[-600:]
+                if stderr_tail
+                else "ready marker not received"
             )
         if process is None:
             raise LarkCliError(
-                f"Feishu event consumer did not become ready after 3 attempts: "
+                "Feishu event consumer did not become ready after "
+                f"{self.STARTUP_ATTEMPTS} attempts: "
                 f"{last_detail}"
             )
         try:
