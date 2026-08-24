@@ -196,6 +196,7 @@ class LarkCliTransport:
                 candidate = self.process_factory(
                     argv,
                     shell=False,
+                    stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,

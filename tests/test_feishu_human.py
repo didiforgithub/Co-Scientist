@@ -155,6 +155,7 @@ def test_event_stream_waits_for_ready_marker_and_yields_normalized_events():
         "consume",
         "im.message.receive_v1",
     ]
+    assert captured["kwargs"].get("stdin") is subprocess.PIPE
     assert process.terminated
 
 
