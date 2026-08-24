@@ -158,6 +158,46 @@ def test_event_stream_waits_for_ready_marker_and_yields_normalized_events():
     assert process.terminated
 
 
+def test_event_stream_retries_a_transient_startup_failure():
+    payload = {
+        "event_id": "evt_after_retry",
+        "message_id": "om_after_retry",
+        "sender_id": "ou_expert",
+        "chat_id": "oc_1",
+        "chat_type": "p2p",
+        "message_type": "text",
+        "content": {"text": "connected"},
+        "timestamp": "1",
+    }
+    failed = _FakeProcess(
+        stdout_lines=[],
+        stderr_lines=[
+            (
+                '{"ok":false,"error":{"type":"authentication",'
+                '"message":"lookup accounts.feishu.cn: i/o timeout"}}'
+            )
+        ],
+    )
+    recovered = _FakeProcess(
+        stdout_lines=[json.dumps(payload)],
+        stderr_lines=["[event] ready event_key=im.message.receive_v1"],
+    )
+    processes = iter([failed, recovered])
+    attempts = []
+
+    def fake_popen(argv, **kwargs):
+        attempts.append(argv)
+        return next(processes)
+
+    transport = LarkCliTransport(process_factory=fake_popen)
+    events = list(transport.consume_events(ready_timeout_s=0.01))
+
+    assert [event.text for event in events] == ["connected"]
+    assert len(attempts) == 2
+    assert failed.terminated
+    assert recovered.terminated
+
+
 @dataclass
 class _FakeTransport:
     sent: list = None

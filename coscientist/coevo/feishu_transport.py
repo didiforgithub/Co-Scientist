@@ -188,38 +188,58 @@ class LarkCliTransport:
             "--as",
             "bot",
         ]
-        try:
-            process = self.process_factory(
-                argv,
-                shell=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
+        process = None
+        last_detail = "ready marker not received"
+        for attempt in range(3):
+            try:
+                candidate = self.process_factory(
+                    argv,
+                    shell=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                )
+            except OSError as exc:
+                if attempt == 2:
+                    raise LarkCliError(
+                        f"could not start lark-cli event consumer: {exc}"
+                    ) from exc
+                continue
+            if candidate.stdout is None or candidate.stderr is None:
+                self._terminate(candidate)
+                raise LarkCliError("lark-cli event consumer has no output pipes")
+
+            ready = threading.Event()
+            stderr_tail: list[str] = []
+
+            def drain_stderr(
+                stream=candidate.stderr,
+                tail=stderr_tail,
+                ready_event=ready,
+            ) -> None:
+                for line in stream:
+                    stripped = line.strip()
+                    if stripped:
+                        tail.append(stripped)
+                        del tail[:-20]
+                    if "[event] ready" in stripped and self.EVENT_KEY in stripped:
+                        ready_event.set()
+
+            stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+            stderr_thread.start()
+            if ready.wait(timeout=ready_timeout_s):
+                process = candidate
+                break
+            self._terminate(candidate)
+            last_detail = (
+                stderr_tail[-1] if stderr_tail else "ready marker not received"
             )
-        except OSError as exc:
-            raise LarkCliError(f"could not start lark-cli event consumer: {exc}") from exc
-        if process.stdout is None or process.stderr is None:
-            raise LarkCliError("lark-cli event consumer has no output pipes")
-
-        ready = threading.Event()
-        stderr_tail: list[str] = []
-
-        def drain_stderr() -> None:
-            for line in process.stderr:
-                stripped = line.strip()
-                if stripped:
-                    stderr_tail.append(stripped)
-                    del stderr_tail[:-20]
-                if "[event] ready" in stripped and self.EVENT_KEY in stripped:
-                    ready.set()
-
-        stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
-        stderr_thread.start()
-        if not ready.wait(timeout=ready_timeout_s):
-            self._terminate(process)
-            detail = stderr_tail[-1] if stderr_tail else "ready marker not received"
-            raise LarkCliError(f"Feishu event consumer did not become ready: {detail}")
+        if process is None:
+            raise LarkCliError(
+                f"Feishu event consumer did not become ready after 3 attempts: "
+                f"{last_detail}"
+            )
         try:
             for line in process.stdout:
                 if not line.strip():
