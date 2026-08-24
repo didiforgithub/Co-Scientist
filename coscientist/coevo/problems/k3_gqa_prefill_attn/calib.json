@@ -1,0 +1,10 @@
+{
+  "task": "K3_gqa_prefill_attn",
+  "baseline_score": 0.9792,
+  "baseline_correct": true,
+  "baseline_matches_ref": true,
+  "naive_score": 0.1729,
+  "naive_vs_baseline": 0.179,
+  "headroom": 5.6,
+  "real_hard": true
+}

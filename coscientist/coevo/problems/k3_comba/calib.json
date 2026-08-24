@@ -1,0 +1,10 @@
+{
+  "task": "K3_comba",
+  "baseline_score": 0.9812,
+  "baseline_correct": true,
+  "baseline_matches_ref": true,
+  "naive_score": 0.0171,
+  "naive_vs_baseline": 0.019,
+  "headroom": 52.6,
+  "real_hard": true
+}

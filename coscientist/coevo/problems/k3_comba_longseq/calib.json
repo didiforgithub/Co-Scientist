@@ -1,0 +1,10 @@
+{
+  "task": "K3_comba_longseq",
+  "baseline_score": 0.9792,
+  "baseline_correct": true,
+  "baseline_matches_ref": true,
+  "naive_score": 0.0031,
+  "naive_vs_baseline": 0.0033,
+  "headroom": 306.2,
+  "real_hard": true
+}

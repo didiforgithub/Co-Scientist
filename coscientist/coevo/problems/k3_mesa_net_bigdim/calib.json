@@ -1,0 +1,10 @@
+{
+  "task": "K3_mesa_net_bigdim",
+  "baseline_score": 0.9722,
+  "baseline_correct": true,
+  "baseline_matches_ref": true,
+  "naive_score": 0.0149,
+  "naive_vs_baseline": 0.0171,
+  "headroom": 58.3,
+  "real_hard": true
+}

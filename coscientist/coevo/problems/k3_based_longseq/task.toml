@@ -1,0 +1,37 @@
+version = "1.1"
+source = "Converted from kernel_100_task_suite.zip"
+
+[metadata]
+author = "kernel_autoresearch_suite"
+difficulty = "hard"
+domain = "cuda"
+tags = ["cuda", "kernel", "pytorch", "triton", "A-linear-attention"]
+
+[agent]
+timeout_sec = 7200
+user = "agent"
+
+[verifier]
+timeout_sec = 3600
+user = "root"
+
+[environment]
+build_timeout_sec = 1800
+cpus = 8
+memory_mb = 32768
+storage_mb = 20480
+gpus = 1
+gpu_types = ["H100"]
+allow_internet = false
+
+[optimization]
+metric = "naive_relative_speedup"
+direction = "higher"
+
+[optimization.baseline]
+score = 1.0
+method = "Naive plain-PyTorch oracle"
+
+[optimization.reference]
+score = 133.8
+method = "Calibrated strong baseline: fla.based:fused_chunk_based"

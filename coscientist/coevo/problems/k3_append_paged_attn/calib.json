@@ -1,0 +1,10 @@
+{
+  "task": "K3_append_paged_attn",
+  "baseline_score": 0.9847,
+  "baseline_correct": true,
+  "baseline_matches_ref": true,
+  "naive_score": 0.2802,
+  "naive_vs_baseline": 0.2837,
+  "headroom": 3.5,
+  "real_hard": true
+}

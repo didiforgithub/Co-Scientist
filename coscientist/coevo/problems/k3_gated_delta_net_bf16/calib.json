@@ -1,0 +1,10 @@
+{
+  "task": "K3_gated_delta_net_bf16",
+  "baseline_score": 0.9565,
+  "baseline_correct": true,
+  "baseline_matches_ref": true,
+  "naive_score": 0.0179,
+  "naive_vs_baseline": 0.021,
+  "headroom": 47.6,
+  "real_hard": true
+}

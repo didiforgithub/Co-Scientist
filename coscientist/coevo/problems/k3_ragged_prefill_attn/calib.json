@@ -1,0 +1,10 @@
+{
+  "task": "K3_ragged_prefill_attn",
+  "baseline_score": 1.1455,
+  "baseline_correct": true,
+  "baseline_matches_ref": true,
+  "naive_score": 0.1687,
+  "naive_vs_baseline": 0.1768,
+  "headroom": 5.7,
+  "real_hard": true
+}

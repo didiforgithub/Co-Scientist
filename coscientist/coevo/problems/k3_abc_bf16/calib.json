@@ -1,0 +1,10 @@
+{
+  "task": "K3_abc_bf16",
+  "baseline_score": 0.9807,
+  "baseline_correct": true,
+  "baseline_matches_ref": true,
+  "naive_score": 0.0114,
+  "naive_vs_baseline": 0.0129,
+  "headroom": 77.8,
+  "real_hard": true
+}

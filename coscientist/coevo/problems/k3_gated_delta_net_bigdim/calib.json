@@ -1,0 +1,10 @@
+{
+  "task": "K3_gated_delta_net_bigdim",
+  "baseline_score": 0.9829,
+  "baseline_correct": true,
+  "baseline_matches_ref": true,
+  "naive_score": 0.017,
+  "naive_vs_baseline": 0.0179,
+  "headroom": 56.0,
+  "real_hard": true
+}

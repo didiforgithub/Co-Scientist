@@ -1,0 +1,10 @@
+{
+  "task": "K3_gla_bigdim",
+  "baseline_score": 0.9697,
+  "baseline_correct": true,
+  "baseline_matches_ref": true,
+  "naive_score": 0.0134,
+  "naive_vs_baseline": 0.014,
+  "headroom": 71.2,
+  "real_hard": true
+}

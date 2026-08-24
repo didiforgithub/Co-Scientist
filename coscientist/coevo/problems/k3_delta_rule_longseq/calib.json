@@ -1,0 +1,10 @@
+{
+  "task": "K3_delta_rule_longseq",
+  "baseline_score": 0.9756,
+  "baseline_correct": true,
+  "baseline_matches_ref": true,
+  "naive_score": 0.0035,
+  "naive_vs_baseline": 0.004,
+  "headroom": 250.0,
+  "real_hard": true
+}

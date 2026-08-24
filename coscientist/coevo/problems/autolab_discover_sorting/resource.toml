@@ -1,0 +1,32 @@
+# Resource config for AutoLab discover_sorting — a CPU system-optimization task with a
+# WEAK bundled verifier (the shipped timed harness + verify_correctness.py oracle).
+# Same co-evolution goal as the K3 kernel tasks: hand the Solver a not-very-strong
+# verifier, let it find holes, have the Supervisor detect and harden it. The
+# bootstrap agent WRAPS the shipped harness/oracle (copies environment/ under
+# checker/) rather than replacing it.
+#
+# CPU-ONLY — no GPU, no torch, so no GPU verify seam. Both slices use this task's
+# own image, built locally from environment/Dockerfile.
+#
+# TWO ISOLATED SLICES (never shared):
+
+# [solver] — the long-lived codex container that edits the candidate source.
+#   INTERNET IS ON: codex's own LLM inference goes over the NETWORK to the remote
+#   API, NOT over the CONTROL_SOCK unix socket. Cutting the net (--network none)
+#   would BLIND codex. The task's "no external libraries / no network" rule is about
+#   the CANDIDATE at scoring time; that is enforced on the verifier slice below.
+[solver]
+image = "autolab_discover_sorting:latest"
+cpus = 4
+memory_mb = 8192
+allow_internet = true
+
+# [verifier] — the ISOLATED verify container. Runs the wrapped build + correctness
+#   oracle + timed benchmark. Separate, cred-free, NET-OFF: the candidate must not
+#   reach the network at scoring time. Pinned to the task's single-core intent.
+[verifier]
+image = "autolab_discover_sorting:latest"
+cpus = 2
+memory_mb = 2048
+timeout_sec = 300
+allow_internet = false

@@ -1,0 +1,10 @@
+{
+  "task": "K3_gated_delta_net_longseq",
+  "baseline_score": 1.002,
+  "baseline_correct": true,
+  "baseline_matches_ref": true,
+  "naive_score": 0.0031,
+  "naive_vs_baseline": 0.0033,
+  "headroom": 300.0,
+  "real_hard": true
+}

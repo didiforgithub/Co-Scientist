@@ -1,0 +1,10 @@
+{
+  "task": "K3_rwkv6_longseq",
+  "baseline_score": 0.9686,
+  "baseline_correct": true,
+  "baseline_matches_ref": true,
+  "naive_score": 0.0029,
+  "naive_vs_baseline": 0.003,
+  "headroom": 328.0,
+  "real_hard": true
+}

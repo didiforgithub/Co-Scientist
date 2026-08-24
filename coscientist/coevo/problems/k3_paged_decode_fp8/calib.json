@@ -1,0 +1,10 @@
+{
+  "task": "K3_paged_decode_fp8",
+  "baseline_score": 0.973,
+  "baseline_correct": true,
+  "baseline_matches_ref": true,
+  "naive_score": 0.075,
+  "naive_vs_baseline": 0.0844,
+  "headroom": 11.8,
+  "real_hard": true
+}

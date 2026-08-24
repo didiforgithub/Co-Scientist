@@ -1,0 +1,10 @@
+{
+  "task": "K3_gated_delta_product_bigbatch",
+  "baseline_score": 0.9317,
+  "baseline_correct": true,
+  "baseline_matches_ref": true,
+  "naive_score": 0.0171,
+  "naive_vs_baseline": 0.0192,
+  "headroom": 52.0,
+  "real_hard": true
+}

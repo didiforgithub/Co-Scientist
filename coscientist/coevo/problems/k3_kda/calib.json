@@ -1,0 +1,10 @@
+{
+  "task": "K3_kda",
+  "baseline_score": 0.9884,
+  "baseline_correct": true,
+  "baseline_matches_ref": true,
+  "naive_score": 0.0339,
+  "naive_vs_baseline": 0.038,
+  "headroom": 26.3,
+  "real_hard": true
+}

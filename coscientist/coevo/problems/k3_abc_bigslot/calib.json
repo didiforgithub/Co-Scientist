@@ -1,0 +1,10 @@
+{
+  "task": "K3_abc_bigslot",
+  "baseline_score": 0.9935,
+  "baseline_correct": true,
+  "baseline_matches_ref": true,
+  "naive_score": 0.0147,
+  "naive_vs_baseline": 0.0156,
+  "headroom": 64.0,
+  "real_hard": true
+}

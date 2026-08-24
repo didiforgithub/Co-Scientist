@@ -1,0 +1,10 @@
+{
+  "task": "K3_gdn2",
+  "baseline_score": 1.0001,
+  "baseline_correct": true,
+  "baseline_matches_ref": true,
+  "naive_score": 0.0257,
+  "naive_vs_baseline": 0.0287,
+  "headroom": 34.8,
+  "real_hard": true
+}

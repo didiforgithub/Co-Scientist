@@ -1,0 +1,10 @@
+{
+  "task": "K3_abc_longseq",
+  "baseline_score": 0.9989,
+  "baseline_correct": true,
+  "baseline_matches_ref": true,
+  "naive_score": 0.0095,
+  "naive_vs_baseline": 0.0095,
+  "headroom": 105.0,
+  "real_hard": true
+}

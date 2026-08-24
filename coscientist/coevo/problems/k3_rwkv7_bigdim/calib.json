@@ -1,0 +1,10 @@
+{
+  "task": "K3_rwkv7_bigdim",
+  "baseline_score": 0.9781,
+  "baseline_correct": true,
+  "baseline_matches_ref": true,
+  "naive_score": 0.0095,
+  "naive_vs_baseline": 0.0096,
+  "headroom": 103.9,
+  "real_hard": true
+}

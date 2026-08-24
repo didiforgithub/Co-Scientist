@@ -1,0 +1,10 @@
+{
+  "task": "K3_gqa_decode_bigcontext",
+  "baseline_score": 0.9723,
+  "baseline_correct": true,
+  "baseline_matches_ref": true,
+  "naive_score": 0.1146,
+  "naive_vs_baseline": 0.1368,
+  "headroom": 7.3,
+  "real_hard": true
+}
