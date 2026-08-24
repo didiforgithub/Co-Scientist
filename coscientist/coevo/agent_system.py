@@ -42,15 +42,21 @@ from __future__ import annotations
 
 import difflib
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional, Protocol
 
 from ..demo.evaluator import Evaluator
 from . import resources as _resources
 from .budget import Deadline
-from .container import (ControlSocket, DockerContainer, GatewayConfig,
-                        agent_elf_path, docker_unavailable, one_shot_agent)
+from .container import (
+    ControlSocket,
+    DockerContainer,
+    GatewayConfig,
+    agent_elf_path,
+    docker_unavailable,
+    one_shot_agent,
+)
 from .eval_service import EvalService, FeedbackLevel
 from .human_sessions import SessionOutcome
 from .store import RunStore
@@ -393,6 +399,8 @@ class AgentSystem:
     human_expert_id: Optional[str] = None
     lark_cli_executable: str = "lark-cli"
     human_agent_timeout_s: float = 180.0
+    human_agent_model: str = "gpt-5.6-luna"
+    human_agent_reasoning_effort: str = "low"
     human_proxy_evaluator_path: Optional[Path] = None
     human_proxy_evaluator_context_path: Optional[Path] = None
     human_proxy_evaluator_function: str = "verify"
@@ -480,10 +488,15 @@ class AgentSystem:
             from .human_sessions import HumanSessionStore
 
             human_store = HumanSessionStore(self.run_dir, max_sessions=5)
+            human_gateway = replace(
+                self.gateway,
+                model=self.human_agent_model,
+                reasoning_effort=self.human_agent_reasoning_effort,
+            )
             evidence_agent = CodexEvidenceAgent(
                 self.run_dir,
                 self.raw_input_dir,
-                gateway=self.gateway,
+                gateway=human_gateway,
                 agent_elf=self.agent_elf,
                 image=self.image,
                 timeout_s=self.human_agent_timeout_s,

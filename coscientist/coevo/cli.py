@@ -229,6 +229,12 @@ def run_agent_system(args) -> None:
         opt["human_agent_timeout_s"] = getattr(
             args, "human_agent_timeout_s", 180.0
         )
+        opt["human_agent_model"] = getattr(
+            args, "human_agent_model", "gpt-5.6-luna"
+        )
+        opt["human_agent_reasoning_effort"] = getattr(
+            args, "human_agent_reasoning_effort", "low"
+        )
     if getattr(args, "human_proxy_evaluator", None):
         opt["human_proxy_evaluator_path"] = Path(args.human_proxy_evaluator)
         if getattr(args, "human_proxy_evaluator_context", None):
@@ -240,6 +246,12 @@ def run_agent_system(args) -> None:
         )
         opt["human_agent_timeout_s"] = getattr(
             args, "human_agent_timeout_s", 180.0
+        )
+        opt["human_agent_model"] = getattr(
+            args, "human_agent_model", "gpt-5.6-luna"
+        )
+        opt["human_agent_reasoning_effort"] = getattr(
+            args, "human_agent_reasoning_effort", "low"
         )
     ov = _build_resource_overrides(args)
     if ov is not None:
@@ -401,6 +413,12 @@ def main() -> None:
     ap.add_argument("--human-agent-timeout-s", type=float, default=180.0,
                     help="wall-clock cap for one evidence-agent reply during a Human "
                          "Session (the Feishu session itself has no message-count cap)")
+    ap.add_argument("--human-agent-model", default="gpt-5.6-luna",
+                    help="model used only by the conversational Human Session evidence "
+                         "agent (default: gpt-5.6-luna; independent of the main Co model)")
+    ap.add_argument("--human-agent-reasoning-effort", default="low",
+                    help="reasoning effort used only by the Human Session evidence "
+                         "agent (default: low)")
     ap.add_argument("--llm-config", default=None,
                     help="path to a JSON file (kept OUTSIDE repo/runs) with "
                          '{"api_key","base_url","model"} for host-side eval/feedback '

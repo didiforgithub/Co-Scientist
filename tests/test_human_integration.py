@@ -239,6 +239,8 @@ def test_cli_wires_feishu_expert_and_listener_configuration(tmp_path, monkeypatc
         feishu_expert_id="ou_expert",
         lark_cli_executable="/opt/homebrew/bin/lark-cli",
         human_agent_timeout_s=90.0,
+        human_agent_model="human-fast-model",
+        human_agent_reasoning_effort="low",
     )
 
     cli.run_agent_system(args)
@@ -246,6 +248,8 @@ def test_cli_wires_feishu_expert_and_listener_configuration(tmp_path, monkeypatc
     assert captured["human_expert_id"] == "ou_expert"
     assert captured["lark_cli_executable"] == "/opt/homebrew/bin/lark-cli"
     assert captured["human_agent_timeout_s"] == 90.0
+    assert captured["human_agent_model"] == "human-fast-model"
+    assert captured["human_agent_reasoning_effort"] == "low"
 
 
 def test_cli_wires_hidden_reference_evaluator_for_human_proxy(tmp_path, monkeypatch):

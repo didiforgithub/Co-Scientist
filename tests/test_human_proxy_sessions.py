@@ -256,3 +256,5 @@ def test_agent_system_preflight_builds_proxy_port_from_hidden_evaluator_config(
 
     assert isinstance(system.human_port, HumanProxySessionPort)
     assert system.human_port.proxy_agent.reference_evaluator.context == {"target": 3}
+    assert system.human_port.service.agent.gateway.model == "gpt-5.6-luna"
+    assert system.human_port.service.agent.gateway.reasoning_effort == "low"

@@ -54,8 +54,15 @@ python -m coscientist.coevo.cli \
   --solver-strength strong \
   --feishu-expert-id ou_xxxxxxxxx \
   --lark-cli-executable lark-cli \
+  --human-agent-model gpt-5.6-luna \
+  --human-agent-reasoning-effort low \
   --human-agent-timeout-s 180
 ```
+
+The conversational evidence agent defaults to `gpt-5.6-luna` with low reasoning
+effort so a human reply does not inherit the slower model/effort selected for the
+main scientific run. Both settings are independently configurable with the flags
+above; they do not change the Solver, Supervisor, or hidden Human Proxy evaluator.
 
 Resume the same run after a process or listener interruption:
 
