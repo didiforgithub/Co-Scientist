@@ -73,6 +73,12 @@ class Bootstrap:
     # Optional solver container overrides the bootstrap agent requested (image/gpus),
     # e.g. a CUDA/kernel task. Empty = use the system defaults.
     solver_env: dict = field(default_factory=dict)
+    # Cold judgement (from reframe_policy.json): does THIS problem admit a rigorous
+    # proof/disproof reframing at all? Optimization tasks (kernel/CPU/throughput/latency)
+    # have only a practical ceiling and get False — they may NEVER be switched to a proof
+    # game. Math/physics/optimality-or-bound tasks get True plus the concrete claim.
+    admits_proof: bool = False
+    provable_claim: str = ""
 
 
 class AgentSystemUnavailable(RuntimeError):
@@ -117,6 +123,20 @@ in /work; at run time they will be available on the host at the absolute path in
 Then encode the checker's anti-gaming rules (correctness on hidden/randomized inputs,
 final-state checks, no shortcuts) as `probes.json` degenerate cases.
 
+If your verifier compiles or runs the candidate in a subprocess (e.g. `make`, `gcc`,
+a test binary), you MAY bound it with `RLIMIT_CPU`, `RLIMIT_AS`, `RLIMIT_FSIZE`,
+`RLIMIT_CORE` in a `preexec_fn`. But do NOT set `RLIMIT_NPROC`: the verifier already
+runs inside an isolated, process-capped container, and this container shares its host
+UID, so an in-process `RLIMIT_NPROC` is counted per-UID across the whole host and will
+make `fork()`/`exec` fail with "Operation not permitted" (a false all-infeasible). Rely
+on the container's own process cap, not an rlimit, to contain fork bombs. Likewise, if
+you cap how many bytes you read from a subprocess's stdout, that cap MUST exceed the
+LARGEST output any legitimate case produces (e.g. a hex dump of your biggest hidden
+input) — a read cap smaller than a correct candidate's own output silently truncates it
+and rejects every honest solution. Prove it: actually run your verifier's FULL path
+(including its largest hidden/benchmark case) on the seed and confirm it is feasible
+before you finish — an infeasible seed means the whole run has no baseline to build on.
+
 Then AUTHOR THE EVALUATION. Write these files into /work:
 
 1. `verifier.py` — {contract}
@@ -154,18 +174,39 @@ Then AUTHOR THE EVALUATION. Write these files into /work:
    SOLVER needs a specific container image or GPU access to develop/run candidates
    (e.g. a CUDA/kernel task). Omit for a plain python problem.
 
+8. `reframe_policy.json` — a COLD, up-front judgement about the NATURE of this problem:
+   does it admit a rigorous PROOF/DISPROOF at all, as opposed to only a practical
+   optimization ceiling? Decide from the problem's intrinsic type, NOT from any future
+   solver progress:
+     * OPTIMIZATION / ENGINEERING tasks — kernel / CPU / GPU / throughput / latency /
+       memory-bandwidth / compression-ratio / "make X faster or smaller" — have only an
+       empirical ceiling. There is no theorem to prove; a flat score just means the
+       current implementation is near its practical limit. These get
+       `{{"admits_proof": false}}` and MUST NEVER be reframed into a proof game.
+     * MATH / PHYSICS / ALGORITHMIC-OPTIMALITY-OR-BOUND tasks — where a specific claim
+       could in principle be proved or refuted (an optimal value, a lower/upper bound, an
+       impossibility, a closed form, an invariant) — get `{{"admits_proof": true}}` PLUS
+       `"provable_claim"`: the concrete statement that could be proved/disproved (e.g.
+       "no 12-input sorting network uses fewer than 39 comparators"). This does NOT force
+       a proof — it only records that a proof reframing is admissible IF the solver later
+       genuinely exhausts construction and reaches the theoretical limit.
+   Shape: {{"admits_proof": bool, "provable_claim": "<claim or ''>", "reasoning": "..."}}.
+   When unsure, default to `false` — a wrongly-allowed proof switch derails an
+   optimization run, while a wrongly-forbidden one merely keeps a math task in
+   construction (still a valid game).
+
 Verify your verifier.py actually imports and runs on seed_solution.json and on each
 probe before you finish (run it with python3); if you wrote feedback.py, run it too.
 This is the ENTIRE evaluation the rest of the system will use — be rigorous. When done,
 write a one-line `BOOTSTRAP_DONE` marker file.'''
 
-# The harden prompt is the Supervisor's creative brief. It ALWAYS carries the full menu
-# — tighten, expose-more, and switch/reframe the representation — and hands the Supervisor
-# `progress.json` (score trajectory, wall-clock burned in the current game, time left,
-# mode, turn) as CONTEXT. The orchestrator does NOT decide "plateau"; the Supervisor owns
-# the evaluation and judges for itself whether the current game is mined out. Its default
-# bias: while wall-clock remains, bite the current game HARDER; only reframe when a route
-# is genuinely exhausted.
+# The harden prompt is the Supervisor's creative brief. It carries TIGHTEN and EXPOSE-MORE
+# always; the SWITCH/REFRAME option (c) is injected ONLY when the problem was cold-judged
+# to admit a proof/disproof (reframe_policy.json → admits_proof). The orchestrator does NOT
+# decide "plateau"; the Supervisor owns the evaluation and judges for itself whether the
+# current game is mined out. Its default bias: while wall-clock remains, bite the current
+# game HARDER — a plateau is treated as a construction ceiling to push, never an automatic
+# cue to switch games. Reframe (when even available) is a high-bar last resort.
 _HARDEN_PROMPT = '''\
 You are the SUPERVISOR. You OWN THE EVALUATION for a problem — the hidden verifier V, an
 optional free-form feedback module, AND the very GAME the solver plays (what "solving"
@@ -188,24 +229,30 @@ In /work you have:
     remains, the current mode, and the turn count. YOU decide from this whether the
     current game still has juice or is mined out. Do NOT treat a flat stretch as an
     automatic signal to switch — a flat score often just means "keep biting harder".
+  * `solver_scratchpad.md` / `solver_review_request.json` — the solver's OWN log of what
+    it observed while running against V (present only if it wrote them). READ THEM FIRST.
+
+CRITICAL — distinguish a VERIFIER weakness from a HARNESS/INFRASTRUCTURE fault. If the
+solver's notes or V's own artifacts show that EVERY candidate scores 0 / infeasible for
+reasons UNRELATED to solution quality — e.g. a build cache or permission error
+(`mkdir /.cache: permission denied`), a missing toolchain, an unwritable directory, a
+crash BEFORE the candidate is even evaluated — then the fault is in HOW V executes, not
+in how strictly it judges. In that case DO NOT tighten and DO NOT reframe the game:
+rewrite `verifier.py` to fix the execution environment (for example set an explicit,
+writable cache such as `GOCACHE`/`HOME`/`XDG_CACHE_HOME` under a tempdir before invoking
+the toolchain, create needed dirs, or otherwise make the run succeed). A harness fault
+that suppresses all scores must be repaired, never mistaken for solver gaming.
 
 You may evolve the evaluation in ANY combination of these directions:
   (a) TIGHTEN — rewrite `verifier.py` so exploit/probe solutions score strictly LOWER
       while a genuine solution still scores well (close a gaming hole);
   (b) EXPOSE MORE — write/adjust `feedback.py` to hand the solver richer diagnostics or
-      guidance when it is honestly stuck (the numeric score stays authoritative);
-  (c) SWITCH / REFRAME THE REPRESENTATION — this is ALWAYS on the table and is YOUR
-      creative call. When you judge the current game mined out, change what the solver
-      is even playing: forward construction → a rigorous PROOF game; or a DISPROOF /
-      counterexample game that tries to refute the target; or another reformulation
-      entirely. Keep the knowledge the old game revealed, change the game.
+      guidance when it is honestly stuck (the numeric score stays authoritative);{reframe_option}
 
-DEFAULT BIAS: while wall-clock remains, prefer to keep biting the CURRENT game harder
-(tighten / expose-more / demand a sharper candidate). Only reframe (c) when you judge —
-from progress.json and probe_report.json — that the current route is genuinely exhausted
-and a different representation is the right next attack. Reframing early throws away a
-game that still had room; refusing to reframe a truly dead route wastes the clock. Your
-judgment, not a threshold.
+DEFAULT BIAS: while wall-clock remains, keep biting the CURRENT game harder (tighten /
+expose-more / demand a sharper candidate). A flat score is NOT a signal to change the
+game — for most problems it means the current implementation is near its practical
+ceiling and the solver should push the construction further, not abandon it.{reframe_bias}
 
 Decide and write into /work:
 
@@ -220,10 +267,41 @@ Decide and write into /work:
 3. If richer/guiding disclosure helps, write `feedback.py`:
        def feedback(payload, ctx, verify_result, history) -> dict  # {{"detail","artifacts"}}
    stdlib-only, may `import llm_client` for LLM guidance. Omit to keep current disclosure.
+{reframe_output}
+Verify whatever you write runs (python3) on the seed and probes before finishing.
 
-4. If — and only if — you choose to SWITCH / REFRAME the representation (c), ALSO write:
-   * `mode_switch.json` — {{"switch": true, "to_mode": "proof"|"disproof"|"<name>",
-     "reasoning": "..."}}
+Write a one-line `HARDEN_DONE` marker when finished.'''
+
+# The (c) reframe option and its output spec are injected ONLY when the problem was
+# cold-judged to ADMIT a proof/disproof (reframe_policy.json admits_proof=true). For
+# optimization/engineering tasks the reframe option is withheld entirely — there is no
+# theorem to prove, so a plateau must be attacked as construction, never escaped into a
+# subjective proof game.
+_REFRAME_OPTION_ALLOWED = '''
+  (c) SWITCH / REFRAME THE REPRESENTATION — available for THIS problem because it was
+      cold-judged to admit a rigorous argument (see the provable claim below). This is a
+      LAST RESORT, not a default escape hatch, and it is NOT triggered by a plateau. Use
+      it ONLY when ALL of the following hold, and say so explicitly in your reasoning:
+        (i) the solver has genuinely EXHAUSTED forward construction — many distinct,
+            serious attempts, not merely a flat stretch;
+        (ii) the best candidate is at what is credibly the THEORETICAL limit of the
+             problem (not just the current implementation's practical ceiling); and
+        (iii) there is a SPECIFIC provable/refutable claim to attack, namely:
+             "{provable_claim}"
+      If any of the three fails, do NOT switch — keep biting construction. Reframing an
+      optimization plateau into a proof game is a gaming failure, not progress.'''
+
+_REFRAME_BIAS_ALLOWED = ''' Only reframe (c) when its three conditions genuinely hold —
+the construction route is exhausted AT THE THEORETICAL LIMIT and a concrete provable
+claim remains. Reframing early throws away a game that still had room; your judgment,
+not a threshold, and the bar is high.'''
+
+_REFRAME_OUTPUT_ALLOWED = '''
+4. If — and only if — conditions (i)-(iii) above genuinely hold and you choose to SWITCH /
+   REFRAME the representation (c), ALSO write:
+   * `mode_switch.json` — {{"switch": true, "to_mode": "<name, e.g. proof or disproof>",
+     "justification": {{"construction_exhausted": "...", "at_theoretical_limit": "...",
+     "claim": "..."}}, "reasoning": "..."}}
    * a NEW `verifier.py` IN THE NEW REPRESENTATION. When the new game is qualitative
      (proof/disproof), make it an LLM-VERIFIER: `import llm_client`, ask the model to
      assess the argument's rigor/progress, map that onto `raw` (higher = closer to a
@@ -234,10 +312,16 @@ Decide and write into /work:
    * a NEW `seed_solution.json`, `probes.json`, and `SOLVER_BRIEF.md` IN THE NEW
      REPRESENTATION (seed = a minimal honest argument; probes = hand-wavy / circular
      attempts that MUST score LOW). The system re-baselines the solver on the new game.
+'''
 
-Verify whatever you write runs (python3) on the seed and probes before finishing.
-
-Write a one-line `HARDEN_DONE` marker when finished.'''
+# Withheld case: the problem is optimization/engineering — no proof reframing exists.
+_REFRAME_OPTION_WITHHELD = ''
+_REFRAME_BIAS_WITHHELD = (
+    ' This problem admits NO proof/disproof reframing (it is an optimization/engineering '
+    'task with only an empirical ceiling); switching the game is NOT an available move. '
+    'Your only tools are TIGHTEN and EXPOSE MORE — attack any plateau as construction.'
+)
+_REFRAME_OUTPUT_WITHHELD = ''
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +349,12 @@ class AgentSystem:
     # even the LAST review before the deadline can still harden AND re-solve.
     post_harden_solve_s: float = 900.0
     min_solver_turn_s: float = 60.0
+
+    # Control-arm switch. When True, the Supervisor never hardens/evolves the verifier:
+    # bootstrap still authors V0, the Solver still mines it for the full budget, but
+    # _run_supervisor_harden early-returns so V is frozen at v0 (hardenings=0). This is
+    # the "solve a weak evaluator" arm that pairs against the evolving treatment arm.
+    freeze_verifier: bool = False
 
     # Per-problem LLM creds for HOST-SIDE eval/feedback code that consults a model
     # (e.g. an LLM-verifier). A plain dict {"api_key","base_url","model"}; provided by
@@ -329,6 +419,12 @@ class AgentSystem:
     _mode_since_s: float = field(default=0.0, init=False)
     # monotonically increasing normal-turn counter, surfaced in progress.json.
     _turn: int = field(default=0, init=False)
+    # cold admissibility judgement from bootstrap's reframe_policy.json: does this problem
+    # admit a proof/disproof reframing at all? Optimization tasks are False (the harden
+    # prompt then withholds the SWITCH option entirely). Defaults False (conservative:
+    # runs without the file, or unreadable policy, never get the proof escape hatch).
+    _admits_proof: bool = field(default=False, init=False)
+    _provable_claim: str = field(default="", init=False)
 
     def __post_init__(self) -> None:
         self.raw_input_dir = Path(self.raw_input_dir).resolve()
@@ -379,6 +475,7 @@ class AgentSystem:
         self.evaluator.versions.append(_version0(bs.verifier_src, bs.feedback_src))
         # bs.ctx already carries ctx["checker_dir"] (pinned in _recover_bootstrap).
         self._ctx, self._seed, self._probes = bs.ctx, bs.seed_solution, bs.probes
+        self._admits_proof, self._provable_claim = bs.admits_proof, bs.provable_claim
         # Resolve the two-slice resource spec (defaults < resource.toml < CLI), then
         # apply the agent-authored solver_env.json as a LAST-RESORT fallback — the
         # structured file wins per the user's decision.
@@ -515,6 +612,14 @@ class AgentSystem:
         solver_env = _read_json(ws / "solver_env.json", default={})
         if not isinstance(solver_env, dict):
             solver_env = {}
+        # Cold admissibility policy — default to no-proof when the file is missing or
+        # malformed (conservative: an optimization task must never inherit the proof
+        # escape hatch just because the agent forgot to write the file).
+        policy = _read_json(ws / "reframe_policy.json", default={})
+        admits_proof = bool(policy.get("admits_proof", False)) \
+            if isinstance(policy, dict) else False
+        provable_claim = str(policy.get("provable_claim", "")) \
+            if isinstance(policy, dict) else ""
         # If the agent bundled a checker, pin its host path into ctx BEFORE the smoke
         # test so a wrapping verifier can reach it exactly as it will at run time.
         self._materialize_checker(ws)
@@ -542,7 +647,8 @@ class AgentSystem:
                              backend=("container" if backend else "host"))
         return Bootstrap(verifier_src=src, ctx=ctx, seed_solution=seed,
                          probes=probes, notes=notes, feedback_src=feedback_src,
-                         solver_env=solver_env)
+                         solver_env=solver_env, admits_proof=admits_proof,
+                         provable_claim=provable_claim)
 
     # ================================================================
     # LOOP 1 — solve: long-lived Solver container + file-state resume
@@ -715,6 +821,15 @@ class AgentSystem:
 
     def _run_supervisor_harden(self, best: dict, sol_ws: Path, *,
                                trigger: str) -> None:
+        # Control-arm switch: keep the bootstrap V0 verifier frozen and never let the
+        # Supervisor red-team / harden / evolve it. This is the ONLY harden entry point
+        # (both _handle_review_request and _proactive_supervise funnel here), so a single
+        # early-return disables all evolution while leaving bootstrap, the solver loop,
+        # _extract_best and _finalize untouched — the Solver just mines the frozen V0 for
+        # the full wall-clock budget. verifier stays v0, hardenings stays 0.
+        if self.freeze_verifier:
+            self.store.event("harden_skipped", trigger=trigger, reason="freeze_verifier")
+            return
         assert self.gateway and self.agent_elf and self.eval_service
         ws = self.run_dir / "harden_ws"
         if ws.exists():
@@ -730,6 +845,21 @@ class AgentSystem:
         (ws / "seed_solution.json").write_text(json.dumps(self._seed, indent=2))
         (ws / "probe_report.json").write_text(
             json.dumps(self._probe_report(), indent=2))
+        # Solver's own log + review request are FILE channels into the Supervisor's
+        # /work. The solver records concrete execution observations here (e.g. a build
+        # cache / permission / toolchain failure that makes EVERY candidate score 0 for
+        # reasons unrelated to the verifier's judgment). Without this the Supervisor only
+        # sees score=0 and misreads a harness/infra fault as a verifier weakness, then
+        # hardens forever without touching the real cause. Copy whatever the solver left.
+        for _name in ("scratchpad.md", "review_request.json"):
+            _src = sol_ws / _name
+            if _src.is_file():
+                try:
+                    (ws / f"solver_{_name}").write_text(
+                        _src.read_text(encoding="utf-8", errors="replace"),
+                        encoding="utf-8")
+                except OSError:
+                    pass
         remaining = self.deadline.remaining()
         # progress.json is CONTEXT for the Supervisor's own judgment, NOT a "plateau"
         # verdict the orchestrator computes: the score trajectory, how long the current
@@ -749,7 +879,24 @@ class AgentSystem:
         # here is what starved the harden to ~0s in the first Chowla run.
         self.store.event("harden_start", trigger=trigger, mode=self._mode,
                          remaining_s=round(remaining, 1))
-        prompt = _HARDEN_PROMPT.format()
+        # Inject the SWITCH/REFRAME option (c) ONLY for problems cold-judged to admit a
+        # proof/disproof. Optimization/engineering tasks get the slim menu (tighten +
+        # expose-more) and can never escape a plateau into a subjective proof game.
+        if self._admits_proof:
+            claim = self._provable_claim or "(the admissible claim recorded at bootstrap)"
+            prompt = _HARDEN_PROMPT.format(
+                reframe_option=_REFRAME_OPTION_ALLOWED.format(provable_claim=claim),
+                reframe_bias=_REFRAME_BIAS_ALLOWED,
+                reframe_output=_REFRAME_OUTPUT_ALLOWED,
+            )
+        else:
+            prompt = _HARDEN_PROMPT.format(
+                reframe_option=_REFRAME_OPTION_WITHHELD,
+                reframe_bias=_REFRAME_BIAS_WITHHELD,
+                reframe_output=_REFRAME_OUTPUT_WITHHELD,
+            )
+        self.store.event("harden_prompt_built", trigger=trigger,
+                         admits_proof=self._admits_proof)
         session = one_shot_agent(
             ws, self.gateway, self.agent_elf, prompt,
             timeout_s=self.harden_timeout_s, image=self.image)
@@ -1031,6 +1178,13 @@ class AgentSystem:
         solver_env = _read_json(bws / "solver_env.json", default={})
         self._resolve_resources()
         self._apply_solver_env_fallback(solver_env if isinstance(solver_env, dict) else {})
+        # Restore the cold admissibility policy (default no-proof if absent — old runs
+        # predating reframe_policy.json stay in construction, which is the safe game).
+        policy = _read_json(bws / "reframe_policy.json", default={})
+        self._admits_proof = bool(policy.get("admits_proof", False)) \
+            if isinstance(policy, dict) else False
+        self._provable_claim = str(policy.get("provable_claim", "")) \
+            if isinstance(policy, dict) else ""
         # 3. reviews handled = count of review_request events already processed; the
         #    current GAME mode = the last mode_switch recorded (else construction).
         self.reviews_handled = sum(

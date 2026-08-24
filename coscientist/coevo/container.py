@@ -104,6 +104,86 @@ def codex_home_path() -> Optional[Path]:
     return home if (home / "auth.json").is_file() else None
 
 
+def _parse_codex_config(text: str, model: str, effort: str):
+    """Extract (model, effort, provider_toml, base_urls, env_key) from a codex config.
+
+    ``provider_toml`` is the ``model_provider = "..."`` selector line plus every
+    ``[model_providers.*]`` stanza, copied verbatim so the container talks to the same
+    gateway. ``base_urls`` are the endpoints those stanzas name (used to pin DNS).
+    ``env_key`` is the ``env_key = "..."`` a custom provider reads its API key from
+    (codex reads a CUSTOM provider's key from THIS process env var, not auth.json), or
+    "" for the built-in provider. We do NOT copy ``[projects.*]`` / ``[notice]`` / etc.
+    — only what routes the model call. Hand-rolled (no toml dep on 3.10) but only over
+    the top-level lines we care about.
+    """
+    provider_sel = ""            # the `model_provider = "x"` line
+    provider_blocks: list[str] = []
+    base_urls: list[str] = []
+    env_key = ""
+    cur: list[str] | None = None   # accumulating a [model_providers.*] block
+    for line in text.splitlines():
+        s = line.strip()
+        is_section = s.startswith("[") and s.endswith("]")
+        if is_section:
+            # close any open provider block on hitting the next section header.
+            if cur is not None:
+                provider_blocks.append("\n".join(cur))
+                cur = None
+            if s.startswith("[model_providers."):
+                cur = [line.rstrip()]
+            continue
+        if cur is not None:
+            cur.append(line.rstrip())
+            if s.startswith("base_url") and "=" in s:
+                base_urls.append(s.split("=", 1)[1].strip().strip('"'))
+            elif s.startswith("env_key") and "=" in s:
+                env_key = s.split("=", 1)[1].strip().strip('"')
+            continue
+        # top-level scalars (only meaningful before the first section header)
+        if s.startswith("model_provider") and "=" in s:
+            provider_sel = s
+        elif s.startswith("model") and "=" in s and "model_reasoning" not in s \
+                and "model_provider" not in s:
+            model = s.split("=", 1)[1].strip().strip('"')
+        elif s.startswith("model_reasoning_effort") and "=" in s:
+            effort = s.split("=", 1)[1].strip().strip('"')
+    if cur is not None:
+        provider_blocks.append("\n".join(cur))
+    parts = ([provider_sel] if provider_sel else []) + provider_blocks
+    return model, effort, "\n\n".join(p for p in parts if p.strip()), base_urls, env_key
+
+
+def _resolve_static_hosts(base_urls: list[str]) -> dict:
+    """For each gateway base_url, if its host resolves ONLY via the host's static
+    ``/etc/hosts`` (no real DNS), return {hostname: ip} so we can ``--add-host`` it into
+    the container. A container inherits the daemon's DNS, not the host's /etc/hosts, so a
+    privately-mapped gateway domain is unresolvable inside without this pin."""
+    import socket as _socket
+    from urllib.parse import urlparse
+    pins: dict = {}
+    # parse the host's /etc/hosts once into {hostname: ip}
+    static: dict = {}
+    try:
+        for ln in Path("/etc/hosts").read_text(encoding="utf-8").splitlines():
+            ln = ln.split("#", 1)[0].strip()
+            if not ln:
+                continue
+            cols = ln.split()
+            ip = cols[0]
+            for name in cols[1:]:
+                static.setdefault(name, ip)
+    except OSError:
+        return pins
+    for url in base_urls:
+        host = urlparse(url).hostname
+        if not host or host in pins:
+            continue
+        # only pin when the host is in /etc/hosts (private) — leave real DNS names alone.
+        if host in static:
+            pins[host] = static[host]
+    return pins
+
+
 # ---------------------------------------------------------------------------
 # agent auth — the codex home (auth.json), discovered from the host, never hardcoded
 # ---------------------------------------------------------------------------
@@ -122,6 +202,22 @@ class GatewayConfig:
     codex_home: Path
     model: str = "gpt-5.6-sol"
     reasoning_effort: str = "high"
+    # The custom-provider wiring copied VERBATIM from the host config.toml: the
+    # ``model_provider = "..."`` selector plus every ``[model_providers.*]`` stanza.
+    # Without this the in-container config names a model but no endpoint, so codex
+    # silently falls back to the built-in ``api.openai.com`` and 401s against a key
+    # minted for a private gateway. Empty when the host uses the default provider.
+    provider_toml: str = ""
+    # Host -> IP pins for any gateway domain the provider block points at that resolves
+    # only via the host's static ``/etc/hosts`` (a private gateway with no working
+    # authoritative DNS). Threaded into ``docker run --add-host`` so the container can
+    # resolve the endpoint the provider block names. {} when nothing needs pinning.
+    extra_hosts: dict = field(default_factory=dict)
+    # For a CUSTOM provider, the env var name codex reads its API key from (its
+    # ``env_key``). codex loads a custom provider's key from THIS process env, NOT from
+    # auth.json, so we must inject it at ``docker exec`` time. Only the NAME lives here;
+    # the VALUE is read from the mounted auth.json on demand and never stored/logged.
+    provider_env_key: str = ""
 
     @classmethod
     def from_host(cls) -> Optional["GatewayConfig"]:
@@ -130,23 +226,49 @@ class GatewayConfig:
         if home is None:
             return None
         model, effort = "gpt-5.6-sol", "high"
+        provider_toml, base_urls, env_key = "", [], ""
         cfg = home / "config.toml"
         if cfg.is_file():
             try:
-                for line in cfg.read_text(encoding="utf-8").splitlines():
-                    s = line.strip()
-                    if s.startswith("model") and "=" in s and "model_reasoning" not in s:
-                        model = s.split("=", 1)[1].strip().strip('"')
-                    elif s.startswith("model_reasoning_effort") and "=" in s:
-                        effort = s.split("=", 1)[1].strip().strip('"')
+                model, effort, provider_toml, base_urls, env_key = _parse_codex_config(
+                    cfg.read_text(encoding="utf-8"), model, effort)
             except OSError:
                 pass
-        return cls(codex_home=Path(home).resolve(), model=model, reasoning_effort=effort)
+        # Resolve any gateway host that only exists in the host's static /etc/hosts
+        # (private gateway, no authoritative DNS) so we can re-pin it in the container.
+        extra_hosts = _resolve_static_hosts(base_urls)
+        return cls(codex_home=Path(home).resolve(), model=model, reasoning_effort=effort,
+                   provider_toml=provider_toml, extra_hosts=extra_hosts,
+                   provider_env_key=env_key)
+
+    def provider_key_value(self) -> Optional[str]:
+        """Read the custom provider's API key VALUE from the mounted auth.json, by the
+        name its provider block declared (``provider_env_key``). Returns None when there
+        is no custom provider or the key is absent. The value is used ONLY to build a
+        ``docker exec -e NAME`` (value passed via the child env, never via argv), and is
+        never stored on the instance, logged, or written anywhere."""
+        if not self.provider_env_key:
+            return None
+        try:
+            import json as _json
+            auth = _json.loads((self.codex_home / "auth.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        val = auth.get(self.provider_env_key)
+        return str(val) if val else None
 
     def container_config_toml(self) -> str:
-        """A minimal, self-contained config for the mounted CODEX_HOME overlay."""
-        return (f'model = "{self.model}"\n'
-                f'model_reasoning_effort = "{self.reasoning_effort}"\n')
+        """A minimal, self-contained config for the mounted CODEX_HOME overlay.
+
+        Carries the model + effort AND the host's custom-provider wiring (selector +
+        ``[model_providers.*]`` blocks) so the in-container codex talks to the same
+        private gateway the host does, not the built-in OpenAI endpoint."""
+        parts = [f'model = "{self.model}"',
+                 f'model_reasoning_effort = "{self.reasoning_effort}"']
+        if self.provider_toml.strip():
+            parts.append("")
+            parts.append(self.provider_toml.rstrip())
+        return "\n".join(parts) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +530,19 @@ class DockerContainer:
                 "-e", "CODEX_HOME=/codexhome",
                 "-e", f"CONTROL_SOCK=/work/{self.control_sock_name}",
                 "-w", "/work"]
+        # codex >=0.147 spawns a sibling helper (``codex-code-mode-host``) from the
+        # same dir as the codex ELF to run tool calls; without it every file op fails
+        # with "workspace execution service is unavailable". Mount the sibling at the
+        # matching /usr/local/bin path when it ships alongside the ELF.
+        _cmh = Path(self.agent_elf).with_name("codex-code-mode-host")
+        if _cmh.is_file():
+            argv += ["-v", f"{_cmh}:/usr/local/bin/codex-code-mode-host:ro"]
+        # Pin any private gateway domain (resolvable only via the host's /etc/hosts) so
+        # the in-container codex can reach the endpoint its provider block names. Harmless
+        # when empty; independent of the network mode below (bootstrap/harden containers
+        # are un-resourced and keep the default bridge, so they DO have egress).
+        for host, ip in (self.gateway.extra_hosts or {}).items():
+            argv += ["--add-host", f"{host}:{ip}"]
         if self.control_sock_host_path is not None:
             # The socket was bound outside the workdir (AF_UNIX path too long) —
             # mount that exact file at the fixed in-container path so the shim's
@@ -454,12 +589,23 @@ class DockerContainer:
         flag; it is ignored (the prompt governs tool use instead)."""
         if not self._started or self._cid is None:
             raise RuntimeError("container not started")
-        argv = ["docker", "exec", "-i", "-w", allowed_dir, self._cid,
+        # A custom provider reads its API key from an env var (env_key), which codex does
+        # NOT source from the mounted auth.json — inject it here. The var NAME goes on the
+        # argv via `-e NAME`; docker forwards the VALUE from THIS process's env, so the
+        # secret never appears in argv/ps/logs. Scoped to this exec only.
+        exec_env = None
+        key_flags: list[str] = []
+        key_val = self.gateway.provider_key_value()
+        if key_val:
+            name = self.gateway.provider_env_key
+            key_flags = ["-e", name]
+            exec_env = {**os.environ, name: key_val}
+        argv = ["docker", "exec", "-i", "-w", allowed_dir, *key_flags, self._cid,
                 "codex", "exec", "--skip-git-repo-check",
                 "--dangerously-bypass-approvals-and-sandbox", prompt]
         try:
             proc = subprocess.run(argv, capture_output=True, text=True,
-                                  timeout=max(1.0, timeout_s))
+                                  env=exec_env, timeout=max(1.0, timeout_s))
         except subprocess.TimeoutExpired:
             return AgentSession(ok=False, returncode=-1, stdout="", stderr="",
                                 note="agent hit the wall-clock budget")

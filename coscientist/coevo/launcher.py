@@ -129,6 +129,7 @@ class Batch:
     # -- launch -----------------------------------------------------------
     def start(self, inputs: list[Path], *, hours: float, python: str = sys.executable,
               gpu_devices: Optional[list[str]] = None,
+              cpu_slots: Optional[int] = None,
               extra_args: Optional[list[str]] = None,
               dry_run: bool = False) -> list[LaunchSpec]:
         """Launch the FIRST WAVE and record the rest as pending (wave scheduling).
@@ -147,8 +148,19 @@ class Batch:
         ``start`` command is safe to re-run after a host reboot.
 
         ``dry_run=True`` builds the first-wave argv (each with its ``--*-gpus device=N``
-        pin) and lists the pending queue, but spawns nothing and writes no manifest."""
-        pool = list(gpu_devices) if gpu_devices else [str(i) for i in range(8)]
+        pin) and lists the pending queue, but spawns nothing and writes no manifest.
+
+        **CPU-slot mode** (``cpu_slots=N``, mutually exclusive with ``gpu_devices``):
+        the pool becomes ``["slot0".."slotN-1"]`` — pure concurrency tokens, not cards.
+        ``_build_argv`` then skips the ``--*-gpus`` pin (the runs are gpus=0). Everything
+        else — wave fill, respawn-on-same-slot, deadline anchoring — is identical, since
+        the scheduler treats a device as an opaque token. ``cpu_mode`` is persisted to the
+        manifest so a resume keeps skipping the GPU pin."""
+        cpu_mode = cpu_slots is not None
+        if cpu_mode:
+            pool = [f"slot{i}" for i in range(int(cpu_slots))]
+        else:
+            pool = list(gpu_devices) if gpu_devices else [str(i) for i in range(8)]
         self.batch_dir.mkdir(parents=True, exist_ok=True)
         budget_s = hours * 3600.0
 
@@ -176,12 +188,15 @@ class Batch:
                 spec.gpu_device = pool[i]
 
         if dry_run:
-            print(f"[dry-run] GPU pool: {pool}")
+            kind = "CPU slots" if cpu_mode else "GPU pool"
+            print(f"[dry-run] {kind}: {pool}")
             print(f"[dry-run] first wave: {wave} run(s); pending: {len(specs) - wave}")
             for spec in specs[:wave]:
                 argv = self._build_argv(spec, budget_s=budget_s, python=python,
-                                        extra_args=extra_args or [])
-                print(f"  RUNNING dev={spec.gpu_device}  {spec.run_id}\n"
+                                        extra_args=extra_args or [], cpu_mode=cpu_mode)
+                slot = spec.gpu_device
+                tag = f"slot={slot}" if cpu_mode else f"dev={slot}"
+                print(f"  RUNNING {tag}  {spec.run_id}\n"
                       f"    {' '.join(argv)}")
             for spec in specs[wave:]:
                 print(f"  PENDING          {spec.run_id}  <- {spec.input_dir}")
@@ -191,7 +206,7 @@ class Batch:
         for i, spec in enumerate(specs):
             if i < wave:
                 pid = self._spawn(spec, budget_s=budget_s, python=python,
-                                  extra_args=extra_args or [])
+                                  extra_args=extra_args or [], cpu_mode=cpu_mode)
                 now = time.time()
                 records.append({"run_id": spec.run_id,
                                 "input_dir": str(spec.input_dir),
@@ -227,6 +242,7 @@ class Batch:
                               "runs_dir": str(self.runs_dir.resolve()),
                               "python": python,
                               "gpu_devices": pool,
+                              "cpu_mode": cpu_mode,
                               "extra_args": list(extra_args or []),
                               "runs": records})
         return specs
@@ -241,7 +257,7 @@ class Batch:
             gpu_device=r.get("gpu_device"))
 
     def _build_argv(self, spec: LaunchSpec, *, budget_s: float, python: str,
-                    extra_args: list[str]) -> list[str]:
+                    extra_args: list[str], cpu_mode: bool = False) -> list[str]:
         argv = [python, "-m", "coscientist.coevo.cli",
                 "--input", str(spec.input_dir),
                 "--solver", "codex", "--supervisor", "no-human-no-proxy",
@@ -256,7 +272,14 @@ class Batch:
                 "--run-id", spec.run_id]
         if spec.resource_config is not None:
             argv += ["--resource-config", str(spec.resource_config)]
-        if spec.gpu_device is not None:
+        if cpu_mode:
+            # CPU-slot batch: spec.gpu_device holds a pure concurrency-slot token
+            # (e.g. "slot3"), NOT a physical card. Do NOT emit --*-gpus — the runs are
+            # gpus=0 (resource.toml has no [*].gpus), so pinning a device would be wrong
+            # and the nvidia runtime would reject it. The slot token only gates how many
+            # run at once; the OS schedules the containers' CPUs itself.
+            pass
+        elif spec.gpu_device is not None:
             # Pin BOTH the solver and verifier containers to this physical card. These
             # CLI flags override resource.toml (merge order defaults < resource.toml <
             # CLI), and the nvidia runtime reads `docker run --gpus device=N` from them.
@@ -268,9 +291,9 @@ class Batch:
         return argv
 
     def _spawn(self, spec: LaunchSpec, *, budget_s: float, python: str,
-               extra_args: list[str]) -> int:
+               extra_args: list[str], cpu_mode: bool = False) -> int:
         argv = self._build_argv(spec, budget_s=budget_s, python=python,
-                                extra_args=extra_args)
+                                extra_args=extra_args, cpu_mode=cpu_mode)
         env = dict(os.environ)
         env.setdefault("PYTHONPATH", str(Path(__file__).resolve().parents[2]))
         log = spec.log_path.open("a", encoding="utf-8")
@@ -320,6 +343,7 @@ class Batch:
         pool = man.get("gpu_devices", [str(i) for i in range(8)])
         python = man.get("python", sys.executable)
         extra_args = man.get("extra_args", []) or []
+        cpu_mode = bool(man.get("cpu_mode", False))
         actions: dict[str, dict] = {}
         changed = False
 
@@ -376,7 +400,7 @@ class Batch:
             # premature death with budget + a card: respawn on the SAME device.
             spec = self._spec_of(r)
             pid = self._spawn(spec, budget_s=remaining, python=python,
-                              extra_args=extra_args)
+                              extra_args=extra_args, cpu_mode=cpu_mode)
             r["pid"] = pid
             r["status"] = "running"
             r["last_launch_epoch"] = now
@@ -399,7 +423,7 @@ class Batch:
             spec = self._spec_of(r)
             spec.gpu_device = dev
             pid = self._spawn(spec, budget_s=r.get("budget_s", 0.0), python=python,
-                              extra_args=extra_args)
+                              extra_args=extra_args, cpu_mode=cpu_mode)
             r["pid"] = pid
             r["status"] = "running"
             r["gpu_device"] = dev
@@ -657,6 +681,10 @@ def main(argv: Optional[list[str]] = None) -> None:
     sp.add_argument("--hours", type=float, default=4.0, help="wall-clock budget per run")
     sp.add_argument("--gpus", type=int, default=8,
                     help="GPU pool size; devices 0..N-1 are wave-scheduled across runs")
+    sp.add_argument("--cpu-slots", type=int, default=None,
+                    help="CPU-slot mode: N opaque concurrency slots (no GPU pin) "
+                         "wave-scheduled across runs. Set this for CPU-only batches "
+                         "(e.g. AutoLab); overrides --gpus.")
     sp.add_argument("--runs-dir", default="runs")
     sp.add_argument("--python", default=sys.executable)
     sp.add_argument("--dry-run", action="store_true",
@@ -668,6 +696,12 @@ def main(argv: Optional[list[str]] = None) -> None:
                          "cards until every run is done or its budget is spent.")
     sp.add_argument("--watch-interval-s", type=float, default=30.0,
                     help="seconds between wave-supervision passes when --watch is set")
+    sp.add_argument("--extra-args", nargs="*", default=[],
+                    help="extra flags appended verbatim to every child cli.py argv "
+                         "(persisted in the manifest, reused on every --resume respawn). "
+                         "NOTE: to pass a flag that starts with '-', use the '=' form, "
+                         "e.g. --extra-args=--freeze-verifier (a bare "
+                         "'--extra-args --freeze-verifier' makes argparse reject it).")
 
     st = sub.add_parser("status", help="show a table of all runs in a batch")
     st.add_argument("--batch", required=True)
@@ -708,13 +742,19 @@ def main(argv: Optional[list[str]] = None) -> None:
     batch = Batch(args.batch, runs_dir=Path(args.runs_dir))
 
     if args.cmd == "start":
-        pool = [str(i) for i in range(args.gpus)]
+        cpu_mode = args.cpu_slots is not None
+        pool = ([f"slot{i}" for i in range(args.cpu_slots)] if cpu_mode
+                else [str(i) for i in range(args.gpus)])
         specs = batch.start([Path(p) for p in args.inputs], hours=args.hours,
                             python=args.python, gpu_devices=pool,
+                            cpu_slots=args.cpu_slots,
+                            extra_args=list(args.extra_args or []),
                             dry_run=args.dry_run)
         if args.dry_run:
+            kind = (f"pool of {args.cpu_slots} CPU slot(s)" if cpu_mode
+                    else f"pool of {args.gpus} GPU(s)")
             print(f"\n[dry-run] {len(specs)} run(s) planned for batch {args.batch!r} "
-                  f"({args.hours}h each, pool of {args.gpus} GPU(s)) — nothing launched.")
+                  f"({args.hours}h each, {kind}) — nothing launched.")
             return
         man = batch._read_manifest()
         running = [r for r in man.get("runs", []) if r.get("status") == "running"]

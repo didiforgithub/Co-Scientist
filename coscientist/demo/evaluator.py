@@ -265,9 +265,22 @@ class Evaluator:
             argv += ["--cpus", str(b["cpus"])]
         if b.get("memory_mb") is not None:
             argv += ["--memory", f"{int(b['memory_mb'])}m"]
+        # Container-scoped fork-bomb containment (cgroup pids controller). This is the
+        # CORRECT process cap for a verifier that self-compiles: it is counted per
+        # CONTAINER, unlike an in-verifier RLIMIT_NPROC which — because the container
+        # runs as the host UID with no userns-remap — is counted per-host-UID GLOBALLY
+        # and so trips on a shared box where that UID already owns many processes
+        # (make/gcc fork -> EAGAIN -> "Operation not permitted"). 512 is ample for a
+        # make + gcc + oracle chain while still stopping a runaway fork bomb.
+        argv += ["--pids-limit", str(int(b.get("pids_limit", 512)))]
         if not b.get("allow_internet", False):
             argv += ["--network", "none"]
-        argv += [b.get("image") or "python:3.11-slim", "python", "/w/_runner.py", *argv_tail]
+        # Use ``python3`` (not ``python``): every task image ships a python3 on PATH,
+        # but some slim images (e.g. python:3.x built without the compat symlink) lack
+        # a bare ``python``. Hardcoding ``python`` makes runc fail at container init with
+        # exec: "python": executable file not found — a false all-infeasible that burns
+        # the whole budget in bootstrap respawns. python3 is the portable choice.
+        argv += [b.get("image") or "python:3.11-slim", "python3", "/w/_runner.py", *argv_tail]
         return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
 
     def run(self, payload: dict, ctx: dict, source: Optional[str] = None,

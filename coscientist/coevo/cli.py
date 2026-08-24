@@ -220,6 +220,8 @@ def run_agent_system(args) -> None:
         opt["solver_gpus"] = args.solver_gpus
     if getattr(args, "resource_config", None):
         opt["resource_config_path"] = Path(args.resource_config)
+    if getattr(args, "freeze_verifier", False):
+        opt["freeze_verifier"] = True
     ov = _build_resource_overrides(args)
     if ov is not None:
         opt["resource_overrides"] = ov
@@ -247,14 +249,30 @@ def run_agent_system(args) -> None:
     if ov is not None:
         print(f"res overr : solver={ov.solver.to_manifest()} "
               f"verifier={ov.verifier.to_manifest()}")
+    strength = getattr(args, "solver_strength", "weak")
+    if strength == "strong":
+        print(f"strength  : STRONG — {args.concurrency} concurrent solvers, "
+              f"<= {args.max_generations} generations (synchronous barrier)")
     print("-" * 72)
     try:
-        system.run(max_turns=args.max_turns, resume=getattr(args, "resume", False))
+        if strength == "strong":
+            from .concurrent_agent_system import ConcurrentAgentSystem
+            gen_turn_s = (args.gen_turn_s if getattr(args, "gen_turn_s", None)
+                          else system.post_harden_solve_s)
+            cx = ConcurrentAgentSystem(base=system, concurrency=args.concurrency,
+                                       gen_turn_s=gen_turn_s,
+                                       max_generations=args.max_generations)
+            cx.run(max_generations=args.max_generations,
+                   resume=getattr(args, "resume", False))
+            runner = cx
+        else:
+            system.run(max_turns=args.max_turns, resume=getattr(args, "resume", False))
+            runner = system
     except AgentSystemUnavailable as e:
         print(f"\nagent system unavailable (clean stop): {e}")
         print("This path needs docker + the claude agent binary + a model gateway.")
         return
-    s = system.summary()
+    s = runner.summary()
     print("\n" + "=" * 72)
     print("agent system — result")
     print("=" * 72)
@@ -262,6 +280,9 @@ def run_agent_system(args) -> None:
           f"({s['verifier_hardenings']} agent-authored hardening(s))")
     print(f"supervisor reviews : {s['reviews_handled']}")
     print(f"best score (final V): {fmt(s['best_score'])}")
+    if strength == "strong":
+        print(f"generations run    : {s['generations']}   "
+              f"final bar: {fmt(s['final_bar'])}   concurrency: {s['concurrency']}")
     print(f"run recorded under : {run_dir}")
     print("Inspect: supervisor/verifier_versions/ (agent-authored V), "
           "solver/candidates/, eval/queries.jsonl, events.jsonl.")
@@ -300,6 +321,22 @@ def main() -> None:
                     help="safety cap on solver steps for finite offline runs")
     ap.add_argument("--max-turns", type=int, default=12,
                     help="max Solver agent turns in the general agent-system path")
+    ap.add_argument("--solver-strength", default="weak", choices=["weak", "strong"],
+                    help="solver reasoning-strength dial for the agent-system path: "
+                         "weak=one long-lived Solver agent (default); strong=N "
+                         "concurrent Solver agents on ONE problem, sharing a blackboard, "
+                         "advancing in synchronous generations, with the Supervisor "
+                         "triggered only on a new SOTA (provisional -> hack-check -> "
+                         "broadcast-or-harden).")
+    ap.add_argument("--concurrency", type=int, default=4,
+                    help="number of concurrent Solver agents in --solver-strength strong "
+                         "(default 4).")
+    ap.add_argument("--max-generations", type=int, default=8,
+                    help="cap on synchronous generations in --solver-strength strong "
+                         "(default 8). Wall-clock (--budget-s) still bounds the run.")
+    ap.add_argument("--gen-turn-s", type=float, default=None,
+                    help="per-solver wall-clock per generation in --solver-strength "
+                         "strong (default: --post-harden-solve-s).")
     ap.add_argument("--bootstrap-timeout-s", type=float, default=None,
                     help="wall-clock cap for the Supervisor bootstrap agent turn "
                          "(agent-system path; default in AgentSystem, ~900s)")
@@ -309,6 +346,10 @@ def main() -> None:
     ap.add_argument("--post-harden-solve-s", type=float, default=None,
                     help="protected budget for the guaranteed post-harden Solver turn "
                          "(agent-system path; default ~900s)")
+    ap.add_argument("--freeze-verifier", action="store_true",
+                    help="control arm: keep the bootstrap V0 verifier but NEVER "
+                         "harden/evolve it; the Solver mines the frozen weak V for the "
+                         "full budget (agent-system path)")
     ap.add_argument("--resume", action="store_true",
                     help="resume an interrupted agent-system run from runs/<run-id>/ "
                          "(rebuilds V chain, hardenings, and best-so-far from disk; "

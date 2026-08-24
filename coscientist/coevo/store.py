@@ -31,6 +31,7 @@ injectable clock so it stamps the same wall-clock the Deadline uses.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -56,6 +57,11 @@ class RunStore:
     _t0: float = field(init=False)
     _candidate_seq: int = field(default=0, init=False)
     _probe_seq: int = field(default=0, init=False)
+    # Serializes every append + seq bump. Uncontended (≈free) on the single-threaded
+    # weak path; correct under the strong mode's concurrent solver/supervisor threads,
+    # where an unlocked ``open("a")`` interleaves lines and a bare ``seq += 1`` races.
+    _lock: "threading.Lock" = field(default_factory=threading.Lock, init=False,
+                                    repr=False, compare=False)
 
     def __post_init__(self) -> None:
         self.root = Path(self.root)
@@ -72,8 +78,10 @@ class RunStore:
     def _append(self, rel: str, obj: dict) -> None:
         p = self.root / rel
         p.parent.mkdir(parents=True, exist_ok=True)
-        with p.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(_jsonable(obj)) + "\n")
+        line = json.dumps(_jsonable(obj)) + "\n"
+        with self._lock:
+            with p.open("a", encoding="utf-8") as fh:
+                fh.write(line)
 
     # -- manifest ---------------------------------------------------------
     def write_manifest(self, manifest: dict) -> None:
@@ -118,8 +126,9 @@ class RunStore:
 
     def candidate(self, payload: dict, feedback: dict, *, score: Optional[float]) -> str:
         """Persist a submitted solution + the feedback it received. Returns its id."""
-        cid = f"cand_{self._candidate_seq:05d}"
-        self._candidate_seq += 1
+        with self._lock:
+            cid = f"cand_{self._candidate_seq:05d}"
+            self._candidate_seq += 1
         (self.root / "solver" / "candidates" / f"{cid}.json").write_text(
             json.dumps(_jsonable({"id": cid, "t": self.t(), "score": score,
                                   "payload": payload, "feedback": feedback}), indent=2),
@@ -151,8 +160,9 @@ class RunStore:
     def probe(self, *, description: str, payload: dict, score: Optional[float],
               expected_low: bool, fooled: bool) -> str:
         """Record a Supervisor red-team probe and whether V was fooled by it."""
-        pid = f"probe_{self._probe_seq:04d}"
-        self._probe_seq += 1
+        with self._lock:
+            pid = f"probe_{self._probe_seq:04d}"
+            self._probe_seq += 1
         (self.root / "supervisor" / "probes" / f"{pid}.json").write_text(
             json.dumps(_jsonable({
                 "id": pid, "t": self.t(), "description": description,

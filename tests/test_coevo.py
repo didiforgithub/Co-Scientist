@@ -1123,8 +1123,9 @@ def test_llm_creds_reach_eval_subprocess_never_the_container(tmp_path, monkeypat
 
 def test_supervisor_can_switch_construction_to_proof(tmp_path, monkeypatch):
     """The motivating arc: the Supervisor may REFRAME the game to proof-guidance. The
-    full menu (incl. mode_switch) is ALWAYS in the harden prompt — no orchestrator
-    "plateau" gate. Driven through the real loop with a fake harden agent that writes
+    mode_switch mechanism is injected into the harden prompt ONLY for a problem that was
+    cold-judged to ADMIT a proof (reframe_policy.json admits_proof=true) — here we mark
+    the task admissible. Driven through the real loop with a fake harden agent that writes
     mode_switch.json + a proof verifier + a new contract; the switch must install,
     _mode flip to 'proof', the brief be rewritten, and the owed re-baseline solve run
     in the NEW representation."""
@@ -1132,6 +1133,9 @@ def test_supervisor_can_switch_construction_to_proof(tmp_path, monkeypatch):
 
     system, A = _bootstrapped_system(tmp_path, monkeypatch)
 
+    # this task admits a proof reframing — so the harden prompt offers option (c).
+    system._admits_proof = True
+    system._provable_claim = "the scalar objective has a provable optimum"
     # a flat trajectory is just CONTEXT now (progress.json), not a trigger.
     system._score_trajectory = [3.0, 3.0, 3.0]
 
@@ -1184,7 +1188,7 @@ def test_supervisor_can_switch_construction_to_proof(tmp_path, monkeypatch):
         (ws / "verdict.json").write_text(json.dumps(
             {"gaming": False, "reasoning": "construction exhausted; switch to proof"}))
         if harden_calls["n"] == 1:
-            # the full menu — incl. the reframe mechanism — is ALWAYS present.
+            # for a proof-ADMITTING task the reframe mechanism is present.
             assert "mode_switch.json" in prompt, "switch mechanism not in harden prompt"
             (ws / "mode_switch.json").write_text(json.dumps(
                 {"switch": True, "to_mode": "proof", "reasoning": "scalar exhausted"}))
@@ -1213,6 +1217,93 @@ def test_supervisor_can_switch_construction_to_proof(tmp_path, monkeypatch):
     events = [json.loads(l) for l in
               (system.run_dir / "events.jsonl").read_text().strip().splitlines()]
     assert any(e["kind"] == "mode_switch" and e.get("to_mode") == "proof" for e in events)
+
+
+def test_optimization_task_harden_prompt_withholds_reframe(tmp_path, monkeypatch):
+    """Admissibility gate: for a task cold-judged NOT to admit a proof (the default,
+    admits_proof=False — kernel/CPU/throughput optimization), the harden prompt must
+    NOT contain the SWITCH/REFRAME option (c) nor its mode_switch.json output spec. The
+    Supervisor can only TIGHTEN / EXPOSE-MORE; a plateau cannot escape into a proof game."""
+    from coscientist.coevo.container import AgentSession
+
+    system, A = _bootstrapped_system(tmp_path, monkeypatch)
+    # optimization task: no proof admissible (this is the dataclass default, made explicit).
+    system._admits_proof = False
+    system._provable_claim = ""
+    system._score_trajectory = [3.0, 3.0, 3.0]
+
+    seen = {"prompt": None}
+
+    def fake_harden_agent(ws, gateway, agent_elf, prompt, *, timeout_s, image,
+                          disallowed_tools=None):
+        ws = Path(ws)
+        seen["prompt"] = prompt
+        (ws / "verdict.json").write_text(json.dumps(
+            {"gaming": False, "reasoning": "keep biting construction"}))
+        (ws / "HARDEN_DONE").write_text("done")
+        return AgentSession(ok=True, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(A, "one_shot_agent", fake_harden_agent)
+
+    best = system._best_payload or system._seed
+    system._run_supervisor_harden(best, system.run_dir / "solver_ws", trigger="proactive")
+
+    p = seen["prompt"]
+    assert p is not None, "harden agent was never invoked"
+    assert "mode_switch.json" not in p, "reframe output leaked into an optimization prompt"
+    assert "(c) SWITCH" not in p, "reframe option (c) leaked into an optimization prompt"
+    assert "admits NO proof" in p, "the withheld-bias sentence is missing"
+    # the game stays construction; no switch happened.
+    assert system._mode == "construction"
+
+
+def test_solver_scratchpad_reaches_supervisor_harden_workspace(tmp_path, monkeypatch):
+    """FILE CHANNEL from Solver to Supervisor. The solver records concrete execution
+    observations (e.g. a build-cache/permission fault that zeroes every candidate for
+    reasons unrelated to the verifier) in solver_ws/scratchpad.md. When a harden fires,
+    that log — plus any review_request.json — must be copied into the Supervisor's /work
+    (harden workspace) so it can tell an INFRASTRUCTURE fault from a verifier weakness,
+    and the harden prompt must point the Supervisor at those files and at the infra-fix
+    guidance instead of a blind tighten."""
+    from coscientist.coevo.container import AgentSession
+
+    system, A = _bootstrapped_system(tmp_path, monkeypatch)
+
+    sol_ws = system.run_dir / "solver_ws"
+    sol_ws.mkdir(parents=True, exist_ok=True)
+    diag = ("## turn 12\nbuild failed: `mkdir /.cache: permission denied`\n"
+            "local `go test` is fine — the runner env has no writable GOCACHE.\n")
+    (sol_ws / "scratchpad.md").write_text(diag)
+    (sol_ws / "review_request.json").write_text(json.dumps(
+        {"solution": {"value": 3}, "question": "every build crashes before eval — env?"}))
+
+    seen = {"prompt": None, "ws": None}
+
+    def fake_harden_agent(ws, gateway, agent_elf, prompt, *, timeout_s, image,
+                          disallowed_tools=None):
+        ws = Path(ws)
+        seen["prompt"] = prompt
+        seen["ws"] = ws
+        (ws / "verdict.json").write_text(json.dumps(
+            {"gaming": False, "reasoning": "infra fault, fixing execution env"}))
+        (ws / "HARDEN_DONE").write_text("done")
+        return AgentSession(ok=True, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(A, "one_shot_agent", fake_harden_agent)
+
+    best = system._best_payload or system._seed
+    system._run_supervisor_harden(best, sol_ws, trigger="review_request")
+
+    ws = seen["ws"]
+    assert ws is not None, "harden agent was never invoked"
+    # the solver's own files landed in the Supervisor's /work, content intact.
+    assert (ws / "solver_scratchpad.md").read_text() == diag
+    assert "every build crashes" in (ws / "solver_review_request.json").read_text()
+    # the prompt points the Supervisor at them and at the infra-vs-verifier distinction.
+    p = seen["prompt"]
+    assert "solver_scratchpad.md" in p
+    assert "HARNESS/INFRASTRUCTURE fault" in p
+    assert "GOCACHE" in p
 
 
 def test_validate_evaluation_accepts_a_separating_modality_change(tmp_path, monkeypatch):
@@ -1853,7 +1944,7 @@ def test_launcher_respawns_crashed_child_with_remaining_budget(tmp_path, monkeyp
 
     spawned = []
 
-    def fake_spawn(self, spec, *, budget_s, python, extra_args):
+    def fake_spawn(self, spec, *, budget_s, python, extra_args, cpu_mode=False):
         spawned.append({"run_id": spec.run_id, "budget_s": budget_s,
                         "gpu": spec.gpu_device})
         return 4000 + len(spawned)
@@ -1941,9 +2032,9 @@ def _wave_batch(tmp_path, monkeypatch, *, n_inputs, gpus, spawn_log):
     problem dirs and a pool of `gpus`. Returns (L, batch, inputs)."""
     from coscientist.coevo import launcher as L
 
-    def fake_spawn(self, spec, *, budget_s, python, extra_args):
+    def fake_spawn(self, spec, *, budget_s, python, extra_args, cpu_mode=False):
         spawn_log.append({"run_id": spec.run_id, "gpu": spec.gpu_device,
-                          "budget_s": budget_s})
+                          "budget_s": budget_s, "cpu_mode": cpu_mode})
         return 5000 + len(spawn_log)
 
     monkeypatch.setattr(L.Batch, "_spawn", fake_spawn)
@@ -2072,6 +2163,31 @@ def test_wave_start_is_idempotent_resume(tmp_path, monkeypatch):
     assert sum(r["status"] == "pending" for r in man2["runs"]) == 1
 
 
+def test_wave_cpu_slot_mode_no_gpu_pin(tmp_path, monkeypatch):
+    """CPU-slot mode: the pool is opaque slot tokens, _spawn is told cpu_mode=True, and
+    the built argv carries NO --*-gpus pin (the runs are gpus=0). The manifest persists
+    cpu_mode so a resume keeps skipping the pin."""
+    spawn_log = []
+    L, batch, inputs = _wave_batch(tmp_path, monkeypatch, n_inputs=3, gpus=0,
+                                   spawn_log=spawn_log)
+    batch.start(inputs, hours=4.0, cpu_slots=2)
+
+    # first wave = 2 slots; every spawn saw cpu_mode=True on a slotN token.
+    assert len(spawn_log) == 2
+    assert all(s["cpu_mode"] is True for s in spawn_log)
+    assert sorted(s["gpu"] for s in spawn_log) == ["slot0", "slot1"]
+
+    man = json.loads((tmp_path / "runs" / "wave" / "batch.json").read_text())
+    assert man["cpu_mode"] is True
+    assert man["gpu_devices"] == ["slot0", "slot1"]
+
+    # the real argv builder must emit no GPU flags for a slot-token spec.
+    spec = batch._spec_of(next(r for r in man["runs"] if r["status"] == "running"))
+    argv = batch._build_argv(spec, budget_s=14400.0, python="py",
+                             extra_args=[], cpu_mode=True)
+    assert "--solver-gpus" not in argv and "--verifier-gpus" not in argv
+
+
 def test_alive_treats_zombie_as_dead(tmp_path):
     """Regression: os.kill(pid,0) SUCCEEDS for a zombie (exited-but-unreaped) child, so a
     naive liveness check reports a finished run as forever-alive and wave scheduling
@@ -2145,3 +2261,577 @@ def test_package_k3_task_is_idempotent(tmp_path):
                              problems_root=problems, template=template)
     assert dst2 == dst
     assert (dst / "resource.toml").read_text() == "EDITED", "idempotent: no clobber"
+
+
+# ---------------------------------------------------------------------------
+# STRONG solver mode: N concurrent solvers over one shared black box.
+# All offline/deterministic — fake containers return instantly, so the
+# generational barrier joins immediately; ordering is asserted via events,
+# never sleeps. Mirrors the _bootstrapped_system + FakeContainer/FakeControl
+# stubs used by the weak-mode loop tests above.
+# ---------------------------------------------------------------------------
+def _strong_fakes(exec_calls, *, value_fn, version_rec=None, note_fn=None,
+                  repair_writes=True):
+    """Build (FakeContainer, FakeControl) for the concurrent orchestrator.
+
+    ``value_fn(idx)`` -> the value each solver writes to solution_out.json this turn.
+    ``version_rec`` (optional list) records svc.current_version at each exec (to prove
+    V is frozen within a generation). ``note_fn(idx)`` -> the peer-note text a NORMAL
+    turn writes; default writes a generic note (real solvers MUST write one). A repair
+    turn (recognized by its prompt) writes a note iff ``repair_writes`` and touches
+    nothing else. FakeControl captures the per-solver handler so a test can drive it."""
+    handlers = {}
+    if note_fn is None:
+        note_fn = lambda i: f"solver{i} note"
+
+    class FakeContainer:
+        def __init__(self, *, workdir, gateway, agent_elf, image, **kw):
+            self.ws = Path(workdir)
+            self.idx = int(self.ws.name.rsplit("_", 1)[1])
+            self.name = kw.get("name")
+        def start(self):
+            return self
+        def stop(self):
+            pass
+        def exec_agent(self, prompt, *, timeout_s, **kw):
+            from coscientist.coevo.container import AgentSession
+            is_repair = "did NOT write" in prompt or "note-only" in prompt \
+                or "NOTES_FOR_PEERS.md, which the other solvers" in prompt
+            exec_calls.append({"idx": self.idx, "budget": timeout_s,
+                               "repair": is_repair})
+            if is_repair:
+                # note-only turn: DO NOT re-run the solution, only (maybe) write the note.
+                if repair_writes:
+                    (self.ws / "NOTES_FOR_PEERS.md").write_text(note_fn(self.idx))
+                return AgentSession(ok=True, returncode=0, stdout="", stderr="")
+            v = value_fn(self.idx)
+            if v is not None:
+                (self.ws / "solution_out.json").write_text(json.dumps({"value": v}))
+            note = note_fn(self.idx)
+            if note:
+                (self.ws / "NOTES_FOR_PEERS.md").write_text(note)
+            return AgentSession(ok=True, returncode=0, stdout="", stderr="")
+
+    class FakeControl:
+        def __init__(self, *, workdir, handler, **kw):
+            self.workdir = workdir
+            self.handler = handler
+            handlers[int(Path(workdir).name.rsplit("_", 1)[1])] = handler
+        def seed_shims(self, ws):
+            pass
+        def start(self):
+            return self
+        def stop(self):
+            pass
+        @property
+        def needs_explicit_mount(self):
+            return False
+        @property
+        def host_path(self):
+            return Path(self.workdir) / ".control.sock"
+
+    return FakeContainer, FakeControl, handlers
+
+
+_STRICTER_CAP5 = (
+    "def verify(payload, ctx):\n"
+    "    try:\n"
+    "        v = float(payload.get('value', 0))\n"
+    "    except Exception:\n"
+    "        return {'feasible': False, 'raw': -1e9, 'artifacts': {}}\n"
+    "    feasible = 0 <= v <= 5\n"
+    "    return {'feasible': feasible, 'raw': (v if feasible else -1e9),"
+    " 'artifacts': {'value': v}}\n"
+)
+
+
+def _concurrent(system, **kw):
+    from coscientist.coevo.concurrent_agent_system import ConcurrentAgentSystem
+    return ConcurrentAgentSystem(base=system, **kw)
+
+
+def test_concurrent_runs_n_solvers_one_generation(tmp_path, monkeypatch):
+    """N=3 solvers each get a workspace and a turn in a single generation; the
+    orchestrator records one agent_turn cost per solver and closes the generation."""
+    from coscientist.coevo import concurrent_agent_system as C
+
+    system, _A = _bootstrapped_system(tmp_path, monkeypatch)
+    exec_calls = []
+    FakeContainer, FakeControl, _ = _strong_fakes(exec_calls, value_fn=lambda i: 3 + i)
+    monkeypatch.setattr(C, "DockerContainer", FakeContainer)
+    monkeypatch.setattr(C, "ControlSocket", FakeControl)
+
+    cx = _concurrent(system, concurrency=3, max_generations=1)
+    # no supervisor moves — clean broadcast path only.
+    monkeypatch.setattr(system, "_run_supervisor_harden",
+                        lambda best, ws, *, trigger: None)
+    cx.solve_and_evolve_concurrent(max_generations=1)
+
+    for i in range(3):
+        assert (Path(system.run_dir) / f"solver_ws_{i}").is_dir()
+    assert sorted(c["idx"] for c in exec_calls) == [0, 1, 2]
+    costs = [json.loads(l) for l in _read_lines_test(system.run_dir / "cost.jsonl")]
+    turn_costs = {c["who"] for c in costs if c.get("kind") == "agent_turn"}
+    assert turn_costs == {"solver_0", "solver_1", "solver_2"}
+    events = [json.loads(l) for l in _read_lines_test(system.run_dir / "events.jsonl")]
+    kinds = [e["kind"] for e in events]
+    assert "generation_start" in kinds and "generation_done" in kinds
+
+
+def test_generational_barrier_freezes_v_within_generation(tmp_path, monkeypatch):
+    """V is frozen for the whole generation: every solver's turn sees the same
+    verifier_version; a harden lands only at the barrier (after the join)."""
+    from coscientist.coevo import concurrent_agent_system as C
+
+    system, _A = _bootstrapped_system(tmp_path, monkeypatch)
+    versions_at_exec = []
+
+    class RecCtrl:  # a shim-less recorder wired via exec
+        pass
+
+    def value_fn(i):
+        versions_at_exec.append(system.eval_service.current_version())
+        return 8   # beats the -inf bar -> a provisional SOTA
+    exec_calls = []
+    FakeContainer, FakeControl, _ = _strong_fakes(exec_calls, value_fn=value_fn)
+    monkeypatch.setattr(C, "DockerContainer", FakeContainer)
+    monkeypatch.setattr(C, "ControlSocket", FakeControl)
+
+    def fake_harden(best, sol_ws, *, trigger):
+        if system.eval_service.current_version() == 0:
+            system.eval_service.install_verifier(_STRICTER_CAP5, origin="agent",
+                                                 note="harden")
+            system.hardenings += 1
+    monkeypatch.setattr(system, "_run_supervisor_harden", fake_harden)
+
+    cx = _concurrent(system, concurrency=3, max_generations=1)
+    cx.solve_and_evolve_concurrent(max_generations=1)
+
+    # every solver turn in generation 1 saw v0 (frozen); the bump happened at the barrier.
+    assert versions_at_exec == [0, 0, 0]
+    assert system.eval_service.current_version() == 1
+    events = [json.loads(l) for l in _read_lines_test(system.run_dir / "events.jsonl")]
+    done = [e for e in events if e["kind"] == "generation_done"][-1]
+    assert done["verifier_version"] == 1
+
+
+def test_provisional_sota_clean_broadcasts_bar(tmp_path, monkeypatch):
+    """A clean hack-check (Supervisor installs NOTHING) broadcasts the new SOTA as the
+    bar; the next generation injects that bar into every solver's BLACKBOARD.md."""
+    from coscientist.coevo import concurrent_agent_system as C
+
+    system, _A = _bootstrapped_system(tmp_path, monkeypatch)
+    exec_calls = []
+    FakeContainer, FakeControl, _ = _strong_fakes(exec_calls, value_fn=lambda i: 7)
+    monkeypatch.setattr(C, "DockerContainer", FakeContainer)
+    monkeypatch.setattr(C, "ControlSocket", FakeControl)
+    # clean: the hack-check finds no hole and installs nothing (V unchanged).
+    monkeypatch.setattr(system, "_run_supervisor_harden",
+                        lambda best, ws, *, trigger: None)
+
+    cx = _concurrent(system, concurrency=2, max_generations=2)
+    cx.solve_and_evolve_concurrent(max_generations=2)
+
+    assert cx._bar == 7.0
+    events = [json.loads(l) for l in _read_lines_test(system.run_dir / "events.jsonl")]
+    assert any(e["kind"] == "sota_broadcast" and e["score"] == 7.0 for e in events)
+    # generation 2 re-injected the bar into each solver's blackboard render.
+    bb = (Path(system.run_dir) / "solver_ws_0" / "BLACKBOARD.md").read_text()
+    assert "7.0" in bb
+
+
+def test_every_solver_leaves_blackboard_trace_notes_stored_as_files(tmp_path, monkeypatch):
+    """Each solver leaves a blackboard entry EVERY generation: a written note goes to a
+    file under peer_notes/ (full text, NOT inlined into BLACKBOARD.md), and a silent
+    solver is still recorded with has_note=False. Notes are mirrored into every solver's
+    own ws so peers can read them, and BLACKBOARD.md carries only the INDEX + paths."""
+    from coscientist.coevo import concurrent_agent_system as C
+
+    system, _A = _bootstrapped_system(tmp_path, monkeypatch)
+    exec_calls = []
+    # solver 0 writes a note; solver 1 stays silent (empty note).
+    note_fn = lambda i: ("solver0 trick: coalesce loads, score up" if i == 0 else "")
+    FakeContainer, FakeControl, _ = _strong_fakes(
+        exec_calls, value_fn=lambda i: 3 + i, note_fn=note_fn)
+    monkeypatch.setattr(C, "DockerContainer", FakeContainer)
+    monkeypatch.setattr(C, "ControlSocket", FakeControl)
+    monkeypatch.setattr(system, "_run_supervisor_harden",
+                        lambda best, ws, *, trigger: None)
+
+    cx = _concurrent(system, concurrency=2, max_generations=1)
+    cx.solve_and_evolve_concurrent(max_generations=1)
+
+    # canonical store: solver 0's note is a file; solver 1 wrote none.
+    notes_dir = Path(system.run_dir) / "peer_notes"
+    assert (notes_dir / "solver_0_gen1.md").is_file()
+    assert (notes_dir / "solver_0_gen1.md").read_text().startswith("solver0 trick")
+    assert not (notes_dir / "solver_1_gen1.md").exists()
+
+    # blackboard.json index records BOTH solvers this generation (silent one flagged).
+    bb = json.loads((Path(system.run_dir) / "blackboard.json").read_text())
+    by_who = {n["who"]: n for n in bb["notes"]}
+    assert by_who["solver_0"]["has_note"] is True
+    assert by_who["solver_0"]["path"] == "peer_notes/solver_0_gen1.md"
+    assert by_who["solver_1"]["has_note"] is False
+    # a missing note is surfaced as an event, not silently dropped.
+    events = [json.loads(l) for l in _read_lines_test(system.run_dir / "events.jsonl")]
+    assert any(e["kind"] == "solver_note_missing" and e["idx"] == 1 for e in events)
+
+    # BLACKBOARD.md is an INDEX (path + "no note"), never the note's full body.
+    # (gen 2 injects gen-1 notes; render into a fresh solver ws to inspect.)
+    from coscientist.coevo.concurrent_agent_system import SolverSlot
+    ws = Path(system.run_dir) / "solver_ws_render"
+    ws.mkdir(parents=True, exist_ok=True)
+    slot = SolverSlot(idx=0, ws=ws, control=None, container=None)
+    cx._inject_context(slot)
+    inj = (ws / "BLACKBOARD.md").read_text()
+    assert "peer_notes/solver_0_gen1.md" in inj          # index points at the file
+    assert "coalesce loads" not in inj                    # full body NOT inlined
+    assert "no note this generation" in inj               # silent solver shown
+    # the note file was mirrored into the solver's own ws so it can open it.
+    assert (ws / "peer_notes" / "solver_0_gen1.md").is_file()
+
+
+def test_missing_note_is_repaired_without_rerunning_solution(tmp_path, monkeypatch):
+    """A solver that skipped NOTES_FOR_PEERS.md gets a SHORT note-only repair turn; the
+    repaired note overwrites its has_note=False stub, and the repair does NOT re-run the
+    solution (no second solution eval / value_fn re-fire)."""
+    from coscientist.coevo import concurrent_agent_system as C
+
+    system, _A = _bootstrapped_system(tmp_path, monkeypatch)
+    exec_calls = []
+    solved = {"n": 0}
+    def value_fn(i):
+        solved["n"] += 1
+        return 3 + i
+    # NORMAL turn writes NO note (force the repair path); the REPAIR turn writes one.
+    note_fn = lambda i: f"repaired note from solver{i}"
+    FakeContainer, FakeControl, _ = _strong_fakes(
+        exec_calls, value_fn=value_fn, note_fn=note_fn)
+
+    # Make the normal turn silent but the repair turn speak: wrap exec to strip the note
+    # on the first (solution) turn only.
+    orig_exec = FakeContainer.exec_agent
+    def exec_agent(self, prompt, *, timeout_s, **kw):
+        r = orig_exec(self, prompt, timeout_s=timeout_s, **kw)
+        is_repair = exec_calls[-1]["repair"]
+        if not is_repair:
+            # normal turn: remove the note so this solver looks "missing".
+            f = self.ws / "NOTES_FOR_PEERS.md"
+            if f.exists():
+                f.unlink()
+        return r
+    FakeContainer.exec_agent = exec_agent
+    monkeypatch.setattr(C, "DockerContainer", FakeContainer)
+    monkeypatch.setattr(C, "ControlSocket", FakeControl)
+    monkeypatch.setattr(system, "_run_supervisor_harden",
+                        lambda best, ws, *, trigger: None)
+
+    cx = _concurrent(system, concurrency=2, max_generations=1)
+    cx.solve_and_evolve_concurrent(max_generations=1)
+
+    # 2 normal turns + 2 repair turns; the solution ran ONCE per solver (repair didn't).
+    normal = [c for c in exec_calls if not c["repair"]]
+    repair = [c for c in exec_calls if c["repair"]]
+    assert len(normal) == 2 and len(repair) == 2
+    assert solved["n"] == 2, "repair turn must NOT re-run the solution"
+
+    # both solvers were missing, then repaired: file lands + stub flips to has_note=True.
+    for i in (0, 1):
+        assert (Path(system.run_dir) / "peer_notes" / f"solver_{i}_gen1.md").is_file()
+    bb = json.loads((Path(system.run_dir) / "blackboard.json").read_text())
+    by_who = {n["who"]: n for n in bb["notes"]}
+    assert by_who["solver_0"]["has_note"] is True
+    assert by_who["solver_1"]["has_note"] is True
+    events = [json.loads(l) for l in _read_lines_test(system.run_dir / "events.jsonl")]
+    assert sum(1 for e in events if e["kind"] == "solver_note_repaired") == 2
+    assert all(e["ok"] for e in events if e["kind"] == "solver_note_repaired")
+
+
+def test_note_repair_overlaps_supervision_same_barrier(tmp_path, monkeypatch):
+    """Repair and the Supervisor hack-check run in the SAME barrier: a hacked SOTA
+    hardens V while the silent solver's note is repaired — both land this generation,
+    and the concurrent store writes stay well-formed (RunStore is thread-safe)."""
+    from coscientist.coevo import concurrent_agent_system as C
+
+    system, _A = _bootstrapped_system(tmp_path, monkeypatch)
+    exec_calls = []
+    # solver 0 hacks (value 8, great under v0, infeasible under v1) AND stays silent;
+    # solver 1 is honest (value 4) and writes a note normally.
+    def value_fn(i):
+        return 8 if i == 0 else 4
+    def note_fn(i):
+        return "" if i == 0 else "solver1 honest note"
+    FakeContainer, FakeControl, _ = _strong_fakes(
+        exec_calls, value_fn=value_fn, note_fn=note_fn)
+    # repair turn for solver 0 writes a note (repair_writes default True), so note_fn
+    # is consulted again — give the repair a non-empty note via a stateful closure.
+    orig_exec = FakeContainer.exec_agent
+    def exec_agent(self, prompt, *, timeout_s, **kw):
+        r = orig_exec(self, prompt, timeout_s=timeout_s, **kw)
+        if exec_calls[-1]["repair"] and self.idx == 0:
+            (self.ws / "NOTES_FOR_PEERS.md").write_text("solver0 repaired note")
+        return r
+    FakeContainer.exec_agent = exec_agent
+    monkeypatch.setattr(C, "DockerContainer", FakeContainer)
+    monkeypatch.setattr(C, "ControlSocket", FakeControl)
+
+    def fake_harden(best, sol_ws, *, trigger):
+        if system.eval_service.current_version() == 0:
+            system.eval_service.install_verifier(_STRICTER_CAP5, origin="agent",
+                                                 note="harden")
+            system.hardenings += 1
+    monkeypatch.setattr(system, "_run_supervisor_harden", fake_harden)
+
+    cx = _concurrent(system, concurrency=2, max_generations=1)
+    cx.solve_and_evolve_concurrent(max_generations=1)
+
+    # the hack-check hardened V AND the bar is honest under v1 (4, not the tainted 8).
+    assert system.eval_service.current_version() == 1
+    assert cx._bar == 4.0
+    events = [json.loads(l) for l in _read_lines_test(system.run_dir / "events.jsonl")]
+    kinds = [e["kind"] for e in events]
+    assert "sota_rejected_hardened" in kinds
+    assert "solver_note_repaired" in kinds
+    # solver 0's repaired note landed even though its SOTA was rejected.
+    assert (Path(system.run_dir) / "peer_notes" / "solver_0_gen1.md").is_file()
+    # every jsonl line under the run is well-formed despite concurrent writers.
+    for name in ("events.jsonl", "cost.jsonl"):
+        for l in _read_lines_test(system.run_dir / name):
+            json.loads(l)
+
+
+def test_provisional_sota_hacked_hardens_and_bar_not_tainted(tmp_path, monkeypatch):
+    """A hacked SOTA hardens V; the bar is recomputed HONESTLY under the new V, never
+    the tainted provisional score."""
+    from coscientist.coevo import concurrent_agent_system as C
+
+    system, _A = _bootstrapped_system(tmp_path, monkeypatch)
+    exec_calls = []
+    # solver 0 writes value=8 (the "hack": great under v0, infeasible under v1);
+    # solver 1 writes value=4 (honest: feasible under both v0 cap10 and v1 cap5).
+    FakeContainer, FakeControl, _ = _strong_fakes(
+        exec_calls, value_fn=lambda i: 8 if i == 0 else 4)
+    monkeypatch.setattr(C, "DockerContainer", FakeContainer)
+    monkeypatch.setattr(C, "ControlSocket", FakeControl)
+
+    def fake_harden(best, sol_ws, *, trigger):
+        if system.eval_service.current_version() == 0:
+            system.eval_service.install_verifier(_STRICTER_CAP5, origin="agent",
+                                                 note="harden")
+            system.hardenings += 1
+    monkeypatch.setattr(system, "_run_supervisor_harden", fake_harden)
+
+    cx = _concurrent(system, concurrency=2, max_generations=1)
+    cx.solve_and_evolve_concurrent(max_generations=1)
+
+    assert system.eval_service.current_version() == 1
+    events = [json.loads(l) for l in _read_lines_test(system.run_dir / "events.jsonl")]
+    assert any(e["kind"] == "sota_rejected_hardened" for e in events)
+    # the honest best under v1 (cap 5) is value=4, NOT the tainted provisional 8.
+    assert cx._bar == 4.0
+    assert cx._bar != 8.0
+
+
+def test_supervisor_not_invoked_without_new_sota(tmp_path, monkeypatch):
+    """No solver beats the standing bar -> the Supervisor is NOT invoked this
+    generation (the coalesced, SOTA-only trigger)."""
+    from coscientist.coevo import concurrent_agent_system as C
+
+    system, _A = _bootstrapped_system(tmp_path, monkeypatch)
+    exec_calls = []
+    FakeContainer, FakeControl, _ = _strong_fakes(exec_calls, value_fn=lambda i: 8)
+    monkeypatch.setattr(C, "DockerContainer", FakeContainer)
+    monkeypatch.setattr(C, "ControlSocket", FakeControl)
+
+    calls = {"n": 0}
+    def spy_harden(best, ws, *, trigger):
+        calls["n"] += 1
+    monkeypatch.setattr(system, "_run_supervisor_harden", spy_harden)
+
+    cx = _concurrent(system, concurrency=3, max_generations=1)
+    cx._bar = 1000.0   # a standing bar nobody can beat this generation
+    cx.solve_and_evolve_concurrent(max_generations=1)
+
+    assert calls["n"] == 0, "Supervisor was invoked despite no new SOTA"
+
+
+def test_coalesced_hackcheck_single_call_for_n_solvers(tmp_path, monkeypatch):
+    """N solvers all beat the bar, but their offers COALESCE to exactly one
+    Supervisor hack-check at the barrier."""
+    from coscientist.coevo import concurrent_agent_system as C
+
+    system, _A = _bootstrapped_system(tmp_path, monkeypatch)
+    exec_calls = []
+    FakeContainer, FakeControl, _ = _strong_fakes(exec_calls, value_fn=lambda i: 5 + i)
+    monkeypatch.setattr(C, "DockerContainer", FakeContainer)
+    monkeypatch.setattr(C, "ControlSocket", FakeControl)
+
+    calls = {"n": 0}
+    def spy_harden(best, ws, *, trigger):
+        calls["n"] += 1   # clean: install nothing
+    monkeypatch.setattr(system, "_run_supervisor_harden", spy_harden)
+
+    cx = _concurrent(system, concurrency=3, max_generations=1)
+    cx.solve_and_evolve_concurrent(max_generations=1)
+
+    assert calls["n"] == 1, f"expected 1 coalesced hack-check, got {calls['n']}"
+
+
+def test_store_appends_are_serialized_under_load(tmp_path, monkeypatch):
+    """The concrete RunStore._append thread-safety fix: N solver shim handlers hammer
+    eval concurrently from real threads; every queries.jsonl + cost.jsonl line must
+    parse and the counts must match the number of evals."""
+    import threading as _th
+    from coscientist.coevo import concurrent_agent_system as C
+
+    system, _A = _bootstrapped_system(tmp_path, monkeypatch)
+    exec_calls = []
+    _FC, FakeControl, _h = _strong_fakes(exec_calls, value_fn=lambda i: 3)
+    monkeypatch.setattr(C, "ControlSocket", FakeControl)
+
+    cx = _concurrent(system, concurrency=4)
+    handlers = [cx._make_shim(i) for i in range(4)]
+    per_thread = 40
+
+    def hammer(h):
+        for _ in range(per_thread):
+            h("eval", {"solution": {"value": 3}})
+
+    threads = [_th.Thread(target=hammer, args=(h,)) for h in handlers]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    total = 4 * per_thread
+    qlines = _read_lines_test(system.run_dir / "eval" / "queries.jsonl")
+    clines = _read_lines_test(system.run_dir / "cost.jsonl")
+    for l in qlines:
+        json.loads(l)   # must not raise (no torn/interleaved writes)
+    for l in clines:
+        json.loads(l)
+    assert len(qlines) == total, f"query lines {len(qlines)} != {total}"
+    eval_costs = [l for l in clines if json.loads(l).get("kind") == "eval_query"]
+    assert len(eval_costs) == total, f"eval cost lines {len(eval_costs)} != {total}"
+
+
+def test_resume_restores_bar_and_generation(tmp_path, monkeypatch):
+    """A resume reconstructs the concurrent orchestrator's bar + generation counter
+    from disk on top of the (unchanged) base resume."""
+    from coscientist.coevo import agent_system as A
+    from coscientist.coevo.eval_service import FeedbackLevel
+
+    raw = tmp_path / "raw"
+    raw.mkdir(exist_ok=True)
+    (raw / "problem.md").write_text("maximize value up to a cap")
+    run_dir = tmp_path / "run"
+
+    def verifier(cap):
+        return (
+            "def verify(payload, ctx):\n"
+            "    try:\n"
+            "        v = float(payload.get('value', 0))\n"
+            "    except Exception:\n"
+            "        return {'feasible': False, 'raw': -1e9, 'artifacts': {}}\n"
+            f"    feasible = 0 <= v <= {cap}\n"
+            "    return {'feasible': feasible, 'raw': (v if feasible else -1e9),"
+            " 'artifacts': {}}\n"
+        )
+
+    bws = run_dir / "bootstrap_ws"
+    bws.mkdir(parents=True)
+    (bws / "verifier.py").write_text(verifier(10))
+    (bws / "ctx.json").write_text(json.dumps({}))
+    (bws / "seed_solution.json").write_text(json.dumps({"value": 1}))
+    (bws / "probes.json").write_text(json.dumps(
+        [{"description": "over cap", "solution": {"value": 9999}}]))
+    (bws / "BOOTSTRAP_DONE").write_text("done")
+
+    vdir = run_dir / "supervisor" / "verifier_versions"
+    vdir.mkdir(parents=True)
+    (vdir / "v0.py").write_text(verifier(10))
+    (vdir / "v1.py").write_text(verifier(5))
+    (run_dir / "supervisor" / "versions.jsonl").write_text(
+        json.dumps({"version": 0, "origin": "agent", "note": "bootstrap"}) + "\n"
+        + json.dumps({"version": 1, "origin": "agent", "note": "harden"}) + "\n")
+
+    # concurrent-mode disk state: two finished generations + a broadcast bar of 4.0.
+    (run_dir / "events.jsonl").write_text(
+        json.dumps({"t": 1.0, "kind": "generation_done", "gen": 1}) + "\n"
+        + json.dumps({"t": 2.0, "kind": "generation_done", "gen": 2}) + "\n")
+    (run_dir / "blackboard.json").write_text(json.dumps(
+        {"gen": 2, "bar": 4.0, "bar_holder": "solver_1", "notes": []}))
+    cdir = run_dir / "solver" / "candidates"
+    cdir.mkdir(parents=True)
+    (cdir / "cand_00000.json").write_text(json.dumps(
+        {"id": "cand_00000", "payload": {"value": 4}, "score": 4.0}))
+    (run_dir / "manifest.json").write_text(json.dumps(
+        {"mode": "concurrent_agent_system", "best_solution": {"value": 4},
+         "best_score": 4.0}))
+
+    system = A.AgentSystem(raw_input_dir=raw, run_dir=run_dir, budget_s=60,
+                           feedback_level=FeedbackLevel.WITH_ARTIFACTS)
+    assert system.can_resume()
+    system._resume_from_disk()
+    cx = _concurrent(system)
+    cx._resume_concurrent_state()
+
+    assert system.eval_service.current_version() == 1
+    assert cx._gen == 2
+    assert cx._bar == 4.0
+
+
+def test_cli_routes_strong_to_concurrent(tmp_path, monkeypatch):
+    """--solver-strength strong builds a ConcurrentAgentSystem (with the requested
+    concurrency) and runs it; weak still runs the single-agent AgentSystem."""
+    import argparse
+
+    from coscientist.coevo import cli
+    from coscientist.coevo import agent_system as A
+    from coscientist.coevo import concurrent_agent_system as C
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "problem.md").write_text("maximize value")
+
+    def base_args(**over):
+        d = dict(input=str(raw), problem="curvefit", runs_dir=str(tmp_path / "runs"),
+                 run_id="t", llm_config=None, bootstrap_timeout_s=None,
+                 harden_timeout_s=None, post_harden_solve_s=None, solver_image=None,
+                 solver_gpus=None, resource_config=None, solver_cpus=None,
+                 solver_memory_mb=None, solver_allow_internet=False,
+                 verifier_image=None, verifier_gpus=None, verifier_cpus=None,
+                 verifier_memory_mb=None, verifier_timeout_s=None,
+                 verifier_allow_internet=False, budget_s=60.0, budget_hours=0.0,
+                 feedback="with_artifacts", max_turns=4, resume=False,
+                 solver_strength="weak", concurrency=4, max_generations=8,
+                 gen_turn_s=None)
+        d.update(over)
+        return argparse.Namespace(**d)
+
+    seen = {"concurrent": None, "weak": False}
+
+    def fake_cx_run(self, *, max_generations=None, resume=False):
+        seen["concurrent"] = self.concurrency
+        return self
+    def fake_weak_run(self, *, max_turns=12, resume=False):
+        seen["weak"] = True
+        return self
+    monkeypatch.setattr(C.ConcurrentAgentSystem, "run", fake_cx_run)
+    monkeypatch.setattr(A.AgentSystem, "run", fake_weak_run)
+
+    cli.run_agent_system(base_args(run_id="strong", solver_strength="strong",
+                                   concurrency=4))
+    assert seen["concurrent"] == 4 and seen["weak"] is False
+
+    seen["concurrent"] = None
+    cli.run_agent_system(base_args(run_id="weak", solver_strength="weak"))
+    assert seen["weak"] is True and seen["concurrent"] is None
+
+
+def _read_lines_test(path):
+    p = Path(path)
+    if not p.is_file():
+        return []
+    return [l for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
