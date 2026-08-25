@@ -118,6 +118,8 @@ The Proxy does **not** use a shortcut API. It implements the same blocking `Huma
 
 The same five-session budget, unlimited turns, transcript, deduplication, staged outcome, explicit closure confirmation, evaluator freeze, guidance persistence, and crash semantics apply. `--feishu-expert-id` and `--human-proxy-evaluator` are mutually exclusive.
 
+The Proxy driver has a 64-turn watchdog for each individual `consult` call. If a policy stalls, exceeds that allowance, or raises an error, the live session is paused and the error is surfaced. A later `consult` resumes the same session without spending another slot and receives a fresh watchdog allowance. This is a liveness guard, not a total session-message limit: one durable session may continue across any number of recoveries. Its sanitized frozen outcome is stored separately in `proxy_state.json`, so resume rebuilds the dialogue policy without executing V* again.
+
 For verifier-change sessions, AgentSystem evaluates a bounded shared case set under current V and proposed V. The Proxy privately adds V* results and compares feasibility/ranking alignment. Only a strictly better, fully executable proposal receives `approve`; regression receives `reject`; insufficient or indistinguishable evidence receives `guide`. V* source, module path, context, artifacts, and raw per-case results are never copied into the run or Solver workspace.
 
 ## Persistence and crash recovery
@@ -135,6 +137,7 @@ runs/<run_id>/
       transcript.jsonl                # append-only human/agent/system turns
       pending_outcome.json            # close summary awaiting confirmation
       outcome.json                    # final confirmed structured outcome
+      proxy_state.json                # sanitized frozen V* outcome for Proxy resume
       outbox/*.json                    # generated replies awaiting Feishu delivery
       agent_workspace/
         context.json                  # bounded, redacted evidence copy

@@ -12,7 +12,9 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import inspect
+import json
 import math
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -138,7 +140,11 @@ class HumanProxyAgent(Protocol):
     """Independent expert agent driven only through the public chat contract."""
 
     def start_conversation(
-        self, *, purpose: str, context: dict[str, Any]
+        self,
+        *,
+        purpose: str,
+        context: dict[str, Any],
+        frozen_outcome: SessionOutcome | None = None,
     ) -> HumanProxyConversation: ...
 
 
@@ -150,7 +156,11 @@ class EvaluatorBackedHumanProxyAgent:
     assessments: int = 0
 
     def start_conversation(
-        self, *, purpose: str, context: dict[str, Any]
+        self,
+        *,
+        purpose: str,
+        context: dict[str, Any],
+        frozen_outcome: SessionOutcome | None = None,
     ) -> HumanProxyConversation:
         """Freeze one hidden evaluation, then converse from its safe assessment.
 
@@ -159,7 +169,13 @@ class EvaluatorBackedHumanProxyAgent:
         model-backed implementation of :class:`HumanProxyAgent` without changing the
         Human Session service or its lifecycle rules.
         """
-        assessment = self.assess(purpose=purpose, context=context)
+        if frozen_outcome is None:
+            assessment = self.assess(purpose=purpose, context=context)
+        else:
+            assessment = ProxyAssessment(
+                message=self._resumed_message(frozen_outcome),
+                outcome=frozen_outcome,
+            )
 
         def next_turn(
             *, session: HumanSession, transcript: list[SessionMessage]
@@ -188,6 +204,18 @@ class EvaluatorBackedHumanProxyAgent:
         return HumanProxyConversation(
             outcome=assessment.outcome,
             next_turn=next_turn,
+        )
+
+    @staticmethod
+    def _resumed_message(outcome: SessionOutcome) -> str:
+        detail = (
+            outcome.human_guidance[0]
+            if outcome.human_guidance
+            else "请继续基于运行证据回答尚未澄清的问题"
+        )
+        return (
+            f"我已恢复此前冻结的 evaluator 判断：{outcome.decision}。"
+            f"{detail}。"
         )
 
     def assess(self, *, purpose: str, context: dict[str, Any]) -> ProxyAssessment:
@@ -398,6 +426,11 @@ class HumanProxySessionPort:
     service: FeishuHumanSessionService
     proxy_agent: HumanProxyAgent
     expert_id: str = "human_proxy_vstar"
+    max_turns_per_consult: int = 64
+
+    def __post_init__(self) -> None:
+        if self.max_turns_per_consult < 1:
+            raise ValueError("max_turns_per_consult must be positive")
 
     def consult(self, *, purpose: str, context: dict) -> SessionOutcome | None:
         try:
@@ -408,30 +441,75 @@ class HumanProxySessionPort:
             )
         except SessionBudgetExhausted:
             return None
-        conversation = self.proxy_agent.start_conversation(
-            purpose=session.purpose,
-            context=session.context,
-        )
-        while True:
-            session = self.service.store.get(session.session_id)
-            if session.state is SessionState.CLOSED:
-                break
-            turn = conversation.next_turn(
-                session=session,
-                transcript=self.service.store.transcript(session.session_id),
+        try:
+            frozen_outcome = self._load_frozen_outcome(session.session_id)
+            conversation = self.proxy_agent.start_conversation(
+                purpose=session.purpose,
+                context=session.context,
+                frozen_outcome=frozen_outcome,
             )
-            if not turn.text.strip():
-                raise RuntimeError("Human Proxy agent returned an empty turn")
-            if session.state is SessionState.CLOSE_REQUESTED:
-                # V* is frozen before the first turn.  Only expose its sanitized
-                # structured outcome at the ordinary explicit-confirmation seam.
-                self.service.store.stage_outcome(
+            if frozen_outcome is None:
+                self._persist_frozen_outcome(
                     session.session_id, conversation.outcome
                 )
-            self.service.handle_event(
-                self._event(session.session_id, turn.text, "dialogue")
-            )
+            elif conversation.outcome != frozen_outcome:
+                raise RuntimeError("resumed Human Proxy changed its frozen outcome")
+
+            driven_turns = 0
+            while True:
+                session = self.service.store.get(session.session_id)
+                if session.state is SessionState.CLOSED:
+                    break
+                if driven_turns >= self.max_turns_per_consult:
+                    raise RuntimeError(
+                        "Human Proxy watchdog reached "
+                        f"{self.max_turns_per_consult} turns in one consult"
+                    )
+                turn = conversation.next_turn(
+                    session=session,
+                    transcript=self.service.store.transcript(session.session_id),
+                )
+                if not turn.text.strip():
+                    raise RuntimeError("Human Proxy agent returned an empty turn")
+                if session.state is SessionState.CLOSE_REQUESTED:
+                    # V* is frozen before the first turn.  Only expose its sanitized
+                    # structured outcome at the ordinary explicit-confirmation seam.
+                    self.service.store.stage_outcome(
+                        session.session_id, conversation.outcome
+                    )
+                handled = self.service.handle_event(
+                    self._event(session.session_id, turn.text, "dialogue")
+                )
+                if not handled:
+                    raise RuntimeError("Human Proxy turn was rejected by the service")
+                driven_turns += 1
+        except Exception as exc:
+            current = self.service.store.get(session.session_id)
+            if current.state is not SessionState.CLOSED:
+                self.service.store.pause(session.session_id)
+            raise RuntimeError(f"Human Proxy driver failed: {exc}") from exc
         return self.service.store.outcome(session.session_id)
+
+    def _proxy_state_path(self, session_id: str) -> Path:
+        return self.service.store.root / session_id / "proxy_state.json"
+
+    def _load_frozen_outcome(self, session_id: str) -> SessionOutcome | None:
+        path = self._proxy_state_path(session_id)
+        if not path.is_file():
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return SessionOutcome.from_dict(payload["outcome"])
+
+    def _persist_frozen_outcome(
+        self, session_id: str, outcome: SessionOutcome
+    ) -> None:
+        path = self._proxy_state_path(session_id)
+        temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump({"outcome": outcome.to_dict()}, stream, ensure_ascii=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
 
     def _event(self, session_id: str, text: str, suffix: str) -> FeishuMessageEvent:
         transcript = self.service.store.transcript(session_id)

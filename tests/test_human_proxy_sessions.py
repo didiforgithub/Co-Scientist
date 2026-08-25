@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+
+import pytest
 
 from coscientist.coevo.agent_system import AgentSystem, _version0
 from coscientist.coevo.eval_service import EvalService, FeedbackLevel
@@ -44,10 +47,17 @@ class IndependentConversationAgent:
         self.assessment = None
         self.observed_agent_replies = []
 
-    def start_conversation(self, *, purpose, context):
-        self.assessment = self.evaluator_agent.assess(
-            purpose=purpose, context=context
-        )
+    def start_conversation(self, *, purpose, context, frozen_outcome=None):
+        if frozen_outcome is None:
+            self.assessment = self.evaluator_agent.assess(
+                purpose=purpose, context=context
+            )
+        else:
+            self.assessment = type(
+                "Assessment",
+                (),
+                {"outcome": frozen_outcome, "message": "继续冻结后的代理会话。"},
+            )()
         return HumanProxyConversation(
             outcome=self.assessment.outcome,
             next_turn=self.next_turn,
@@ -81,6 +91,48 @@ class IndependentConversationAgent:
             assert session.state is SessionState.CLOSE_REQUESTED
             return HumanProxyTurn("确认结束")
         raise AssertionError("conversation driver asked for a turn after explicit close")
+
+
+class FailOnceAfterFreezeAgent:
+    def __init__(self, reference_evaluator):
+        self.delegate = EvaluatorBackedHumanProxyAgent(reference_evaluator)
+        self.fail_next_turn = True
+        self.frozen_inputs = []
+
+    def start_conversation(self, *, purpose, context, frozen_outcome=None):
+        self.frozen_inputs.append(frozen_outcome)
+        conversation = self.delegate.start_conversation(
+            purpose=purpose,
+            context=context,
+            frozen_outcome=frozen_outcome,
+        )
+        if not self.fail_next_turn:
+            return conversation
+        self.fail_next_turn = False
+
+        def fail(**kwargs):
+            del kwargs
+            raise ValueError("synthetic proxy policy failure")
+
+        return HumanProxyConversation(
+            outcome=conversation.outcome,
+            next_turn=fail,
+        )
+
+
+class EndlessConversationAgent:
+    def start_conversation(self, *, purpose, context, frozen_outcome=None):
+        del purpose, context
+        outcome = frozen_outcome or SessionOutcome(
+            decision="guide", human_guidance=["keep asking"]
+        )
+
+        def next_turn(*, session, transcript):
+            del session
+            count = sum(item.role == "human" for item in transcript)
+            return HumanProxyTurn(f"继续追问第 {count + 1} 个问题")
+
+        return HumanProxyConversation(outcome=outcome, next_turn=next_turn)
 
 
 def _reference_module(tmp_path: Path) -> Path:
@@ -192,6 +244,58 @@ def test_proxy_port_runs_an_independent_multi_turn_agent_through_same_contract(
     assert "还剩几次" in transcript[9].text
     assert len(dialogue_agent.observed_agent_replies) >= 7
     assert len(transport.sent) == 8
+
+
+def test_proxy_resume_reuses_frozen_outcome_without_rerunning_vstar(tmp_path):
+    port, store, _, reference = _proxy_port(tmp_path)
+    failing_agent = FailOnceAfterFreezeAgent(reference)
+    port.proxy_agent = failing_agent
+
+    with pytest.raises(RuntimeError, match="Human Proxy driver failed"):
+        port.consult(purpose="verifier_change", context=_improving_context())
+
+    session = store.sessions()[0]
+    assert session.state is SessionState.PAUSED
+    assert store.opened_count == 1
+    assert reference.calls == 2
+    proxy_state = json.loads(
+        (store.root / session.session_id / "proxy_state.json").read_text()
+    )
+    frozen_outcome = SessionOutcome.from_dict(proxy_state["outcome"])
+
+    outcome = port.consult(purpose="verifier_change", context=_improving_context())
+
+    assert store.sessions()[0].state is SessionState.CLOSED
+    assert store.opened_count == 1
+    assert reference.calls == 2
+    assert failing_agent.frozen_inputs == [None, frozen_outcome]
+    assert outcome == frozen_outcome
+
+
+def test_proxy_watchdog_pauses_one_consult_without_limiting_session_turns(tmp_path):
+    port, store, _, _ = _proxy_port(tmp_path)
+    port.proxy_agent = EndlessConversationAgent()
+    port.max_turns_per_consult = 2
+
+    with pytest.raises(RuntimeError, match="watchdog reached 2 turns"):
+        port.consult(purpose="verifier_change", context=_improving_context())
+
+    assert store.sessions()[0].state is SessionState.PAUSED
+    assert store.opened_count == 1
+    first_length = len(store.transcript("session_001"))
+    frozen_state = (
+        store.root / "session_001" / "proxy_state.json"
+    ).read_text(encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="watchdog reached 2 turns"):
+        port.consult(purpose="verifier_change", context=_improving_context())
+
+    assert store.sessions()[0].state is SessionState.PAUSED
+    assert store.opened_count == 1
+    assert len(store.transcript("session_001")) == first_length + 4
+    assert (
+        store.root / "session_001" / "proxy_state.json"
+    ).read_text(encoding="utf-8") == frozen_state
 
 
 def test_proxy_rejects_a_proposal_that_moves_away_from_real_evaluator(tmp_path):
