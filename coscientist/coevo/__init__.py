@@ -19,7 +19,9 @@ Roles
     Supervisor   — = Eval Proposer. Owns and rewrites V; runs red-team probes in
                    the eval container. Autonomous mode installs validated changes;
                    optional Human Sessions freeze a proposed change until a Feishu
-                   expert or V*-holding Proxy finishes the shared conversation contract.
+                   expert or model-backed Human Proxy finishes the shared conversation
+                   contract. The Proxy receives evaluator context as text and has no
+                   solution/evaluator execution environment.
     driver       — plain code (not an LLM): starts the roles, owns the two-day
                    wall clock, routes the two channels, records everything.
 

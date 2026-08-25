@@ -204,6 +204,14 @@ with a **human port** arbitrating every change to the evaluator.
   is a scalable stand-in that judges via a hidden `V*`; the `CliHuman` blocks
   and asks a real person. Same protocol — swap freely.
 
+The live `coscientist.coevo` Human Session path uses a stricter model-backed
+proxy contract than this deterministic demo: the Proxy receives private evaluator
+context as text plus the public conversation, but no solution runner, GPU,
+evaluator callable, or evaluator endpoint. It collaborates with the Co-side agent
+to design better evaluators, probes, feedback, and environments rather than
+directly grading solutions. See
+[`docs/feishu-human-sessions.md`](docs/feishu-human-sessions.md).
+
 ## Run it
 
 ```bash
@@ -331,6 +339,5 @@ about to be packaged for V\* fingerprints (`reference_score`,
 `pack_task` calls it before anything could ship to a container. The `AutoHuman`
 legitimately holds V\* but lives on the control plane, never in a task package, so
 it is never scanned.
-
 
 

@@ -164,9 +164,7 @@ def test_explicit_human_approval_installs_change_only_after_consult_returns(tmp_
         def consult(self, *, purpose, context):
             seen_versions.append(system.eval_service.current_version())
             assert purpose == "verifier_change"
-            assert len(context["comparison_cases"]) >= 2
-            assert all("current" in case and "proposed" in case
-                       for case in context["comparison_cases"])
+            assert "comparison_cases" not in context
             return SessionOutcome(
                 decision="approve",
                 approved_changes=["cap is now 5"],
@@ -263,7 +261,7 @@ def test_cli_wires_feishu_expert_and_listener_configuration(tmp_path, monkeypatc
     assert captured["human_agent_reasoning_effort"] == "low"
 
 
-def test_cli_wires_hidden_reference_evaluator_for_human_proxy(tmp_path, monkeypatch):
+def test_cli_wires_private_text_context_for_model_human_proxy(tmp_path, monkeypatch):
     import argparse
 
     from coscientist.coevo import agent_system as agent_system_module
@@ -272,10 +270,8 @@ def test_cli_wires_hidden_reference_evaluator_for_human_proxy(tmp_path, monkeypa
     raw = tmp_path / "raw_proxy_cli"
     raw.mkdir()
     (raw / "instruction.md").write_text("ABC")
-    reference = tmp_path / "hidden_vstar.py"
-    reference.write_text("def verify(payload, ctx): return {'feasible': True, 'raw': 0}\n")
-    reference_context = tmp_path / "hidden_ctx.json"
-    reference_context.write_text('{"target": 3}')
+    proxy_context = tmp_path / "private_evaluator_context.md"
+    proxy_context.write_text("The real evaluator cares about target semantics.")
     captured = {}
 
     class FakeSystem:
@@ -301,14 +297,15 @@ def test_cli_wires_hidden_reference_evaluator_for_human_proxy(tmp_path, monkeypa
         feedback="with_artifacts", max_turns=1, resume=False,
         solver_strength="weak", solver_image=None, solver_gpus=None,
         llm_config=None, feishu_expert_id=None,
-        human_proxy_evaluator=str(reference),
-        human_proxy_evaluator_context=str(reference_context),
-        human_proxy_evaluator_function="verify",
+        human_proxy_context=str(proxy_context),
         human_agent_timeout_s=90.0,
+        human_agent_model="proxy-model",
+        human_agent_reasoning_effort="medium",
     )
 
     cli.run_agent_system(args)
 
-    assert captured["human_proxy_evaluator_path"] == reference
-    assert captured["human_proxy_evaluator_context_path"] == reference_context
-    assert captured["human_proxy_evaluator_function"] == "verify"
+    assert captured["human_proxy_context_path"] == proxy_context
+    assert captured["human_agent_timeout_s"] == 90.0
+    assert captured["human_agent_model"] == "proxy-model"
+    assert captured["human_agent_reasoning_effort"] == "medium"

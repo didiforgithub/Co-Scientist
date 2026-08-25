@@ -235,15 +235,8 @@ def run_agent_system(args) -> None:
         opt["human_agent_reasoning_effort"] = getattr(
             args, "human_agent_reasoning_effort", "low"
         )
-    if getattr(args, "human_proxy_evaluator", None):
-        opt["human_proxy_evaluator_path"] = Path(args.human_proxy_evaluator)
-        if getattr(args, "human_proxy_evaluator_context", None):
-            opt["human_proxy_evaluator_context_path"] = Path(
-                args.human_proxy_evaluator_context
-            )
-        opt["human_proxy_evaluator_function"] = getattr(
-            args, "human_proxy_evaluator_function", "verify"
-        )
+    if getattr(args, "human_proxy_context", None):
+        opt["human_proxy_context_path"] = Path(args.human_proxy_context)
         opt["human_agent_timeout_s"] = getattr(
             args, "human_agent_timeout_s", 180.0
         )
@@ -280,9 +273,9 @@ def run_agent_system(args) -> None:
     if getattr(args, "feishu_expert_id", None):
         print(f"human     : Feishu DM to {args.feishu_expert_id} "
               "(max 5 sessions; unlimited turns/session)")
-    if getattr(args, "human_proxy_evaluator", None):
-        print("human     : evaluator-backed Human Proxy "
-              "(hidden V*; same 5-session contract)")
+    if getattr(args, "human_proxy_context", None):
+        print("human     : model-backed Human Proxy "
+              "(private evaluator context; no solution execution; same 5-session contract)")
     if ov is not None:
         print(f"res overr : solver={ov.solver.to_manifest()} "
               f"verifier={ov.verifier.to_manifest()}")
@@ -397,28 +390,22 @@ def main() -> None:
                                  "expert open_id (ou_xxx): max five sessions per Co "
                                  "run, unlimited natural-language turns until explicit "
                                  "close confirmation")
-    human_mode.add_argument("--human-proxy-evaluator", default=None,
-                            help="enable an automated Human Proxy with a hidden real "
-                                 "evaluator Python module (same Human Session contract "
-                                 "as Feishu; V* source/results stay control-plane only)")
-    ap.add_argument("--human-proxy-evaluator-context", default=None,
-                    help="optional hidden JSON context object passed only to the Human "
-                         "Proxy evaluator; never copied into the run")
-    ap.add_argument("--human-proxy-evaluator-function", default="verify",
-                    help="callable in --human-proxy-evaluator (default: verify; accepts "
-                         "payload or payload,context and returns feasible + raw/score)")
+    human_mode.add_argument("--human-proxy-context", default=None,
+                            help="enable a separate model Human Proxy with this private, "
+                                 "read-only evaluator context file; the file is treated "
+                                 "only as text and never imported or executed")
     ap.add_argument("--lark-cli-executable", default="lark-cli",
                     help="lark-cli executable used for bot send/reply and the "
                          "im.message.receive_v1 long connection")
     ap.add_argument("--human-agent-timeout-s", type=float, default=180.0,
-                    help="wall-clock cap for one evidence-agent reply during a Human "
-                         "Session (the Feishu session itself has no message-count cap)")
+                    help="wall-clock cap for one Human Session agent turn "
+                         "(the session itself has no message-count cap)")
     ap.add_argument("--human-agent-model", default="gpt-5.6-luna",
-                    help="model used only by the conversational Human Session evidence "
-                         "agent (default: gpt-5.6-luna; independent of the main Co model)")
+                    help="model for the Co-side evidence agent and, in proxy mode, "
+                         "the independent Human Proxy (default: gpt-5.6-luna; "
+                         "independent of the main Co model)")
     ap.add_argument("--human-agent-reasoning-effort", default="low",
-                    help="reasoning effort used only by the Human Session evidence "
-                         "agent (default: low)")
+                    help="reasoning effort for Human Session agents (default: low)")
     ap.add_argument("--llm-config", default=None,
                     help="path to a JSON file (kept OUTSIDE repo/runs) with "
                          '{"api_key","base_url","model"} for host-side eval/feedback '

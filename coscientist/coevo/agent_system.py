@@ -392,7 +392,8 @@ class AgentSystem:
     agent_elf: Optional[Path] = None
 
     # Optional scarce human-expert channel. Tests/custom deployments inject a port
-    # directly; CLI preflight builds either the Feishu or V*-backed Proxy port.
+    # directly; CLI preflight builds either the Feishu port or a model-backed Proxy
+    # that receives private evaluator text but has no evaluator execution path.
     # The hard maximum is intentionally not configurable: one Co run gets five
     # sessions, while each session may have arbitrarily many natural-language turns.
     human_port: Optional[HumanInteractionPort] = None
@@ -401,9 +402,7 @@ class AgentSystem:
     human_agent_timeout_s: float = 180.0
     human_agent_model: str = "gpt-5.6-luna"
     human_agent_reasoning_effort: str = "low"
-    human_proxy_evaluator_path: Optional[Path] = None
-    human_proxy_evaluator_context_path: Optional[Path] = None
-    human_proxy_evaluator_function: str = "verify"
+    human_proxy_context_path: Optional[Path] = None
 
     store: RunStore = field(init=False)
     deadline: Deadline = field(init=False)
@@ -476,11 +475,11 @@ class AgentSystem:
                 "no codex auth found (need ~/.codex/auth.json)")
         self.gateway = gw
         human_modes = int(bool(self.human_expert_id)) + int(
-            bool(self.human_proxy_evaluator_path)
+            bool(self.human_proxy_context_path)
         )
         if human_modes > 1:
             raise AgentSystemUnavailable(
-                "choose either a Feishu human or a Human Proxy evaluator, not both"
+                "choose either a Feishu human or a Human Proxy agent, not both"
             )
         if human_modes and self.human_port is None:
             from .feishu_human import FeishuHumanSessionService
@@ -523,36 +522,24 @@ class AgentSystem:
                 return
 
             from .human_proxy_sessions import (
-                EvaluatorBackedHumanProxyAgent,
                 HumanProxySessionPort,
                 LoopbackTransport,
-                PythonReferenceEvaluator,
+                ModelBackedHumanProxyAgent,
             )
 
-            reference_context: dict = {}
-            if self.human_proxy_evaluator_context_path is not None:
-                context_path = Path(self.human_proxy_evaluator_context_path).resolve()
-                try:
-                    reference_context = json.loads(
-                        context_path.read_text(encoding="utf-8")
-                    )
-                except (OSError, json.JSONDecodeError) as exc:
-                    raise AgentSystemUnavailable(
-                        "Human Proxy evaluator context is not readable JSON"
-                    ) from exc
-                if not isinstance(reference_context, dict):
-                    raise AgentSystemUnavailable(
-                        "Human Proxy evaluator context must be a JSON object"
-                    )
             try:
-                reference = PythonReferenceEvaluator(
-                    Path(self.human_proxy_evaluator_path),
-                    function=self.human_proxy_evaluator_function,
-                    context=reference_context,
+                proxy_context_path = Path(self.human_proxy_context_path).resolve()
+                proxy_context = proxy_context_path.read_text(encoding="utf-8")
+                proxy_agent = ModelBackedHumanProxyAgent(
+                    evaluator_context=proxy_context,
+                    gateway=human_gateway,
+                    agent_elf=self.agent_elf,
+                    image=self.image,
+                    timeout_s=self.human_agent_timeout_s,
                 )
-            except Exception as exc:  # noqa: BLE001 - hide trusted V* internals cleanly
+            except Exception as exc:  # noqa: BLE001 - private context stays opaque
                 raise AgentSystemUnavailable(
-                    f"could not initialize hidden Human Proxy evaluator: {type(exc).__name__}"
+                    f"could not initialize Human Proxy context: {type(exc).__name__}"
                 ) from exc
             transport = LoopbackTransport()
             service = FeishuHumanSessionService(
@@ -562,7 +549,8 @@ class AgentSystem:
             )
             self.human_port = HumanProxySessionPort(
                 service=service,
-                proxy_agent=EvaluatorBackedHumanProxyAgent(reference),
+                proxy_agent=proxy_agent,
+                expert_id="human_proxy_agent",
             )
 
     def _consult_human(
@@ -1117,68 +1105,6 @@ class AgentSystem:
                 human_guidance.read_text(encoding="utf-8"), encoding="utf-8"
             )
 
-    def _human_comparison_cases(
-        self,
-        *,
-        current_source: str,
-        proposed_source: str,
-        seed: dict,
-        probes: list[dict],
-        ctx: dict,
-    ) -> list[dict]:
-        """Evaluate a bounded shared case set under current/proposed V, never V*.
-
-        A Human Proxy privately adds V* results later. Keeping that step behind the
-        HumanInteractionPort prevents reference source/results from entering the run
-        context visible to Solver or the ordinary evidence agent.
-        """
-        candidates: list[tuple[str, dict]] = []
-        if isinstance(seed, dict):
-            candidates.append(("seed", seed))
-        for index, probe in enumerate(probes[:6]):
-            if isinstance(probe, dict) and isinstance(probe.get("solution"), dict):
-                candidates.append((f"probe_{index}", probe["solution"]))
-        if isinstance(self._best_payload, dict):
-            candidates.append(("best_candidate", self._best_payload))
-
-        deduplicated: list[tuple[str, dict]] = []
-        fingerprints: set[str] = set()
-        for label, payload in candidates:
-            try:
-                fingerprint = json.dumps(payload, sort_keys=True, default=str)
-            except TypeError:
-                fingerprint = repr(payload)
-            if fingerprint not in fingerprints:
-                fingerprints.add(fingerprint)
-                deduplicated.append((label, payload))
-
-        evaluator = self.evaluator
-        if evaluator is None:
-            return []
-
-        def score(payload: dict, source: str) -> dict:
-            result = evaluator.run(
-                payload,
-                ctx,
-                source=source,
-                env=self._llm_env() or None,
-            )
-            return {
-                "ok": result.error is None,
-                "feasible": bool(result.feasible) if result.error is None else False,
-                "score": result.raw if result.error is None else None,
-            }
-
-        return [
-            {
-                "label": label,
-                "payload": payload,
-                "current": score(payload, current_source),
-                "proposed": score(payload, proposed_source),
-            }
-            for label, payload in deduplicated
-        ]
-
     def _apply_harden(self, ws: Path, *, trigger: str, verdict: dict) -> None:
         """Install whatever the smith authored: a new verifier and/or a feedback module,
         possibly a full modality switch. Direction-neutral acceptance via the separation
@@ -1261,13 +1187,6 @@ class AgentSystem:
                     "verdict": verdict,
                     "is_mode_switch": is_switch,
                     "proposed_mode": switch.get("to_mode") if is_switch else self._mode,
-                    "comparison_cases": self._human_comparison_cases(
-                        current_source=current_source,
-                        proposed_source=verify_src,
-                        seed=val_seed,
-                        probes=val_probes,
-                        ctx=val_ctx,
-                    ),
                 },
             )
             if human_outcome is None or human_outcome.decision.lower() != "approve":

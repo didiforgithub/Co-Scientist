@@ -1,443 +1,277 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import pytest
 
-from coscientist.coevo.agent_system import AgentSystem, _version0
-from coscientist.coevo.eval_service import EvalService, FeedbackLevel
 from coscientist.coevo.feishu_human import FeishuHumanSessionService
 from coscientist.coevo.human_evidence import EvidenceReply
 from coscientist.coevo.human_proxy_sessions import (
-    EvaluatorBackedHumanProxyAgent,
     HumanProxyConversation,
-    HumanProxyTurn,
     HumanProxySessionPort,
+    HumanProxyTurn,
     LoopbackTransport,
-    PythonReferenceEvaluator,
 )
 from coscientist.coevo.human_sessions import (
     HumanSessionStore,
     SessionOutcome,
     SessionState,
 )
-from coscientist.demo.evaluator import Evaluator
+
+
+FINAL_OUTCOME = SessionOutcome(
+    decision="guide",
+    human_guidance=["先让环境返回失败类别，再优化性能。"],
+    evidence_requested=["mask、数值稳定性和大规模性能 probe"],
+    human_rationale="Human Proxy 与 Co-side 共同识别出总分反馈无法指导 Solver。",
+)
 
 
 class FakeCoSessionAgent:
     def reply(self, **kwargs):
         instruction = kwargs["agent_instruction"]
         if "会话开场" in instruction:
-            return EvidenceReply(text="我先说明当前评估变化，再请你判断是否更接近真实目标。")
+            return EvidenceReply(
+                text="当前反馈只有总分。你认为怎样设计环境，能让 Solver 更快定位错误？"
+            )
         if "总结" in instruction:
             return EvidenceReply(
-                text="我已总结你的判断；如果准确请回复确认结束。",
+                text="总结：增加失败分类与针对性 probe。若准确请确认结束。",
                 proposed_outcome=SessionOutcome(decision="none"),
             )
-        return EvidenceReply(text="我收到了你的 V* 对照结论，并记录了依据。")
+        return EvidenceReply(text="收到。我会把这个建议转化为 evaluator 和环境设计。")
 
 
-class IndependentConversationAgent:
-    """A distinct evaluator-backed agent that reacts to the live transcript."""
+class NaturalDialogueAgent:
+    """Free dialogue: ask, request close, reject close, continue, then confirm."""
 
-    def __init__(self, reference_evaluator, store):
-        self.evaluator_agent = EvaluatorBackedHumanProxyAgent(reference_evaluator)
+    def __init__(self, store: HumanSessionStore):
         self.store = store
-        self.assessment = None
-        self.observed_agent_replies = []
+        self.frozen_inputs: list[SessionOutcome | None] = []
 
-    def start_conversation(self, *, purpose, context, frozen_outcome=None):
-        if frozen_outcome is None:
-            self.assessment = self.evaluator_agent.assess(
-                purpose=purpose, context=context
-            )
-        else:
-            self.assessment = type(
-                "Assessment",
-                (),
-                {"outcome": frozen_outcome, "message": "继续冻结后的代理会话。"},
-            )()
-        return HumanProxyConversation(
-            outcome=self.assessment.outcome,
-            next_turn=self.next_turn,
-        )
-
-    def next_turn(self, *, session, transcript):
-        assert self.assessment is not None
-        agent_replies = [item.text for item in transcript if item.role == "agent"]
-        self.observed_agent_replies = agent_replies
-        human_messages = [item.text for item in transcript if item.role == "human"]
-
-        if not human_messages:
-            return HumanProxyTurn(self.assessment.message)
-        if len(human_messages) == 1:
-            assert "V* 对照结论" in agent_replies[-1]
-            return HumanProxyTurn("请再解释这个结论覆盖了哪些边界情况？")
-        if len(human_messages) == 2:
-            return HumanProxyTurn("信息基本充分，我请求结束这轮。")
-        if len(human_messages) == 3:
-            assert session.state is SessionState.CLOSE_REQUESTED
-            return HumanProxyTurn("先别结束，我还要确认继续聊天不会消耗第二次机会。")
-        if len(human_messages) == 4:
-            assert session.state is SessionState.ACTIVE
-            assert self.store.opened_count == 1
-            assert self.store.outcome(session.session_id) is None
-            assert self.store.staged_outcome(session.session_id) is None
-            return HumanProxyTurn("现在还剩几次会话机会？")
-        if len(human_messages) == 5:
-            return HumanProxyTurn("这轮可以结束了。")
-        if len(human_messages) == 6:
-            assert session.state is SessionState.CLOSE_REQUESTED
-            return HumanProxyTurn("确认结束")
-        raise AssertionError("conversation driver asked for a turn after explicit close")
-
-
-class FailOnceAfterFreezeAgent:
-    def __init__(self, reference_evaluator):
-        self.delegate = EvaluatorBackedHumanProxyAgent(reference_evaluator)
-        self.fail_next_turn = True
-        self.frozen_inputs = []
-
-    def start_conversation(self, *, purpose, context, frozen_outcome=None):
+    def start_conversation(self, *, purpose, frozen_outcome=None):
+        del purpose
         self.frozen_inputs.append(frozen_outcome)
-        conversation = self.delegate.start_conversation(
-            purpose=purpose,
-            context=context,
-            frozen_outcome=frozen_outcome,
+
+        def next_turn(*, session, transcript):
+            human_count = sum(item.role == "human" for item in transcript)
+            if session.state is SessionState.CLOSE_REQUESTED:
+                if human_count == 2:
+                    return HumanProxyTurn(
+                        "先别结束，我还想确认：失败分类会不会泄露隐藏样例？"
+                    )
+                return HumanProxyTurn("确认结束", outcome=FINAL_OUTCOME)
+            if human_count == 0:
+                return HumanProxyTurn(
+                    "先解释总分由哪些失败模式混合而成，我们一起设计 probe。"
+                )
+            if human_count == 1:
+                return HumanProxyTurn(
+                    "这个方向基本明确，请总结后结束这轮。",
+                    outcome=FINAL_OUTCOME,
+                )
+            if human_count == 3:
+                assert self.store.opened_count == 1
+                assert self.store.remaining_count == 4
+                return HumanProxyTurn("明白了。请把保密边界也写进反馈契约。")
+            if human_count == 4:
+                return HumanProxyTurn(
+                    "现在信息充分，结束这轮。",
+                    outcome=FINAL_OUTCOME,
+                )
+            raise AssertionError(f"unexpected proxy state: {session.state}/{human_count}")
+
+        return HumanProxyConversation(next_turn=next_turn)
+
+
+class ClosingAgent:
+    def start_conversation(self, *, purpose, frozen_outcome=None):
+        del purpose
+
+        def next_turn(*, session, transcript):
+            del transcript
+            if session.state is SessionState.CLOSE_REQUESTED:
+                return HumanProxyTurn(
+                    "确认结束", outcome=frozen_outcome or FINAL_OUTCOME
+                )
+            return HumanProxyTurn(
+                "建议已明确，结束这轮。",
+                outcome=frozen_outcome or FINAL_OUTCOME,
+            )
+
+        return HumanProxyConversation(next_turn=next_turn)
+
+
+class FailOnceAgent:
+    def __init__(self):
+        self.failed = False
+        self.frozen_inputs: list[SessionOutcome | None] = []
+
+    def start_conversation(self, *, purpose, frozen_outcome=None):
+        del purpose
+        self.frozen_inputs.append(frozen_outcome)
+        if not self.failed:
+            self.failed = True
+
+            def fail(**kwargs):
+                del kwargs
+                raise ValueError("synthetic model failure")
+
+            return HumanProxyConversation(next_turn=fail)
+        return ClosingAgent().start_conversation(
+            purpose="resume", frozen_outcome=frozen_outcome
         )
-        if not self.fail_next_turn:
-            return conversation
-        self.fail_next_turn = False
-
-        def fail(**kwargs):
-            del kwargs
-            raise ValueError("synthetic proxy policy failure")
-
-        return HumanProxyConversation(
-            outcome=conversation.outcome,
-            next_turn=fail,
-        )
 
 
-class EndlessConversationAgent:
-    def start_conversation(self, *, purpose, context, frozen_outcome=None):
-        del purpose, context
-        outcome = frozen_outcome or SessionOutcome(
-            decision="guide", human_guidance=["keep asking"]
-        )
+class EndlessAgent:
+    def start_conversation(self, *, purpose, frozen_outcome=None):
+        del purpose, frozen_outcome
 
         def next_turn(*, session, transcript):
             del session
             count = sum(item.role == "human" for item in transcript)
-            return HumanProxyTurn(f"继续追问第 {count + 1} 个问题")
+            return HumanProxyTurn(f"继续共同设计第 {count + 1} 个环境 probe。")
 
-        return HumanProxyConversation(outcome=outcome, next_turn=next_turn)
-
-
-def _reference_module(tmp_path: Path) -> Path:
-    path = tmp_path / "hidden_reference.py"
-    path.write_text(
-        "TOP_SECRET_VSTAR_SOURCE = 'must never enter the run'\n"
-        "def verify(payload, ctx):\n"
-        "    value = float(payload['value'])\n"
-        "    raw = -abs(value - float(ctx.get('target', 3)))\n"
-        "    return {'feasible': True, 'raw': raw, 'artifacts': {'hidden': True}}\n"
-    )
-    return path
+        return HumanProxyConversation(next_turn=next_turn)
 
 
-def _improving_context():
-    return {
-        "comparison_cases": [
-            {
-                "label": "seed",
-                "payload": {"value": 1},
-                "current": {"ok": True, "feasible": True, "score": 1.0},
-                "proposed": {"ok": True, "feasible": True, "score": -2.0},
-            },
-            {
-                "label": "adversarial_probe",
-                "payload": {"value": 10},
-                "current": {"ok": True, "feasible": True, "score": 10.0},
-                "proposed": {"ok": True, "feasible": True, "score": -7.0},
-            },
-        ],
-        "current_version": 0,
-        "diff": "tighten toward the honest target",
-    }
-
-
-def _proxy_port(tmp_path, *, context=None):
-    run_dir = tmp_path / "run"
-    store = HumanSessionStore(run_dir)
+def _port(tmp_path, agent, *, max_turns=64):
+    store = HumanSessionStore(tmp_path / "run")
     transport = LoopbackTransport()
     service = FeishuHumanSessionService(
         store=store,
         transport=transport,
         agent=FakeCoSessionAgent(),
     )
-    reference = PythonReferenceEvaluator(
-        _reference_module(tmp_path), context={"target": 3}
-    )
-    proxy_agent = EvaluatorBackedHumanProxyAgent(reference)
     port = HumanProxySessionPort(
         service=service,
-        proxy_agent=proxy_agent,
-        expert_id="human_proxy_vstar",
+        proxy_agent=agent,
+        expert_id="human_proxy_agent",
+        max_turns_per_consult=max_turns,
     )
-    return port, store, transport, reference
+    return port, store, transport
 
 
-def test_proxy_uses_real_evaluator_and_full_human_session_contract(tmp_path):
-    port, store, transport, reference = _proxy_port(tmp_path)
+def test_proxy_uses_same_free_multi_turn_contract_and_can_refuse_close(tmp_path):
+    store = HumanSessionStore(tmp_path / "run")
+    agent = NaturalDialogueAgent(store)
+    transport = LoopbackTransport()
+    port = HumanProxySessionPort(
+        service=FeishuHumanSessionService(
+            store=store,
+            transport=transport,
+            agent=FakeCoSessionAgent(),
+        ),
+        proxy_agent=agent,
+        expert_id="human_proxy_agent",
+    )
 
-    outcome = port.consult(purpose="verifier_change", context=_improving_context())
-
-    session = store.sessions()[0]
-    assert session.state is SessionState.CLOSED
-    assert store.opened_count == 1
-    assert outcome == store.outcome(session.session_id)
-    assert outcome.decision == "approve"
-    assert reference.calls == 2
-
-    transcript = store.transcript(session.session_id)
-    assert [item.role for item in transcript] == [
-        "agent",
-        "human",
-        "agent",
-        "human",
-        "agent",
-        "human",
-        "agent",
-        "human",
-        "agent",
-    ]
-    assert "请继续说明" in transcript[3].text
-    assert "这轮可以结束" in transcript[5].text
-    assert transcript[7].text == "确认结束"
-    assert "第 1/5 次" in transcript[0].text
-    assert len(transport.sent) == 5
-
-
-def test_proxy_port_runs_an_independent_multi_turn_agent_through_same_contract(
-    tmp_path,
-):
-    port, store, transport, reference = _proxy_port(tmp_path)
-    dialogue_agent = IndependentConversationAgent(reference, store)
-    port.proxy_agent = dialogue_agent
-
-    outcome = port.consult(purpose="verifier_change", context=_improving_context())
+    outcome = port.consult(
+        purpose="verifier_change",
+        context={"solver_workspace_secret": "never passed to proxy policy"},
+    )
 
     session = store.sessions()[0]
     transcript = store.transcript(session.session_id)
-    assert outcome == dialogue_agent.assessment.outcome
     assert session.state is SessionState.CLOSED
+    assert outcome == FINAL_OUTCOME
+    assert store.outcome(session.session_id) == FINAL_OUTCOME
     assert store.opened_count == 1
     assert store.remaining_count == 4
-    assert reference.calls == 2
-    assert [item.role for item in transcript] == [
-        "agent", "human", "agent", "human", "agent", "human", "agent",
-        "human", "agent", "human", "agent", "human", "agent", "human", "agent",
-    ]
-    assert "先别结束" in transcript[7].text
-    assert "还剩几次" in transcript[9].text
-    assert len(dialogue_agent.observed_agent_replies) >= 7
-    assert len(transport.sent) == 8
+    assert "先别结束" in transcript[5].text
+    assert any("保密边界" in item.text for item in transcript)
+    assert len([item for item in transcript if item.role == "human"]) == 6
+    assert len(transport.sent) == 7
 
 
-def test_proxy_resume_reuses_frozen_outcome_without_rerunning_vstar(tmp_path):
-    port, store, _, reference = _proxy_port(tmp_path)
-    failing_agent = FailOnceAfterFreezeAgent(reference)
-    port.proxy_agent = failing_agent
+def test_proxy_failure_pauses_and_resume_reuses_same_session(tmp_path):
+    agent = FailOnceAgent()
+    port, store, _ = _port(tmp_path, agent)
 
     with pytest.raises(RuntimeError, match="Human Proxy driver failed"):
-        port.consult(purpose="verifier_change", context=_improving_context())
+        port.consult(purpose="verifier_change", context={})
 
-    session = store.sessions()[0]
-    assert session.state is SessionState.PAUSED
+    assert store.sessions()[0].state is SessionState.PAUSED
     assert store.opened_count == 1
-    assert reference.calls == 2
-    proxy_state = json.loads(
-        (store.root / session.session_id / "proxy_state.json").read_text()
-    )
-    frozen_outcome = SessionOutcome.from_dict(proxy_state["outcome"])
 
-    outcome = port.consult(purpose="verifier_change", context=_improving_context())
+    outcome = port.consult(purpose="verifier_change", context={})
 
+    assert outcome == FINAL_OUTCOME
     assert store.sessions()[0].state is SessionState.CLOSED
     assert store.opened_count == 1
-    assert reference.calls == 2
-    assert failing_agent.frozen_inputs == [None, frozen_outcome]
-    assert outcome == frozen_outcome
+    assert agent.frozen_inputs == [None, None]
 
 
-def test_proxy_watchdog_pauses_one_consult_without_limiting_session_turns(tmp_path):
-    port, store, _, _ = _proxy_port(tmp_path)
-    port.proxy_agent = EndlessConversationAgent()
-    port.max_turns_per_consult = 2
+def test_proxy_watchdog_pauses_one_consult_without_spending_another_session(
+    tmp_path,
+):
+    port, store, _ = _port(tmp_path, EndlessAgent(), max_turns=2)
 
     with pytest.raises(RuntimeError, match="watchdog reached 2 turns"):
-        port.consult(purpose="verifier_change", context=_improving_context())
+        port.consult(purpose="verifier_change", context={})
 
     assert store.sessions()[0].state is SessionState.PAUSED
     assert store.opened_count == 1
     first_length = len(store.transcript("session_001"))
-    frozen_state = (
-        store.root / "session_001" / "proxy_state.json"
-    ).read_text(encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="watchdog reached 2 turns"):
-        port.consult(purpose="verifier_change", context=_improving_context())
+        port.consult(purpose="verifier_change", context={})
 
     assert store.sessions()[0].state is SessionState.PAUSED
     assert store.opened_count == 1
     assert len(store.transcript("session_001")) == first_length + 4
-    assert (
-        store.root / "session_001" / "proxy_state.json"
-    ).read_text(encoding="utf-8") == frozen_state
-
-
-def test_proxy_rejects_a_proposal_that_moves_away_from_real_evaluator(tmp_path):
-    port, _, _, _ = _proxy_port(tmp_path)
-    context = _improving_context()
-    for case in context["comparison_cases"]:
-        case["current"], case["proposed"] = case["proposed"], case["current"]
-
-    outcome = port.consult(purpose="verifier_change", context=context)
-
-    assert outcome.decision == "reject"
-    assert outcome.rejected_changes
-    assert "真实 evaluator" in outcome.human_rationale
-
-
-def test_proxy_never_leaks_reference_source_or_raw_results_into_run(tmp_path):
-    port, store, _, _ = _proxy_port(tmp_path)
-    port.consult(purpose="verifier_change", context=_improving_context())
-
-    blobs = []
-    for path in store.run_dir.rglob("*"):
-        if path.is_file():
-            blobs.append(path.read_text(encoding="utf-8", errors="ignore"))
-    joined = "\n".join(blobs)
-    assert "TOP_SECRET_VSTAR_SOURCE" not in joined
-    assert "must never enter the run" not in joined
-    assert "'hidden': True" not in joined
-    assert '"hidden": true' not in joined.lower()
 
 
 def test_proxy_has_the_same_five_session_budget_as_a_human(tmp_path):
-    port, store, _, _ = _proxy_port(tmp_path)
+    port, store, _ = _port(tmp_path, ClosingAgent())
 
     outcomes = [
-        port.consult(purpose=f"checkpoint_{i}", context=_improving_context())
-        for i in range(6)
+        port.consult(purpose=f"checkpoint_{index}", context={})
+        for index in range(6)
     ]
 
-    assert all(outcome is not None for outcome in outcomes[:5])
+    assert outcomes[:5] == [FINAL_OUTCOME] * 5
     assert outcomes[5] is None
     assert store.opened_count == 5
     assert store.remaining_count == 0
 
 
-def test_proxy_task_definition_session_still_talks_and_closes_without_cases(tmp_path):
-    port, store, _, reference = _proxy_port(tmp_path)
-
-    outcome = port.consult(
-        purpose="task_definition", context={"phase": "before_bootstrap"}
+def test_final_outcome_is_frozen_before_confirmation_and_reused_on_resume(tmp_path):
+    original = SessionOutcome(
+        decision="guide",
+        human_guidance=["original, already durable"],
+        human_rationale="first confirmation attempt",
+    )
+    changed = SessionOutcome(
+        decision="approve",
+        approved_changes=["must not replace durable outcome"],
     )
 
-    assert outcome.decision == "guide"
-    assert outcome.evidence_requested
-    assert reference.calls == 0
-    assert store.sessions()[0].state is SessionState.CLOSED
+    class ResumeWithChangedJudgement:
+        def start_conversation(self, *, purpose, frozen_outcome=None):
+            del purpose
+            assert frozen_outcome == original
 
+            def next_turn(*, session, transcript):
+                del session, transcript
+                return HumanProxyTurn("确认结束", outcome=changed)
 
-def test_proxy_end_to_end_approves_then_agent_system_installs_after_close(tmp_path):
-    current_source = (
-        "def verify(payload, ctx):\n"
-        "    value = float(payload.get('value', -1))\n"
-        "    ok = 0 <= value <= 10\n"
-        "    return {'feasible': ok, 'raw': value if ok else -1e9, 'artifacts': {}}\n"
+            return HumanProxyConversation(next_turn=next_turn)
+
+    port, store, _ = _port(tmp_path, ResumeWithChangedJudgement())
+    session = port.service.open_session(
+        expert_id="human_proxy_agent",
+        purpose="verifier_change",
+        context={},
     )
-    proposed_source = (
-        "def verify(payload, ctx):\n"
-        "    value = float(payload.get('value', -1))\n"
-        "    ok = 0 <= value <= 10\n"
-        "    return {'feasible': ok, 'raw': -abs(value - 3) if ok else -1e9, "
-        "'artifacts': {}}\n"
-    )
-    raw = tmp_path / "raw_system"
-    raw.mkdir()
-    (raw / "instruction.md").write_text("target value is three")
-    system = AgentSystem(raw_input_dir=raw, run_dir=tmp_path / "system_run")
-    evaluator = Evaluator()
-    evaluator.versions.append(_version0(current_source))
-    system.evaluator = evaluator
-    system._ctx = {}
-    system._seed = {"value": 1}
-    system._probes = [
-        {"description": "proxy exploit", "solution": {"value": 10}}
-    ]
-    system.eval_service = EvalService(
-        evaluator=evaluator,
-        ctx_provider=lambda: system._ctx,
-        feedback_level=FeedbackLevel.WITH_ARTIFACTS,
-    )
-    system.store.verifier_version(
-        0, current_source, origin="agent", note="bootstrap", rationale=""
+    store._transition(session.session_id, SessionState.CLOSE_REQUESTED)
+    state_path = store.root / session.session_id / "proxy_state.json"
+    state_path.write_text(
+        json.dumps({"outcome": original.to_dict()}, ensure_ascii=False),
+        encoding="utf-8",
     )
 
-    reference = PythonReferenceEvaluator(
-        _reference_module(tmp_path), context={"target": 3}
-    )
-    human_store = HumanSessionStore(system.run_dir)
-    transport = LoopbackTransport()
-    service = FeishuHumanSessionService(
-        store=human_store, transport=transport, agent=FakeCoSessionAgent()
-    )
-    system.human_port = HumanProxySessionPort(
-        service=service,
-        proxy_agent=EvaluatorBackedHumanProxyAgent(reference),
-    )
-    proposal = tmp_path / "system_proposal"
-    proposal.mkdir()
-    (proposal / "verifier.py").write_text(proposed_source)
+    outcome = port.consult(purpose="verifier_change", context={})
 
-    system._apply_harden(proposal, trigger="proxy_test", verdict={"gaming": True})
-
-    assert system.eval_service.current_version() == 1
-    assert system.hardenings == 1
-    assert human_store.opened_count == 1
-    assert human_store.sessions()[0].state is SessionState.CLOSED
-    assert human_store.outcome("session_001").decision == "approve"
-
-
-def test_agent_system_preflight_builds_proxy_port_from_hidden_evaluator_config(
-    tmp_path, monkeypatch
-):
-    from coscientist.coevo import agent_system as agent_system_module
-    from coscientist.coevo.container import GatewayConfig
-
-    raw = tmp_path / "raw_preflight"
-    raw.mkdir()
-    (raw / "instruction.md").write_text("target value is three")
-    reference_path = _reference_module(tmp_path)
-    context_path = tmp_path / "reference_context.json"
-    context_path.write_text('{"target": 3}')
-    system = AgentSystem(
-        raw_input_dir=raw,
-        run_dir=tmp_path / "preflight_run",
-        human_proxy_evaluator_path=reference_path,
-        human_proxy_evaluator_context_path=context_path,
-    )
-    system.gateway = GatewayConfig(codex_home=tmp_path / "fake_codex_home")
-    system.agent_elf = tmp_path / "fake_codex"
-    monkeypatch.setattr(agent_system_module, "docker_unavailable", lambda: None)
-
-    system.preflight()
-
-    assert isinstance(system.human_port, HumanProxySessionPort)
-    assert system.human_port.proxy_agent.reference_evaluator.context == {"target": 3}
-    assert system.human_port.service.agent.gateway.model == "gpt-5.6-luna"
-    assert system.human_port.service.agent.gateway.reasoning_effort == "low"
+    assert outcome == original
+    assert store.outcome(session.session_id) == original

@@ -1,24 +1,19 @@
-"""Evaluator-backed Human Proxy that obeys the real Human Session contract.
+"""Model-backed Human Proxy using the same durable contract as a human expert.
 
-The proxy is the *expert participant*, not a privileged evaluator mutation path.
-It consults a hidden reference evaluator (V*), talks to the same Co-side evidence
-agent through the same durable session store, requests closure, and explicitly
-confirms it.  AgentSystem therefore sees only the ordinary ``consult`` seam used
-by a Feishu human.
+The proxy receives private evaluator *context as text*. It has no reference
+evaluator callable, solution runner, Solver workspace, or GPU environment.
 """
 
 from __future__ import annotations
 
-import hashlib
-import importlib.util
-import inspect
 import json
-import math
 import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
+from .container import AgentSession, GatewayConfig, one_shot_agent
 from .feishu_human import FeishuHumanSessionService
 from .feishu_transport import FeishuMessageEvent
 from .human_sessions import (
@@ -29,97 +24,12 @@ from .human_sessions import (
     SessionState,
 )
 
-
-@dataclass(frozen=True)
-class ReferenceEvaluation:
-    ok: bool
-    feasible: bool = False
-    score: float | None = None
-    error: str = ""
-
-
-class ReferenceEvaluator(Protocol):
-    calls: int
-
-    def evaluate(self, payload: dict) -> ReferenceEvaluation: ...
-
-
-class PythonReferenceEvaluator:
-    """Trusted control-plane adapter for a hidden Python V* module.
-
-    The module path and source are never copied into the run. Its callable may be
-    ``verify(payload, ctx)`` or ``verify(payload)`` and should return a mapping with
-    ``feasible`` plus ``raw`` or ``score`` (higher is better), matching Co's verifier
-    convention.
-    """
-
-    def __init__(
-        self,
-        module_path: Path | str,
-        *,
-        function: str = "verify",
-        context: dict[str, Any] | None = None,
-    ):
-        self.module_path = Path(module_path).resolve()
-        self.function = function
-        self.context = dict(context or {})
-        self.calls = 0
-        self._callable = self._load()
-
-    def _load(self):
-        if not self.module_path.is_file():
-            raise FileNotFoundError(f"reference evaluator not found: {self.module_path}")
-        digest = hashlib.sha256(str(self.module_path).encode("utf-8")).hexdigest()[:12]
-        spec = importlib.util.spec_from_file_location(
-            f"coscientist_hidden_reference_{digest}", self.module_path
-        )
-        if spec is None or spec.loader is None:
-            raise RuntimeError("could not load the reference evaluator module")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        function = getattr(module, self.function, None)
-        if not callable(function):
-            raise TypeError(
-                f"reference evaluator has no callable {self.function!r}"
-            )
-        return function
-
-    def evaluate(self, payload: dict) -> ReferenceEvaluation:
-        self.calls += 1
-        try:
-            parameters = inspect.signature(self._callable).parameters
-            raw_result = (
-                self._callable(payload, dict(self.context))
-                if len(parameters) >= 2
-                else self._callable(payload)
-            )
-            if not isinstance(raw_result, dict):
-                raise TypeError("reference evaluator must return a dict")
-            raw_score = raw_result.get("raw", raw_result.get("score"))
-            score = float(raw_score) if raw_score is not None else None
-            if score is not None and not math.isfinite(score):
-                raise ValueError("reference evaluator returned a non-finite score")
-            feasible = bool(raw_result.get("feasible", score is not None))
-            return ReferenceEvaluation(
-                ok=True,
-                feasible=feasible,
-                score=score,
-            )
-        except Exception as exc:  # noqa: BLE001 - V* errors become safe proxy guidance
-            return ReferenceEvaluation(ok=False, error=type(exc).__name__)
-
-
-@dataclass(frozen=True)
-class ProxyAssessment:
-    message: str
-    outcome: SessionOutcome
-
-
 @dataclass(frozen=True)
 class HumanProxyTurn:
     """One natural-language turn chosen by the expert-side dialogue agent."""
 
     text: str
+    outcome: SessionOutcome | None = None
 
 
 class HumanProxyTurnPolicy(Protocol):
@@ -130,10 +40,10 @@ class HumanProxyTurnPolicy(Protocol):
 
 @dataclass(frozen=True)
 class HumanProxyConversation:
-    """A frozen V* judgement plus a live policy for choosing subsequent turns."""
+    """A live expert policy reconstructed from the durable transcript."""
 
-    outcome: SessionOutcome
     next_turn: HumanProxyTurnPolicy
+    outcome: SessionOutcome | None = None
 
 
 class HumanProxyAgent(Protocol):
@@ -143,261 +53,188 @@ class HumanProxyAgent(Protocol):
         self,
         *,
         purpose: str,
-        context: dict[str, Any],
         frozen_outcome: SessionOutcome | None = None,
     ) -> HumanProxyConversation: ...
 
 
-@dataclass
-class EvaluatorBackedHumanProxyAgent:
-    """Expert-side agent that judges V changes against hidden V* evaluations."""
+ProxyRunner = Callable[..., AgentSession]
 
-    reference_evaluator: ReferenceEvaluator
-    assessments: int = 0
+
+@dataclass
+class ModelBackedHumanProxyAgent:
+    """A human-like expert agent with private evaluator *context*, not execution.
+
+    The agent gets no Solver payload, run workspace, evaluator callable, GPU, or
+    evaluator endpoint from this class.  Every turn is reconstructed from a private
+    text context plus the public Human Session transcript in a throw-away workspace.
+    """
+
+    evaluator_context: str
+    gateway: GatewayConfig
+    agent_elf: Path
+    image: str = "python:3.11-slim"
+    timeout_s: float = 180.0
+    runner: ProxyRunner | None = None
+
+    def __post_init__(self) -> None:
+        self.evaluator_context = self.evaluator_context.strip()
+        if not self.evaluator_context:
+            raise ValueError("Human Proxy evaluator context must not be empty")
+        if len(self.evaluator_context) > 200_000:
+            raise ValueError("Human Proxy evaluator context exceeds 200000 characters")
+        self.agent_elf = Path(self.agent_elf)
 
     def start_conversation(
         self,
         *,
         purpose: str,
-        context: dict[str, Any],
         frozen_outcome: SessionOutcome | None = None,
     ) -> HumanProxyConversation:
-        """Freeze one hidden evaluation, then converse from its safe assessment.
-
-        The returned policy reacts to the durable transcript rather than prescribing
-        messages in the transport port.  A deployment may replace this agent with a
-        model-backed implementation of :class:`HumanProxyAgent` without changing the
-        Human Session service or its lifecycle rules.
-        """
-        if frozen_outcome is None:
-            assessment = self.assess(purpose=purpose, context=context)
-        else:
-            assessment = ProxyAssessment(
-                message=self._resumed_message(frozen_outcome),
-                outcome=frozen_outcome,
-            )
+        # A real human learns run details only through Co-side chat messages.
+        # The port never passes the orchestrator's private session context here.
+        del frozen_outcome
 
         def next_turn(
             *, session: HumanSession, transcript: list[SessionMessage]
         ) -> HumanProxyTurn:
-            human_turns = [item for item in transcript if item.role == "human"]
-            agent_turns = [item for item in transcript if item.role == "agent"]
-            if session.state is SessionState.CLOSE_REQUESTED:
-                return HumanProxyTurn("确认结束")
-            if not human_turns:
-                return HumanProxyTurn(assessment.message)
-            if len(human_turns) == 1:
-                last_reply = agent_turns[-1].text if agent_turns else ""
-                focus = (
-                    assessment.outcome.unresolved_questions[0]
-                    if assessment.outcome.unresolved_questions
-                    else "尚未覆盖的边界条件"
+            return self._next_turn(
+                purpose=purpose,
+                session=session,
+                transcript=transcript,
+            )
+
+        return HumanProxyConversation(next_turn=next_turn)
+
+    def _next_turn(
+        self,
+        *,
+        purpose: str,
+        session: HumanSession,
+        transcript: list[SessionMessage],
+    ) -> HumanProxyTurn:
+        with tempfile.TemporaryDirectory(prefix="coscientist-human-proxy-") as raw:
+            workspace = Path(raw)
+            (workspace / "evaluator_context.md").write_text(
+                self.evaluator_context, encoding="utf-8"
+            )
+            (workspace / "transcript.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "sequence": item.sequence,
+                            "role": item.role,
+                            "text": item.text,
+                            "timestamp": item.timestamp,
+                        }
+                        for item in transcript
+                    ],
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            result = self._run(
+                workspace,
+                self._prompt(purpose=purpose, state=session.state),
+            )
+            if not result.ok:
+                raise RuntimeError(
+                    "Human Proxy model turn failed: "
+                    f"{result.note or result.stderr[-200:]}"
                 )
-                if focus in last_reply:
-                    focus = "这个判断在对抗样例上的依据"
-                return HumanProxyTurn(f"请继续说明：{focus}。")
-            return HumanProxyTurn(
-                f"我的最终判断是 {assessment.outcome.decision}，依据已经说明。"
-                "现在这轮可以结束了。"
-            )
+            turn_path = workspace / "turn.json"
+            if not turn_path.is_file():
+                raise RuntimeError("Human Proxy model did not write turn.json")
+            try:
+                payload = json.loads(turn_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("Human Proxy model wrote invalid turn.json") from exc
+        return self._parse_turn(payload, state=session.state)
 
-        return HumanProxyConversation(
-            outcome=assessment.outcome,
-            next_turn=next_turn,
+    def _run(self, workspace: Path, prompt: str) -> AgentSession:
+        if self.runner is not None:
+            return self.runner(
+                workspace,
+                prompt,
+                gateway=self.gateway,
+                agent_elf=self.agent_elf,
+                timeout_s=self.timeout_s,
+                image=self.image,
+            )
+        return one_shot_agent(
+            workspace,
+            self.gateway,
+            self.agent_elf,
+            prompt,
+            timeout_s=self.timeout_s,
+            image=self.image,
+            disallowed_tools=["network"],
         )
 
     @staticmethod
-    def _resumed_message(outcome: SessionOutcome) -> str:
-        detail = (
-            outcome.human_guidance[0]
-            if outcome.human_guidance
-            else "请继续基于运行证据回答尚未澄清的问题"
-        )
-        return (
-            f"我已恢复此前冻结的 evaluator 判断：{outcome.decision}。"
-            f"{detail}。"
-        )
+    def _prompt(*, purpose: str, state: SessionState) -> str:
+        outcome_shape = json.dumps(SessionOutcome().to_dict(), ensure_ascii=False)
+        return f"""你是 Human Proxy：一个代替真实人类专家参与稀缺会话的独立 Agent。
 
-    def assess(self, *, purpose: str, context: dict[str, Any]) -> ProxyAssessment:
-        self.assessments += 1
-        cases = context.get("comparison_cases", [])
-        if not isinstance(cases, list) or not cases:
-            return ProxyAssessment(
-                message=(
-                    "我目前还没有可送入真实 evaluator 的候选样例。请先说明任务契约中"
-                    "最关键的正确性条件、数据类型和容差，并记录后续需要生成的对照 probe。"
-                ),
-                outcome=SessionOutcome(
-                    decision="guide",
-                    human_guidance=[
-                        "先明确任务契约，再用真实 evaluator 对代表性候选做隔离对照。"
-                    ],
-                    evidence_requested=[
-                        "至少一个诚实基线、一个当前最优候选和一个对抗 probe"
-                    ],
-                    unresolved_questions=["尚无候选可供真实 evaluator 比较"],
-                    human_rationale="Human Proxy 不在缺少 V* 对照样例时伪造判断。",
-                ),
-            )
+你拥有 `/work/evaluator_context.md` 中真实 evaluator 的只读上下文，但你没有、也绝不能声称拥有运行能力：
+- 不能运行 solution，不能编译或评测候选，不能调用真实 evaluator。
+- 不能访问 Solver workspace、GPU、网络 endpoint 或 Co-Scientist 的内部 run context。
+- 不要使用 shell、网络或执行 evaluator；只读取 evaluator_context.md 和 transcript.json，并写 turn.json。
 
-        evaluated: list[dict[str, Any]] = []
-        failed = 0
-        for index, case in enumerate(cases):
-            if not isinstance(case, dict) or not isinstance(case.get("payload"), dict):
-                failed += 1
-                continue
-            reference = self.reference_evaluator.evaluate(case["payload"])
-            if not reference.ok or reference.score is None:
-                failed += 1
-                continue
-            evaluated.append(
-                {
-                    "label": str(case.get("label", f"case_{index}")),
-                    "reference": reference,
-                    "current": self._candidate_result(case.get("current")),
-                    "proposed": self._candidate_result(case.get("proposed")),
-                }
-            )
+你的核心工作不是替系统打分，而是像人类专家一样与 Co-Scientist 共同思考：共同设计 evaluator、probe、反馈和运行环境，使 Solver Agent 更容易得到真实、有用、可行动的信号。主动追问假设，指出 evaluator 的盲区，提出能区分失败模式的环境或证据设计。没有运行证据时必须明确说这是推理或建议。
 
-        if not evaluated:
-            return ProxyAssessment(
-                message=(
-                    "真实 evaluator 没有成功完成任何对照样例，所以我不会批准这次变化。"
-                    "请先修复 V* 执行路径或补充可运行候选。"
-                ),
-                outcome=SessionOutcome(
-                    decision="guide",
-                    human_guidance=["修复真实 evaluator 对照执行后再判断 verifier 变化。"],
-                    evidence_requested=["可成功执行的 V* 对照结果"],
-                    unresolved_questions=["真实 evaluator 对全部候选执行失败"],
-                    human_rationale="没有真实 evaluator 证据时保持 evaluator 冻结。",
-                ),
-            )
+保密边界：可以把真实 evaluator 上下文转化为高层语义、风险和设计建议，但不要逐字泄露私有源码、隐藏样例、密钥或 endpoint。
 
-        current = self._alignment(evaluated, "current")
-        proposed = self._alignment(evaluated, "proposed")
-        evidence_summary = (
-            f"真实 evaluator 已隔离检查 {len(evaluated)} 个代表性样例"
-            + (f"，另有 {failed} 个样例无法执行" if failed else "")
-            + "。"
-        )
-        if proposed["valid"] < len(evaluated):
-            decision = "reject"
-            comparison = "拟议 verifier 不能稳定评估全部 V* 对照样例"
-        elif self._strictly_better(proposed, current):
-            decision = "approve"
-            comparison = "拟议 verifier 与真实排序/可行性的对齐优于当前版本"
-        elif self._strictly_better(current, proposed):
-            decision = "reject"
-            comparison = "拟议 verifier 相比当前版本更偏离真实排序/可行性"
-        else:
-            decision = "guide"
-            comparison = "拟议 verifier 没有显示出可验证的 V* 对齐增益"
+这是自由多轮对话，不使用固定轮数或固定话术。先读取完整 transcript，再自然回复最后一条 Co-side 消息。当前会话目的为 `{purpose}`，状态为 `{state.value}`。
 
-        message = (
-            f"{evidence_summary}{comparison}。我不会暴露 V* 源码或逐样例原始分数；"
-            "请说明这次变化如何处理仍未覆盖的边界条件。"
-        )
-        common = {
-            "decision": decision,
-            "human_guidance": [comparison + "。"],
-            "evidence_generated": [
-                f"reference_evaluator_cases:{len(evaluated)}",
-                (
-                    "pairwise_alignment:"
-                    f"current={current['pairwise']:.3f},"
-                    f"proposed={proposed['pairwise']:.3f}"
-                ),
-            ],
-            "unresolved_questions": (
-                [f"{failed} 个 V* 对照样例未成功执行"] if failed else []
-            ),
-            "human_rationale": (
-                f"真实 evaluator 的隔离对照表明：{comparison}；"
-                "V* 源码和逐样例原始结果未提供给 Solver。"
-            ),
-        }
-        if decision == "approve":
-            common["approved_changes"] = ["采用本轮经 V* 对照的 verifier 变化"]
-        elif decision == "reject":
-            common["rejected_changes"] = ["拒绝本轮 verifier 变化"]
-        else:
-            common["evidence_requested"] = ["增加能区分当前版与拟议版的边界 probe"]
-        return ProxyAssessment(message=message, outcome=SessionOutcome(**common))
+写入 `/work/turn.json`，且只写这个 JSON 文件：
+{{
+  "message": "自然语言回复",
+  "action": "continue | request_close | confirm_close | keep_open",
+  "outcome": null
+}}
+
+action 规则：
+- `continue`：继续自然对话。
+- `request_close`：你认为本轮信息已充分，请求进入关闭确认；同时提供 reasoned outcome。
+- `confirm_close`：仅当状态是 close_requested 且 Co-side 总结准确时使用；必须提供最终 outcome。
+- `keep_open`：仅当状态是 close_requested 但总结不准确或仍需追问时使用。
+
+outcome 字段形状：{outcome_shape}
+decision 只能是 approve/reject/guide/none。它必须来自本轮对话中的推理，不能来自你没有运行过的 solution 结果。
+"""
 
     @staticmethod
-    def _candidate_result(value: Any) -> dict[str, Any]:
-        if not isinstance(value, dict):
-            return {"ok": False, "feasible": False, "score": None}
-        score = value.get("score")
-        try:
-            parsed_score = float(score) if score is not None else None
-        except (TypeError, ValueError):
-            parsed_score = None
-        return {
-            "ok": bool(value.get("ok", parsed_score is not None)),
-            "feasible": bool(value.get("feasible", parsed_score is not None)),
-            "score": parsed_score,
-        }
-
-    @staticmethod
-    def _alignment(evaluated: list[dict[str, Any]], key: str) -> dict[str, float]:
-        valid = [
-            item
-            for item in evaluated
-            if item[key]["ok"] and item[key]["score"] is not None
-        ]
-        feasibility = (
-            sum(
-                item[key]["feasible"] == item["reference"].feasible
-                for item in valid
-            )
-            / len(valid)
-            if valid
-            else 0.0
+    def _parse_turn(payload: Any, *, state: SessionState) -> HumanProxyTurn:
+        if not isinstance(payload, dict):
+            raise RuntimeError("Human Proxy turn must be a JSON object")
+        message = str(payload.get("message", "")).strip()
+        if not message:
+            raise RuntimeError("Human Proxy turn is missing message")
+        action = str(payload.get("action", "continue")).strip().lower()
+        if action not in {"continue", "request_close", "confirm_close", "keep_open"}:
+            raise RuntimeError(f"unsupported Human Proxy action: {action}")
+        raw_outcome = payload.get("outcome")
+        outcome = (
+            SessionOutcome.from_dict(raw_outcome)
+            if isinstance(raw_outcome, dict)
+            else None
         )
-        agreements = 0
-        pairs = 0
-        for left_index, left in enumerate(valid):
-            for right in valid[left_index + 1 :]:
-                ref_delta = left["reference"].score - right["reference"].score
-                candidate_delta = left[key]["score"] - right[key]["score"]
-                if abs(ref_delta) < 1e-12:
-                    continue
-                pairs += 1
-                if ref_delta * candidate_delta > 0:
-                    agreements += 1
-                elif abs(candidate_delta) < 1e-12:
-                    agreements += 0.5
-        pairwise = agreements / pairs if pairs else feasibility
-        mae = (
-            sum(abs(item[key]["score"] - item["reference"].score) for item in valid)
-            / len(valid)
-            if valid
-            else float("inf")
-        )
-        return {
-            "valid": float(len(valid)),
-            "feasibility": feasibility,
-            "pairwise": pairwise,
-            "mae": mae,
-        }
-
-    @staticmethod
-    def _strictly_better(left: dict[str, float], right: dict[str, float]) -> bool:
-        if left["valid"] > right["valid"]:
-            return True
-        if left["valid"] < right["valid"]:
-            return False
-        if left["feasibility"] > right["feasibility"] + 1e-9:
-            return True
-        if left["feasibility"] + 1e-9 < right["feasibility"]:
-            return False
-        if left["pairwise"] > right["pairwise"] + 1e-9:
-            return True
-        if left["pairwise"] + 1e-9 < right["pairwise"]:
-            return False
-        return left["mae"] + 1e-9 < right["mae"]
+        if action in {"request_close", "confirm_close"} and outcome is None:
+            raise RuntimeError(f"Human Proxy {action} requires an outcome")
+        if action == "confirm_close":
+            if state is not SessionState.CLOSE_REQUESTED:
+                raise RuntimeError("Human Proxy can confirm only a requested close")
+            return HumanProxyTurn("确认结束", outcome=outcome)
+        if action == "keep_open":
+            if state is not SessionState.CLOSE_REQUESTED:
+                raise RuntimeError("Human Proxy can keep open only after a close request")
+            if "继续聊" not in message:
+                message = f"继续聊：{message}"
+            return HumanProxyTurn(message, outcome=outcome)
+        if action == "request_close" and "结束这轮" not in message:
+            message = f"{message}\n\n结束这轮"
+        return HumanProxyTurn(message, outcome=outcome)
 
 
 @dataclass
@@ -421,11 +258,11 @@ class LoopbackTransport:
 
 @dataclass
 class HumanProxySessionPort:
-    """Blocking ``HumanInteractionPort`` implemented by a V*-holding expert agent."""
+    """Blocking ``HumanInteractionPort`` driven by a model-backed expert agent."""
 
     service: FeishuHumanSessionService
     proxy_agent: HumanProxyAgent
-    expert_id: str = "human_proxy_vstar"
+    expert_id: str = "human_proxy_agent"
     max_turns_per_consult: int = 64
 
     def __post_init__(self) -> None:
@@ -445,14 +282,17 @@ class HumanProxySessionPort:
             frozen_outcome = self._load_frozen_outcome(session.session_id)
             conversation = self.proxy_agent.start_conversation(
                 purpose=session.purpose,
-                context=session.context,
                 frozen_outcome=frozen_outcome,
             )
-            if frozen_outcome is None:
+            if frozen_outcome is None and conversation.outcome is not None:
                 self._persist_frozen_outcome(
                     session.session_id, conversation.outcome
                 )
-            elif conversation.outcome != frozen_outcome:
+            elif (
+                frozen_outcome is not None
+                and conversation.outcome is not None
+                and conversation.outcome != frozen_outcome
+            ):
                 raise RuntimeError("resumed Human Proxy changed its frozen outcome")
 
             driven_turns = 0
@@ -472,11 +312,23 @@ class HumanProxySessionPort:
                 if not turn.text.strip():
                     raise RuntimeError("Human Proxy agent returned an empty turn")
                 if session.state is SessionState.CLOSE_REQUESTED:
-                    # V* is frozen before the first turn.  Only expose its sanitized
-                    # structured outcome at the ordinary explicit-confirmation seam.
-                    self.service.store.stage_outcome(
-                        session.session_id, conversation.outcome
+                    # A close-requested session is still a live conversation: the
+                    # expert may reject the summary and keep talking. Only a turn
+                    # carrying a reasoned outcome is a confirmation candidate. Once
+                    # persisted, that outcome wins on crash recovery even if a later
+                    # model invocation proposes something different.
+                    final_outcome = (
+                        frozen_outcome or turn.outcome or conversation.outcome
                     )
+                    if final_outcome is not None:
+                        if frozen_outcome is None:
+                            self._persist_frozen_outcome(
+                                session.session_id, final_outcome
+                            )
+                            frozen_outcome = final_outcome
+                        self.service.store.stage_outcome(
+                            session.session_id, final_outcome
+                        )
                 handled = self.service.handle_event(
                     self._event(session.session_id, turn.text, "dialogue")
                 )

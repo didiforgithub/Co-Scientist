@@ -59,10 +59,10 @@ python -m coscientist.coevo.cli \
   --human-agent-timeout-s 180
 ```
 
-The conversational evidence agent defaults to `gpt-5.6-luna` with low reasoning
-effort so a human reply does not inherit the slower model/effort selected for the
-main scientific run. Both settings are independently configurable with the flags
-above; they do not change the Solver, Supervisor, or hidden Human Proxy evaluator.
+Human Session agents default to `gpt-5.6-luna` with low reasoning effort so a
+human reply does not inherit the slower model/effort selected for the main
+scientific run. The flags configure the Co-side evidence agent and, in proxy mode,
+the independent Human Proxy; they do not change the Solver or Supervisor.
 
 Resume the same run after a process or listener interruption:
 
@@ -83,9 +83,11 @@ The task-definition checkpoint runs before bootstrap so its guidance is availabl
 
 Disabling `--feishu-expert-id` preserves the existing autonomous behavior exactly.
 
-## Evaluator-backed Human Proxy Agent
+## Model-backed Human Proxy Agent
 
-For automated experiments and pre-Feishu testing, replace the Feishu expert with a Human Proxy that holds a hidden real evaluator `V*`:
+For automated experiments and pre-Feishu testing, replace the Feishu expert with
+a separate model agent and give it a private textual description of the real
+evaluator:
 
 ```bash
 python -m coscientist.coevo.cli \
@@ -93,34 +95,60 @@ python -m coscientist.coevo.cli \
   --runs-dir /path/to/runs \
   --run-id abc-proxy-001 \
   --solver-strength strong \
-  --human-proxy-evaluator /control-plane/reference_evaluator.py \
-  --human-proxy-evaluator-function verify \
-  --human-proxy-evaluator-context /control-plane/reference_context.json
+  --human-proxy-context /control-plane/evaluator_context.md \
+  --human-agent-model gpt-5.6-luna \
+  --human-agent-reasoning-effort low
 ```
 
-The Python module is trusted control-plane code. Its callable accepts either `payload` or `payload, context` and returns:
+The context should explain the evaluator's real goal, task semantics, important
+failure modes, evidence standards, and useful environment constraints. It is
+treated only as text: Co-Scientist never imports it as Python and never exposes an
+evaluator callable or endpoint. Keep this private file outside both the run
+directory and the Solver workspace.
 
-```python
-{"feasible": True, "raw": 0.91, "artifacts": {}}
-```
+The Human Proxy intentionally has the same information boundary as a remote human
+expert:
 
-`score` may be used instead of `raw`; higher is better. The evaluator module and optional context must live outside the run directory.
+| Participant | Receives | Does not receive |
+|---|---|---|
+| Co-side evidence agent | allowlisted run evidence and the durable public transcript | private Human Proxy evaluator context |
+| Human Proxy agent | private evaluator text, session purpose/state, and the durable public transcript | direct solution payloads, internal session context, Solver/evaluator workspace, GPU, evaluator callable, or a provisioned evaluator endpoint |
 
-The Proxy does **not** use a shortcut API. It implements the same blocking `HumanInteractionPort` as Feishu and reuses the same `HumanSessionStore` and `FeishuHumanSessionService` through an in-memory loopback transport. `HumanProxySessionPort` is only the conversation driver: a separate `HumanProxyAgent` chooses every next message from the live durable transcript, so deployments can supply an evaluator-backed model policy rather than a fixed script:
+Each Human Proxy turn runs in a fresh throw-away workspace containing only
+`evaluator_context.md` and `transcript.json`. The workspace is deleted after
+`turn.json` is read. The Proxy therefore cannot directly run the current
+solution against the real evaluator. Its job is instead to act like a thoughtful
+human expert: question assumptions, expose evaluator blind spots, and jointly
+design evaluators, probes, feedback, and runtime environments that give the Solver
+more truthful and actionable signals. Claims without run evidence must be labeled
+as reasoning or advice.
 
-1. Co's evidence agent opens the conversation.
-2. The Proxy evaluates the same bounded seed/probe/candidate set under hidden V*.
-3. It sends a natural-language expert message without V* source or raw per-case scores.
-4. Co's evidence agent answers and records the exchange.
-5. The Proxy may ask any number of follow-up questions, request closure, reject that closure, and continue talking without opening a new session.
-6. When the Proxy requests closure, Co summarizes and asks for confirmation.
-7. Only a later explicit `确认结束` closes the session and lets `AgentSystem` receive the frozen outcome.
+The Proxy implements the same blocking `HumanInteractionPort` as Feishu and
+reuses the same `HumanSessionStore` and `FeishuHumanSessionService` through an
+in-memory loopback transport:
 
-The same five-session budget, unlimited turns, transcript, deduplication, staged outcome, explicit closure confirmation, evaluator freeze, guidance persistence, and crash semantics apply. `--feishu-expert-id` and `--human-proxy-evaluator` are mutually exclusive.
+1. The Co-side evidence agent opens with what it knows from the current run.
+2. The Human Proxy reads the private evaluator context and the public transcript,
+   then asks or answers naturally.
+3. Both agents may continue for any number of messages. The Proxy may request
+   closure, reject an inaccurate close summary, and keep talking without opening a
+   new session.
+4. When the Proxy requests closure, the Co-side agent summarizes the conversation.
+5. Only a later explicit confirmation closes the session and exposes the Proxy's
+   reasoned structured outcome to `AgentSystem`.
 
-The Proxy driver has a 64-turn watchdog for each individual `consult` call. If a policy stalls, exceeds that allowance, or raises an error, the live session is paused and the error is surfaced. A later `consult` resumes the same session without spending another slot and receives a fresh watchdog allowance. This is a liveness guard, not a total session-message limit: one durable session may continue across any number of recoveries. Its sanitized frozen outcome is stored separately in `proxy_state.json`, so resume rebuilds the dialogue policy without executing V* again.
+The same five-session budget, unlimited turns, durable transcript, deduplication,
+staged outcome, explicit closure confirmation, guidance persistence, and crash
+semantics apply. `--feishu-expert-id` and `--human-proxy-context` are mutually
+exclusive.
 
-For verifier-change sessions, AgentSystem evaluates a bounded shared case set under current V and proposed V. The Proxy privately adds V* results and compares feasibility/ranking alignment. Only a strictly better, fully executable proposal receives `approve`; regression receives `reject`; insufficient or indistinguishable evidence receives `guide`. V* source, module path, context, artifacts, and raw per-case results are never copied into the run or Solver workspace.
+The driver has a 64-turn watchdog for each individual `consult` call. If a model
+turn fails or that allowance is reached, the live session is paused. A later
+`consult` resumes the same session without spending another slot and receives a
+fresh watchdog allowance. This is a liveness guard, not a total message limit.
+Once a final outcome is persisted in `proxy_state.json`, crash recovery reuses
+that exact outcome rather than accepting a different judgment from a restarted
+model turn.
 
 ## Persistence and crash recovery
 
@@ -137,7 +165,7 @@ runs/<run_id>/
       transcript.jsonl                # append-only human/agent/system turns
       pending_outcome.json            # close summary awaiting confirmation
       outcome.json                    # final confirmed structured outcome
-      proxy_state.json                # sanitized frozen V* outcome for Proxy resume
+      proxy_state.json                # final Proxy outcome frozen for safe resume
       outbox/*.json                    # generated replies awaiting Feishu delivery
       agent_workspace/
         context.json                  # bounded, redacted evidence copy
@@ -172,6 +200,6 @@ The offline suite covers:
 - durable outbox recovery;
 - task checkpoint ordering and resume behavior;
 - evaluator freeze, explicit approval, held guidance, and disabled-mode compatibility.
-- Human Proxy use of real V*, an independent transcript-driven multi-turn dialogue agent, close rejection/continuation, five-session budget, approve-only gated install, and V* non-leakage.
+- model-backed Human Proxy isolation from solution/evaluator execution, transcript-driven multi-turn dialogue, close rejection/continuation, crash recovery, five-session budget, and approve-only gated install.
 
 Before declaring a deployment ready, perform one real Feishu session on the target machine: open it, exchange several ordinary turns, ask for a run-evidence detail, request closure, reject closure once, continue talking, request closure again, explicitly confirm, then inspect `transcript.jsonl`, `outcome.json`, `index.json`, and `events.jsonl`.
