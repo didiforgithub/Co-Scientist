@@ -127,6 +127,8 @@ def test_codex_agent_prompt_contains_evidence_and_full_session_transcript(tmp_pa
     assert "你想先看哪个约束" in prompt
     assert "先看 dtype" in prompt
     assert "这两个 dtype 的容差一样吗" in prompt
+    assert "FP32 and BF16 are required" in prompt
+    assert "必须先读取并核对 `/work/context.json`" in prompt
     context = (captured["workdir"] / "context.json").read_text()
     assert "FP32 and BF16 are required" in context
 

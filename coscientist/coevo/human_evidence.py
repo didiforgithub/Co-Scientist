@@ -268,8 +268,9 @@ class CodexEvidenceAgent:
         response_path.unlink(missing_ok=True)
 
         builder = RunEvidenceBuilder(self.run_dir, self.raw_input_dir)
+        snapshot = builder.build()
         (workspace / "context.json").write_text(
-            builder.render(), encoding="utf-8"
+            builder.render(snapshot), encoding="utf-8"
         )
         transcript_payload = [asdict(item) for item in transcript]
         (workspace / "transcript.json").write_text(
@@ -288,6 +289,7 @@ class CodexEvidenceAgent:
             transcript=transcript,
             human_message=human_message,
             agent_instruction=agent_instruction,
+            evidence_brief=self._evidence_brief(snapshot),
         )
         result = self._run(workspace, prompt)
         if not result.ok:
@@ -338,6 +340,7 @@ class CodexEvidenceAgent:
         transcript: Sequence[SessionMessage],
         human_message: str,
         agent_instruction: str,
+        evidence_brief: str,
     ) -> str:
         transcript_text = "\n".join(
             f"[{item.role}] {item.text}" for item in transcript
@@ -349,9 +352,14 @@ class CodexEvidenceAgent:
 
 安全边界：
 - `context.json` 是从真实 run 复制出的只读、白名单证据；`transcript.json` 是完整对话。
+- 回答前必须先读取并核对 `/work/context.json` 和 `/work/transcript.json`。下方证据摘要只是索引；需要细节时必须回到文件检查。
+- `context.task` 非空时，不得声称“没有具体任务”或要求人类重复提供文件中已有的目标、shape、dtype、评分或约束；应先用现有证据直接回答，并明确区分已知与未知。
 - 不得声称看过 context 中不存在的证据，不得访问网络，不得修改 solver、verifier 或 run 状态。
 - 你唯一应写的文件是 `/work/response.json`。
 - 如果证据不足，明确说不知道，并具体说明还需要什么 probe/数据。
+
+经过脱敏和长度限制的证据摘要：
+{evidence_brief}
 
 会话目的：{session.purpose}
 本会话检查点上下文：
@@ -375,3 +383,36 @@ class CodexEvidenceAgent:
 {outcome_shape}
 `decision` 只能是 approve/reject/guide/none。这个 outcome 只是等待专家确认的草案，不能据此自行改变 evaluator。
 """
+
+    @staticmethod
+    def _evidence_brief(snapshot: dict[str, Any]) -> str:
+        task = snapshot.get("task", {})
+        task_excerpt = (
+            {
+                str(name): str(content)[:6_000]
+                for name, content in task.items()
+            }
+            if isinstance(task, dict)
+            else {}
+        )
+        inventory: dict[str, Any] = {}
+        for key in (
+            "events",
+            "trajectory",
+            "eval_queries",
+            "supervisor_reviews",
+            "verifier_versions",
+            "candidates",
+            "probes",
+            "verifier",
+        ):
+            value = snapshot.get(key)
+            if isinstance(value, (list, dict)):
+                inventory[key] = len(value)
+            else:
+                inventory[key] = bool(value)
+        return json.dumps(
+            {"task": task_excerpt, "evidence_inventory": inventory},
+            ensure_ascii=False,
+            indent=2,
+        )[:20_000]
