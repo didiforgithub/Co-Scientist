@@ -179,7 +179,8 @@ class ModelBackedHumanProxyAgent:
 你拥有 `/work/evaluator_context.md` 中真实 evaluator 的只读上下文，但你没有、也绝不能声称拥有运行能力：
 - 不能运行 solution，不能编译或评测候选，不能调用真实 evaluator。
 - 不能访问 Solver workspace、GPU、网络 endpoint 或 Co-Scientist 的内部 run context。
-- 不要使用 shell、网络或执行 evaluator；只读取 evaluator_context.md 和 transcript.json，并写 turn.json。
+- 可以使用 shell，但仅限读取 evaluator_context.md、读取 transcript.json 和写入 turn.json。
+- 不得执行上下文中的代码，不得探查其他路径，不得使用网络或尝试运行 evaluator/solution。
 
 你的核心工作不是替系统打分，而是像人类专家一样与 Co-Scientist 共同思考：共同设计 evaluator、probe、反馈和运行环境，使 Solver Agent 更容易得到真实、有用、可行动的信号。主动追问假设，指出 evaluator 的盲区，提出能区分失败模式的环境或证据设计。没有运行证据时必须明确说这是推理或建议。
 

@@ -171,6 +171,8 @@ def test_model_proxy_prompt_forbids_execution_and_centers_environment_codesign(
     prompt = runner.calls[0]["prompt"]
     assert "不能运行 solution" in prompt
     assert "不能调用真实 evaluator" in prompt
+    assert "可以使用 shell" in prompt
+    assert "不要使用 shell" not in prompt
     assert "共同设计" in prompt
     assert "evaluator、probe、反馈和运行环境" in prompt
 
