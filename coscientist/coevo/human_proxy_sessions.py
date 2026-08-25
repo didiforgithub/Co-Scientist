@@ -20,6 +20,8 @@ from typing import Any, Protocol
 from .feishu_human import FeishuHumanSessionService
 from .feishu_transport import FeishuMessageEvent
 from .human_sessions import (
+    HumanSession,
+    SessionMessage,
     SessionBudgetExhausted,
     SessionOutcome,
     SessionState,
@@ -111,12 +113,82 @@ class ProxyAssessment:
     outcome: SessionOutcome
 
 
+@dataclass(frozen=True)
+class HumanProxyTurn:
+    """One natural-language turn chosen by the expert-side dialogue agent."""
+
+    text: str
+
+
+class HumanProxyTurnPolicy(Protocol):
+    def __call__(
+        self, *, session: HumanSession, transcript: list[SessionMessage]
+    ) -> HumanProxyTurn: ...
+
+
+@dataclass(frozen=True)
+class HumanProxyConversation:
+    """A frozen V* judgement plus a live policy for choosing subsequent turns."""
+
+    outcome: SessionOutcome
+    next_turn: HumanProxyTurnPolicy
+
+
+class HumanProxyAgent(Protocol):
+    """Independent expert agent driven only through the public chat contract."""
+
+    def start_conversation(
+        self, *, purpose: str, context: dict[str, Any]
+    ) -> HumanProxyConversation: ...
+
+
 @dataclass
 class EvaluatorBackedHumanProxyAgent:
     """Expert-side agent that judges V changes against hidden V* evaluations."""
 
     reference_evaluator: ReferenceEvaluator
     assessments: int = 0
+
+    def start_conversation(
+        self, *, purpose: str, context: dict[str, Any]
+    ) -> HumanProxyConversation:
+        """Freeze one hidden evaluation, then converse from its safe assessment.
+
+        The returned policy reacts to the durable transcript rather than prescribing
+        messages in the transport port.  A deployment may replace this agent with a
+        model-backed implementation of :class:`HumanProxyAgent` without changing the
+        Human Session service or its lifecycle rules.
+        """
+        assessment = self.assess(purpose=purpose, context=context)
+
+        def next_turn(
+            *, session: HumanSession, transcript: list[SessionMessage]
+        ) -> HumanProxyTurn:
+            human_turns = [item for item in transcript if item.role == "human"]
+            agent_turns = [item for item in transcript if item.role == "agent"]
+            if session.state is SessionState.CLOSE_REQUESTED:
+                return HumanProxyTurn("确认结束")
+            if not human_turns:
+                return HumanProxyTurn(assessment.message)
+            if len(human_turns) == 1:
+                last_reply = agent_turns[-1].text if agent_turns else ""
+                focus = (
+                    assessment.outcome.unresolved_questions[0]
+                    if assessment.outcome.unresolved_questions
+                    else "尚未覆盖的边界条件"
+                )
+                if focus in last_reply:
+                    focus = "这个判断在对抗样例上的依据"
+                return HumanProxyTurn(f"请继续说明：{focus}。")
+            return HumanProxyTurn(
+                f"我的最终判断是 {assessment.outcome.decision}，依据已经说明。"
+                "现在这轮可以结束了。"
+            )
+
+        return HumanProxyConversation(
+            outcome=assessment.outcome,
+            next_turn=next_turn,
+        )
 
     def assess(self, *, purpose: str, context: dict[str, Any]) -> ProxyAssessment:
         self.assessments += 1
@@ -324,7 +396,7 @@ class HumanProxySessionPort:
     """Blocking ``HumanInteractionPort`` implemented by a V*-holding expert agent."""
 
     service: FeishuHumanSessionService
-    proxy_agent: EvaluatorBackedHumanProxyAgent
+    proxy_agent: HumanProxyAgent
     expert_id: str = "human_proxy_vstar"
 
     def consult(self, *, purpose: str, context: dict) -> SessionOutcome | None:
@@ -336,32 +408,28 @@ class HumanProxySessionPort:
             )
         except SessionBudgetExhausted:
             return None
-        assessment = self.proxy_agent.assess(
+        conversation = self.proxy_agent.start_conversation(
             purpose=session.purpose,
             context=session.context,
         )
-        session = self.service.store.get(session.session_id)
-        if session.state is not SessionState.CLOSE_REQUESTED:
-            self.service.handle_event(
-                self._event(session.session_id, assessment.message, "assessment")
+        while True:
+            session = self.service.store.get(session.session_id)
+            if session.state is SessionState.CLOSED:
+                break
+            turn = conversation.next_turn(
+                session=session,
+                transcript=self.service.store.transcript(session.session_id),
             )
-            self.service.handle_event(
-                self._event(
-                    session.session_id,
-                    (
-                        f"我的最终判断是 {assessment.outcome.decision}，依据已经说明。"
-                        "现在这轮可以结束了。"
-                    ),
-                    "close_request",
+            if not turn.text.strip():
+                raise RuntimeError("Human Proxy agent returned an empty turn")
+            if session.state is SessionState.CLOSE_REQUESTED:
+                # V* is frozen before the first turn.  Only expose its sanitized
+                # structured outcome at the ordinary explicit-confirmation seam.
+                self.service.store.stage_outcome(
+                    session.session_id, conversation.outcome
                 )
-            )
-        session = self.service.store.get(session.session_id)
-        if session.state is SessionState.CLOSE_REQUESTED:
-            # The expert's V*-grounded decision is authoritative; the Co-side agent's
-            # summary remains in the transcript but cannot dilute or invent it.
-            self.service.store.stage_outcome(session.session_id, assessment.outcome)
             self.service.handle_event(
-                self._event(session.session_id, "确认结束", "close_confirm")
+                self._event(session.session_id, turn.text, "dialogue")
             )
         return self.service.store.outcome(session.session_id)
 

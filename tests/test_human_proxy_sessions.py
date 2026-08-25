@@ -8,6 +8,8 @@ from coscientist.coevo.feishu_human import FeishuHumanSessionService
 from coscientist.coevo.human_evidence import EvidenceReply
 from coscientist.coevo.human_proxy_sessions import (
     EvaluatorBackedHumanProxyAgent,
+    HumanProxyConversation,
+    HumanProxyTurn,
     HumanProxySessionPort,
     LoopbackTransport,
     PythonReferenceEvaluator,
@@ -31,6 +33,54 @@ class FakeCoSessionAgent:
                 proposed_outcome=SessionOutcome(decision="none"),
             )
         return EvidenceReply(text="我收到了你的 V* 对照结论，并记录了依据。")
+
+
+class IndependentConversationAgent:
+    """A distinct evaluator-backed agent that reacts to the live transcript."""
+
+    def __init__(self, reference_evaluator, store):
+        self.evaluator_agent = EvaluatorBackedHumanProxyAgent(reference_evaluator)
+        self.store = store
+        self.assessment = None
+        self.observed_agent_replies = []
+
+    def start_conversation(self, *, purpose, context):
+        self.assessment = self.evaluator_agent.assess(
+            purpose=purpose, context=context
+        )
+        return HumanProxyConversation(
+            outcome=self.assessment.outcome,
+            next_turn=self.next_turn,
+        )
+
+    def next_turn(self, *, session, transcript):
+        assert self.assessment is not None
+        agent_replies = [item.text for item in transcript if item.role == "agent"]
+        self.observed_agent_replies = agent_replies
+        human_messages = [item.text for item in transcript if item.role == "human"]
+
+        if not human_messages:
+            return HumanProxyTurn(self.assessment.message)
+        if len(human_messages) == 1:
+            assert "V* 对照结论" in agent_replies[-1]
+            return HumanProxyTurn("请再解释这个结论覆盖了哪些边界情况？")
+        if len(human_messages) == 2:
+            return HumanProxyTurn("信息基本充分，我请求结束这轮。")
+        if len(human_messages) == 3:
+            assert session.state is SessionState.CLOSE_REQUESTED
+            return HumanProxyTurn("先别结束，我还要确认继续聊天不会消耗第二次机会。")
+        if len(human_messages) == 4:
+            assert session.state is SessionState.ACTIVE
+            assert self.store.opened_count == 1
+            assert self.store.outcome(session.session_id) is None
+            assert self.store.staged_outcome(session.session_id) is None
+            return HumanProxyTurn("现在还剩几次会话机会？")
+        if len(human_messages) == 5:
+            return HumanProxyTurn("这轮可以结束了。")
+        if len(human_messages) == 6:
+            assert session.state is SessionState.CLOSE_REQUESTED
+            return HumanProxyTurn("确认结束")
+        raise AssertionError("conversation driver asked for a turn after explicit close")
 
 
 def _reference_module(tmp_path: Path) -> Path:
@@ -108,11 +158,40 @@ def test_proxy_uses_real_evaluator_and_full_human_session_contract(tmp_path):
         "agent",
         "human",
         "agent",
+        "human",
+        "agent",
     ]
-    assert "这轮可以结束" in transcript[3].text
-    assert transcript[5].text == "确认结束"
+    assert "请继续说明" in transcript[3].text
+    assert "这轮可以结束" in transcript[5].text
+    assert transcript[7].text == "确认结束"
     assert "第 1/5 次" in transcript[0].text
-    assert len(transport.sent) == 4
+    assert len(transport.sent) == 5
+
+
+def test_proxy_port_runs_an_independent_multi_turn_agent_through_same_contract(
+    tmp_path,
+):
+    port, store, transport, reference = _proxy_port(tmp_path)
+    dialogue_agent = IndependentConversationAgent(reference, store)
+    port.proxy_agent = dialogue_agent
+
+    outcome = port.consult(purpose="verifier_change", context=_improving_context())
+
+    session = store.sessions()[0]
+    transcript = store.transcript(session.session_id)
+    assert outcome == dialogue_agent.assessment.outcome
+    assert session.state is SessionState.CLOSED
+    assert store.opened_count == 1
+    assert store.remaining_count == 4
+    assert reference.calls == 2
+    assert [item.role for item in transcript] == [
+        "agent", "human", "agent", "human", "agent", "human", "agent",
+        "human", "agent", "human", "agent", "human", "agent", "human", "agent",
+    ]
+    assert "先别结束" in transcript[7].text
+    assert "还剩几次" in transcript[9].text
+    assert len(dialogue_agent.observed_agent_replies) >= 7
+    assert len(transport.sent) == 8
 
 
 def test_proxy_rejects_a_proposal_that_moves_away_from_real_evaluator(tmp_path):

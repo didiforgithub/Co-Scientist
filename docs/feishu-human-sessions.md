@@ -79,7 +79,7 @@ The task-definition checkpoint runs before bootstrap so its guidance is availabl
 
 - final decision `approve`: install the validated proposal after the session closes;
 - `reject`, `guide`, or `none`: hold the proposal and preserve the human guidance for the next Supervisor/Solver turn;
-- five-session budget exhausted: do not initiate a sixth conversation; retain the original autonomous Co-Scientist behavior.
+- five-session budget exhausted: do not initiate a sixth conversation and hold any evaluator change that lacks an explicit approval.
 
 Disabling `--feishu-expert-id` preserves the existing autonomous behavior exactly.
 
@@ -106,15 +106,15 @@ The Python module is trusted control-plane code. Its callable accepts either `pa
 
 `score` may be used instead of `raw`; higher is better. The evaluator module and optional context must live outside the run directory.
 
-The Proxy does **not** use a shortcut API. It implements the same blocking `HumanInteractionPort` as Feishu and reuses the same `HumanSessionStore` and `FeishuHumanSessionService` through an in-memory loopback transport:
+The Proxy does **not** use a shortcut API. It implements the same blocking `HumanInteractionPort` as Feishu and reuses the same `HumanSessionStore` and `FeishuHumanSessionService` through an in-memory loopback transport. `HumanProxySessionPort` is only the conversation driver: a separate `HumanProxyAgent` chooses every next message from the live durable transcript, so deployments can supply an evaluator-backed model policy rather than a fixed script:
 
 1. Co's evidence agent opens the conversation.
 2. The Proxy evaluates the same bounded seed/probe/candidate set under hidden V*.
 3. It sends a natural-language expert message without V* source or raw per-case scores.
 4. Co's evidence agent answers and records the exchange.
-5. The Proxy states its final decision and naturally requests closure.
-6. Co summarizes and asks for confirmation.
-7. The Proxy sends the separate `确认结束`; only then does `AgentSystem` receive the outcome.
+5. The Proxy may ask any number of follow-up questions, request closure, reject that closure, and continue talking without opening a new session.
+6. When the Proxy requests closure, Co summarizes and asks for confirmation.
+7. Only a later explicit `确认结束` closes the session and lets `AgentSystem` receive the frozen outcome.
 
 The same five-session budget, unlimited turns, transcript, deduplication, staged outcome, explicit closure confirmation, evaluator freeze, guidance persistence, and crash semantics apply. `--feishu-expert-id` and `--human-proxy-evaluator` are mutually exclusive.
 
@@ -169,6 +169,6 @@ The offline suite covers:
 - durable outbox recovery;
 - task checkpoint ordering and resume behavior;
 - evaluator freeze, explicit approval, held guidance, and disabled-mode compatibility.
-- Human Proxy use of real V*, full seven-message session/close contract, five-session budget, end-to-end gated install, and V* non-leakage.
+- Human Proxy use of real V*, an independent transcript-driven multi-turn dialogue agent, close rejection/continuation, five-session budget, approve-only gated install, and V* non-leakage.
 
 Before declaring a deployment ready, perform one real Feishu session on the target machine: open it, exchange several ordinary turns, ask for a run-evidence detail, request closure, reject closure once, continue talking, request closure again, explicitly confirm, then inspect `transcript.jsonl`, `outcome.json`, `index.json`, and `events.jsonl`.

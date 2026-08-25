@@ -183,6 +183,17 @@ def test_explicit_human_approval_installs_change_only_after_consult_returns(tmp_
     assert system.hardenings == 1
 
 
+def test_configured_human_mode_holds_change_when_no_approval_is_available(tmp_path):
+    system = _system_with_live_v0(tmp_path, human_port=FakeHumanPort([None]))
+
+    system._apply_harden(
+        _proposal(tmp_path), trigger="budget_exhausted", verdict={"gaming": True}
+    )
+
+    assert system.eval_service.current_version() == 0
+    assert system.hardenings == 0
+
+
 def test_disabled_human_mode_preserves_autonomous_install_behavior(tmp_path):
     system = _system_with_live_v0(tmp_path, human_port=None)
 

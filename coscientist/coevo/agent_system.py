@@ -1237,8 +1237,8 @@ class AgentSystem:
         # freezes the evaluator at its current version while the expert inspects the
         # exact source/diff and talks to the evidence agent.  Only an explicit final
         # `approve` installs this proposal; guidance/rejection is persisted for the
-        # next Supervisor attempt.  If the five-session budget is exhausted, consult
-        # returns None and the original autonomous semantics continue.
+        # next Supervisor attempt.  Once a Human/Proxy port is configured, an absent
+        # response (including an exhausted five-session budget) is not approval.
         if self.human_port is not None:
             current_source = svc.current_source()
             proposal_diff = "".join(
@@ -1270,10 +1270,13 @@ class AgentSystem:
                     ),
                 },
             )
-            if human_outcome is not None and human_outcome.decision.lower() != "approve":
+            if human_outcome is None or human_outcome.decision.lower() != "approve":
+                human_decision = (
+                    human_outcome.decision if human_outcome is not None else "unavailable"
+                )
                 self.store.event(
                     "harden_held_for_human",
-                    decision=human_outcome.decision,
+                    decision=human_decision,
                     trigger=trigger,
                 )
                 self.store.review(
@@ -1281,7 +1284,7 @@ class AgentSystem:
                     gaming=bool(verdict.get("gaming")),
                     installed=False,
                     mode=self._mode,
-                    human_decision=human_outcome.decision,
+                    human_decision=human_decision,
                     reasoning=str(verdict.get("reasoning", ""))[:400],
                 )
                 return
