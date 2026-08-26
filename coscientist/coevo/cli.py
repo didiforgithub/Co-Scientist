@@ -237,6 +237,9 @@ def run_agent_system(args) -> None:
         )
     if getattr(args, "human_proxy_context", None):
         opt["human_proxy_context_path"] = Path(args.human_proxy_context)
+        opt["human_proxy_context_sha256"] = getattr(
+            args, "human_proxy_context_sha256", None
+        )
         opt["human_agent_timeout_s"] = getattr(
             args, "human_agent_timeout_s", 180.0
         )
@@ -394,6 +397,9 @@ def main() -> None:
                             help="enable a separate model Human Proxy with this private, "
                                  "read-only evaluator context file; the file is treated "
                                  "only as text and never imported or executed")
+    ap.add_argument("--human-proxy-context-sha256", default=None,
+                    help="expected SHA-256 for --human-proxy-context; the exact bytes "
+                         "are hashed and decoded from one read before Proxy creation")
     ap.add_argument("--lark-cli-executable", default="lark-cli",
                     help="lark-cli executable used for bot send/reply and the "
                          "im.message.receive_v1 long connection")

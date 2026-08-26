@@ -49,6 +49,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -56,6 +57,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,6 +75,7 @@ from typing import Optional
 MIN_RUNTIME_FOR_RESPAWN_S = 45.0   # died faster than this since last launch => systematic
 MAX_RESPAWNS = 100                 # backstop against a crash-loop (SForge uses 100)
 MIN_REMAINING_TO_RESPAWN_S = 90.0  # don't relaunch for a sliver of budget
+BATCH_SCHEMA_VERSION = 2
 
 
 
@@ -80,6 +83,91 @@ def _slug(text: str) -> str:
     """A filesystem/run-id-safe slug from an input path's basename."""
     s = re.sub(r"[^a-zA-Z0-9_-]+", "_", Path(text).name).strip("_").lower()
     return s or "problem"
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _inside(path: Path, parent: Path) -> bool:
+    """Whether resolved ``path`` is ``parent`` or one of its descendants."""
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _symlink_component(path: Path) -> Optional[Path]:
+    """Return the first symlink in an absolute path, including its final component."""
+    absolute = Path(path).absolute()
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current = current / part
+        if current.is_symlink():
+            return current
+    return None
+
+
+# ``extra_args`` is intentionally narrow: allowing arbitrary child-parser options lets
+# argparse abbreviations (``--bud``) or a later duplicate silently override the audited
+# launcher contract. These are the exact non-contract tuning flags a caller may still
+# append. Everything else must become a first-class launcher option before use.
+_ALLOWED_EXTRA_ARG_FLAGS = {
+    "--bootstrap-timeout-s", "--harden-timeout-s", "--post-harden-solve-s",
+    "--concurrency", "--max-generations", "--gen-turn-s", "--llm-config",
+    "--solver-image", "--solver-gpus", "--resource-config", "--solver-cpus",
+    "--solver-memory-mb", "--solver-allow-internet", "--verifier-image",
+    "--verifier-gpus", "--verifier-cpus", "--verifier-memory-mb",
+    "--verifier-timeout-s", "--verifier-allow-internet",
+}
+
+_PROTECTED_CHILD_FLAGS = {
+    "--input", "--solver", "--supervisor", "--budget-s", "--budget-hours",
+    "--max-turns", "--resume", "--runs-dir", "--run-id", "--freeze-verifier",
+    "--feedback", "--solver-strength", "--human-proxy-context",
+    "--human-proxy-context-sha256",
+    "--human-agent-timeout-s", "--human-agent-model",
+    "--human-agent-reasoning-effort",
+}
+
+
+def _validate_extra_args(args: list[str]) -> None:
+    seen: set[str] = set()
+    for token in args:
+        if not token.startswith("--"):
+            continue
+        key = token.split("=", 1)[0]
+        if key in seen:
+            raise ValueError(f"duplicate option in extra args: {key}")
+        seen.add(key)
+        if any(flag.startswith(key) for flag in _PROTECTED_CHILD_FLAGS):
+            raise ValueError(
+                f"extra args may not override/abbreviate protected first-class flag: "
+                f"{key}")
+        if key not in _ALLOWED_EXTRA_ARG_FLAGS:
+            raise ValueError(
+                f"extra args option must use an exact allowlisted flag (no argparse "
+                f"abbreviation): {key}")
+
+
+def _resolve_solver_identity() -> dict[str, str]:
+    """Resolve the identity the Solver container will actually inherit from Codex.
+
+    Launcher Solver flags are an assertion over this host-derived gateway, not merely
+    labels written to the manifest: the child CLI builds the same ``GatewayConfig``
+    from the same host at startup.
+    """
+    from .container import GatewayConfig
+
+    gateway = GatewayConfig.from_host()
+    if gateway is None:
+        raise ValueError("cannot resolve Solver identity: ~/.codex/auth.json is absent")
+    return {"model": gateway.model, "reasoning_effort": gateway.reasoning_effort}
 
 
 # a run holds its card while running OR while transiently held (a systematic-death run
@@ -115,6 +203,20 @@ class LaunchSpec:
     # each concurrent run on a distinct physical GPU purely through argv.
     resource_config: Optional[Path] = None
     gpu_device: Optional[str] = None
+    # A context is private evaluator evidence for this task's independent Human Proxy.
+    # Store both the absolute path and content identity so no queued/resumed child can
+    # silently see different evaluator bytes.
+    human_proxy_context: Optional[Path] = None
+    human_proxy_context_sha256: Optional[str] = None
+    human_proxy_context_dir: Optional[Path] = None
+    batch_input_dirs: tuple[Path, ...] = ()
+    human_agent_timeout_s: Optional[float] = None
+    human_agent_model: Optional[str] = None
+    human_agent_reasoning_effort: Optional[str] = None
+    solver_model: Optional[str] = None
+    solver_reasoning_effort: Optional[str] = None
+    feedback: str = "with_artifacts"
+    solver_strength: str = "weak"
 
 
 class Batch:
@@ -131,6 +233,14 @@ class Batch:
               gpu_devices: Optional[list[str]] = None,
               cpu_slots: Optional[int] = None,
               extra_args: Optional[list[str]] = None,
+              human_proxy_context_dir: Optional[Path] = None,
+              human_agent_timeout_s: Optional[float] = None,
+              human_agent_model: Optional[str] = None,
+              human_agent_reasoning_effort: Optional[str] = None,
+              solver_model: Optional[str] = None,
+              solver_reasoning_effort: Optional[str] = None,
+              feedback: str = "with_artifacts",
+              solver_strength: str = "weak",
               dry_run: bool = False) -> list[LaunchSpec]:
         """Launch the FIRST WAVE and record the rest as pending (wave scheduling).
 
@@ -161,25 +271,80 @@ class Batch:
             pool = [f"slot{i}" for i in range(int(cpu_slots))]
         else:
             pool = list(gpu_devices) if gpu_devices else [str(i) for i in range(8)]
-        self.batch_dir.mkdir(parents=True, exist_ok=True)
         budget_s = hours * 3600.0
+        child_extra_args = list(extra_args or [])
+        _validate_extra_args(child_extra_args)
+        if feedback not in {"score_only", "feasible_score", "with_artifacts"}:
+            raise ValueError(f"unsupported feedback level: {feedback}")
+        if solver_strength not in {"weak", "strong"}:
+            raise ValueError(f"unsupported solver strength: {solver_strength}")
 
-        # -- idempotent resume: an existing manifest means "continue", not "re-plan" --
-        if not dry_run and self.manifest_path.is_file():
-            self._wave_tick()
-            man = self._read_manifest()
-            return [self._spec_of(r) for r in man.get("runs", [])]
+        if (solver_model is None) != (solver_reasoning_effort is None):
+            raise ValueError("Solver identity requires both model and reasoning effort")
+        solver_identity = None
+        if solver_model is not None:
+            resolved_solver = _resolve_solver_identity()
+            requested_solver = {
+                "model": str(solver_model),
+                "reasoning_effort": str(solver_reasoning_effort),
+            }
+            if resolved_solver != requested_solver:
+                raise ValueError(
+                    "Solver identity contract mismatch: requested "
+                    f"{requested_solver}, host resolves {resolved_solver}")
+            solver_identity = resolved_solver
+
+        resolved_inputs = [Path(inp).resolve() for inp in inputs]
+        context_root, contexts = self._resolve_human_proxy_contexts(
+            resolved_inputs, human_proxy_context_dir)
+        human_agent = {
+            "timeout_s": human_agent_timeout_s,
+            "model": human_agent_model,
+            "reasoning_effort": human_agent_reasoning_effort,
+        }
 
         # unique, stable run_ids: <batch>__<slug>[ _2, _3 ... on collision].
         seen: dict[str, int] = {}
         specs: list[LaunchSpec] = []
-        for inp in inputs:
+        for inp, context in zip(resolved_inputs, contexts):
             base = f"{self.batch}__{_slug(str(inp))}"
             n = seen.get(base, 0)
             seen[base] = n + 1
             run_id = base if n == 0 else f"{base}_{n+1}"
-            specs.append(LaunchSpec(run_id=run_id, input_dir=Path(inp).resolve(),
-                                    log_path=self.batch_dir / f"{run_id}.log"))
+            specs.append(LaunchSpec(
+                run_id=run_id, input_dir=inp,
+                log_path=self.batch_dir / f"{run_id}.log",
+                human_proxy_context=context[0] if context else None,
+                human_proxy_context_sha256=context[1] if context else None,
+                human_proxy_context_dir=context_root,
+                batch_input_dirs=tuple(resolved_inputs),
+                human_agent_timeout_s=human_agent_timeout_s,
+                human_agent_model=human_agent_model,
+                human_agent_reasoning_effort=human_agent_reasoning_effort,
+                solver_model=(solver_identity or {}).get("model"),
+                solver_reasoning_effort=(solver_identity or {}).get(
+                    "reasoning_effort"),
+                feedback=feedback,
+                solver_strength=solver_strength))
+
+        # -- idempotent resume: continue only an EXACT persisted launch contract. --
+        if not dry_run and self.manifest_path.is_file():
+            man = self._read_manifest()
+            self._validate_resume_contract(
+                man, specs=specs, hours=hours, python=python, pool=pool,
+                cpu_mode=cpu_mode, extra_args=child_extra_args,
+                human_agent=human_agent, solver_identity=solver_identity,
+                context_root=context_root, inputs=resolved_inputs,
+                feedback=feedback, solver_strength=solver_strength)
+            # Verify current bytes even if every child is still live: this makes an
+            # idempotent start a useful fail-closed contract check of the whole batch.
+            for spec in specs:
+                self._verify_human_proxy_context(spec)
+            self._wave_tick()
+            man = self._read_manifest()
+            return [self._spec_of(r) for r in man.get("runs", [])]
+
+        self.batch_dir.mkdir(parents=True, exist_ok=True)
 
         # the first wave gets a distinct card each; the rest queue as pending.
         wave = min(len(pool), len(specs))
@@ -193,59 +358,191 @@ class Batch:
             print(f"[dry-run] first wave: {wave} run(s); pending: {len(specs) - wave}")
             for spec in specs[:wave]:
                 argv = self._build_argv(spec, budget_s=budget_s, python=python,
-                                        extra_args=extra_args or [], cpu_mode=cpu_mode)
+                                        extra_args=child_extra_args,
+                                        cpu_mode=cpu_mode)
                 slot = spec.gpu_device
                 tag = f"slot={slot}" if cpu_mode else f"dev={slot}"
                 print(f"  RUNNING {tag}  {spec.run_id}\n"
                       f"    {' '.join(argv)}")
             for spec in specs[wave:]:
                 print(f"  PENDING          {spec.run_id}  <- {spec.input_dir}")
+            for spec in specs:
+                context = (str(spec.human_proxy_context)
+                           if spec.human_proxy_context else "-")
+                digest = spec.human_proxy_context_sha256 or "-"
+                print(f"    CONTRACT {spec.run_id} context={context} sha256={digest}")
             return specs
 
-        records = []
-        for i, spec in enumerate(specs):
-            if i < wave:
-                pid = self._spawn(spec, budget_s=budget_s, python=python,
-                                  extra_args=extra_args or [], cpu_mode=cpu_mode)
-                now = time.time()
-                records.append({"run_id": spec.run_id,
-                                "input_dir": str(spec.input_dir),
-                                "log": str(spec.log_path), "pid": pid,
-                                "status": "running",
-                                "budget_s": budget_s,
-                                # absolute wall-clock expiry: the TOTAL budget is anchored
-                                # once, so respawns after a crash charge only the
-                                # REMAINING time (a fresh child Deadline would reset it).
-                                "deadline_epoch": now + budget_s,
-                                "last_launch_epoch": now,
-                                "respawns": 0,
-                                "resource_config":
-                                    str(spec.resource_config)
-                                    if spec.resource_config else None,
-                                "gpu_device": spec.gpu_device})
-            else:
-                # pending: no pid, no card, budget NOT yet charged (deadline anchored at
-                # first launch inside _wave_tick so queue-wait doesn't eat the 4h).
-                records.append({"run_id": spec.run_id,
-                                "input_dir": str(spec.input_dir),
-                                "log": str(spec.log_path), "pid": None,
-                                "status": "pending",
-                                "budget_s": budget_s,
-                                "deadline_epoch": None,
-                                "last_launch_epoch": None,
-                                "respawns": 0,
-                                "resource_config":
-                                    str(spec.resource_config)
-                                    if spec.resource_config else None,
-                                "gpu_device": None})
-        self._write_manifest({"batch": self.batch, "hours": hours,
-                              "runs_dir": str(self.runs_dir.resolve()),
-                              "python": python,
-                              "gpu_devices": pool,
-                              "cpu_mode": cpu_mode,
-                              "extra_args": list(extra_args or []),
-                              "runs": records})
+        # Persist the complete contract BEFORE the first child exists. Every _spawn,
+        # including the first wave, can therefore compare its run-level settings to
+        # batch.json. Runs remain pending until Popen succeeds, so a failed launch is
+        # recoverable by the watcher instead of becoming an untracked contract-less job.
+        records = [{"run_id": spec.run_id,
+                    "input_dir": str(spec.input_dir),
+                    "log": str(spec.log_path), "pid": None,
+                    "status": "pending",
+                    "budget_s": budget_s,
+                    "deadline_epoch": None,
+                    "last_launch_epoch": None,
+                    "respawns": 0,
+                    "resource_config": (str(spec.resource_config)
+                                        if spec.resource_config else None),
+                    "gpu_device": None,
+                    **self._human_proxy_record(spec)}
+                   for spec in specs]
+        manifest = {"schema_version": BATCH_SCHEMA_VERSION,
+                    "batch": self.batch, "hours": hours,
+                    "runs_dir": str(self.runs_dir.resolve()),
+                    "python": python,
+                    "gpu_devices": pool,
+                    "cpu_mode": cpu_mode,
+                    "extra_args": child_extra_args,
+                    "human_agent": human_agent,
+                    "solver": solver_identity,
+                    "human_proxy_context_dir": (
+                        str(context_root) if context_root else None),
+                    "inputs": [str(p) for p in resolved_inputs],
+                    "feedback": feedback,
+                    "solver_strength": solver_strength,
+                    "run_contracts": {
+                        spec.run_id: {
+                            "input_dir": str(spec.input_dir),
+                            "human_proxy_context": (
+                                str(spec.human_proxy_context)
+                                if spec.human_proxy_context else None),
+                            "human_proxy_context_sha256": (
+                                spec.human_proxy_context_sha256),
+                        }
+                        for spec in specs
+                    },
+                    "runs": records}
+        self._write_manifest(manifest)
+        for i, spec in enumerate(specs[:wave]):
+            pid = self._spawn(spec, budget_s=budget_s, python=python,
+                              extra_args=child_extra_args, cpu_mode=cpu_mode)
+            now = time.time()
+            records[i].update({
+                "pid": pid,
+                "status": "running",
+                # The TOTAL budget is anchored once; respawns receive only remaining.
+                "deadline_epoch": now + budget_s,
+                "last_launch_epoch": now,
+                "gpu_device": spec.gpu_device,
+            })
+            self._write_manifest(manifest)
         return specs
+
+    def _resolve_human_proxy_contexts(
+            self, inputs: list[Path], context_dir: Optional[Path]
+    ) -> tuple[Optional[Path], list[Optional[tuple[Path, str]]]]:
+        if context_dir is None:
+            return None, [None for _ in inputs]
+
+        raw_dir = Path(context_dir).absolute()
+        linked = _symlink_component(raw_dir)
+        if linked is not None:
+            raise ValueError(
+                f"Human Proxy context path must have no symlink ancestor: {linked}")
+        if not raw_dir.is_dir():
+            raise ValueError(f"Human Proxy context directory does not exist: {raw_dir}")
+        resolved_dir = raw_dir.resolve()
+        runs_root = self.runs_dir.resolve()
+        if _inside(resolved_dir, runs_root):
+            raise ValueError(
+                f"Human Proxy context directory must be outside runs/: {resolved_dir}")
+        for inp in inputs:
+            if _inside(resolved_dir, inp):
+                raise ValueError(
+                    "Human Proxy context directory must be outside every input: "
+                    f"{resolved_dir} is within {inp}")
+
+        resolved: list[Optional[tuple[Path, str]]] = []
+        for inp in inputs:
+            raw_context = raw_dir / f"{inp.name}.md"
+            linked = _symlink_component(raw_context)
+            if linked is not None:
+                raise ValueError(
+                    f"Human Proxy context path must have no symlink ancestor: {linked}")
+            if not raw_context.is_file():
+                raise ValueError(
+                    f"Human Proxy context for {inp.name} is missing or not a regular "
+                    f"file: {raw_context}")
+            context = raw_context.resolve()
+            # A race or unusual mount must not resolve the selected file elsewhere.
+            if not _inside(context, resolved_dir):
+                raise ValueError(
+                    f"Human Proxy context resolved outside its directory: {raw_context}")
+            resolved.append((context, _sha256_file(context)))
+        return resolved_dir, resolved
+
+    @staticmethod
+    def _human_proxy_record(spec: LaunchSpec) -> dict:
+        return {
+            "human_proxy_context": (
+                str(spec.human_proxy_context) if spec.human_proxy_context else None),
+            "human_proxy_context_sha256": spec.human_proxy_context_sha256,
+            "human_proxy_context_dir": (
+                str(spec.human_proxy_context_dir)
+                if spec.human_proxy_context_dir else None),
+            "batch_input_dirs": [str(p) for p in spec.batch_input_dirs],
+            "human_agent_timeout_s": spec.human_agent_timeout_s,
+            "human_agent_model": spec.human_agent_model,
+            "human_agent_reasoning_effort": spec.human_agent_reasoning_effort,
+            "solver_model": spec.solver_model,
+            "solver_reasoning_effort": spec.solver_reasoning_effort,
+            "feedback": spec.feedback,
+            "solver_strength": spec.solver_strength,
+        }
+
+    def _validate_resume_contract(
+            self, man: dict, *, specs: list[LaunchSpec], hours: float, python: str,
+            pool: list[str], cpu_mode: bool, extra_args: list[str],
+            human_agent: dict, solver_identity: Optional[dict[str, str]],
+            context_root: Optional[Path], inputs: list[Path], feedback: str,
+            solver_strength: str) -> None:
+        persisted_runs = man.get("runs", [])
+        persisted_contexts = [
+            {
+                "input_dir": str(Path(r["input_dir"]).resolve()),
+                "context": r.get("human_proxy_context"),
+                "sha256": r.get("human_proxy_context_sha256"),
+            }
+            for r in persisted_runs
+        ]
+        requested_contexts = [
+            {
+                "input_dir": str(s.input_dir),
+                "context": (str(s.human_proxy_context)
+                            if s.human_proxy_context else None),
+                "sha256": s.human_proxy_context_sha256,
+            }
+            for s in specs
+        ]
+        persisted_human = man.get("human_agent", {
+            "timeout_s": None, "model": None, "reasoning_effort": None})
+        checks = {
+            "inputs/context mapping": (persisted_contexts, requested_contexts),
+            "hours": (float(man.get("hours", 0.0)), float(hours)),
+            "CPU/GPU mode": (bool(man.get("cpu_mode", False)), bool(cpu_mode)),
+            "CPU/GPU pool": (list(man.get("gpu_devices", [])), list(pool)),
+            "python": (man.get("python", sys.executable), python),
+            "extra args": (list(man.get("extra_args", []) or []), extra_args),
+            "Human Agent": (persisted_human, human_agent),
+            "Solver identity": (man.get("solver"), solver_identity),
+            "context directory": (
+                man.get("human_proxy_context_dir"),
+                str(context_root) if context_root else None),
+            "inputs": (man.get("inputs", [r["input_dir"] for r in persisted_runs]),
+                       [str(p) for p in inputs]),
+            "feedback": (man.get("feedback", "with_artifacts"), feedback),
+            "solver strength": (man.get("solver_strength", "weak"),
+                                solver_strength),
+        }
+        for name, (persisted, requested) in checks.items():
+            if persisted != requested:
+                raise ValueError(
+                    f"existing batch launch contract mismatch for {name}: "
+                    f"persisted={persisted!r}, requested={requested!r}")
 
     def _spec_of(self, r: dict) -> LaunchSpec:
         """Reconstruct a LaunchSpec from a manifest run record."""
@@ -254,10 +551,171 @@ class Batch:
             log_path=Path(r["log"]),
             resource_config=(Path(r["resource_config"])
                              if r.get("resource_config") else None),
-            gpu_device=r.get("gpu_device"))
+            gpu_device=r.get("gpu_device"),
+            human_proxy_context=(Path(r["human_proxy_context"])
+                                 if r.get("human_proxy_context") else None),
+            human_proxy_context_sha256=r.get("human_proxy_context_sha256"),
+            human_proxy_context_dir=(Path(r["human_proxy_context_dir"])
+                                     if r.get("human_proxy_context_dir") else None),
+            batch_input_dirs=tuple(Path(p) for p in r.get("batch_input_dirs", [])),
+            human_agent_timeout_s=r.get("human_agent_timeout_s"),
+            human_agent_model=r.get("human_agent_model"),
+            human_agent_reasoning_effort=r.get(
+                "human_agent_reasoning_effort"),
+            solver_model=r.get("solver_model"),
+            solver_reasoning_effort=r.get("solver_reasoning_effort"),
+            feedback=r.get("feedback", "with_artifacts"),
+            solver_strength=r.get("solver_strength", "weak"))
+
+    def _verify_human_proxy_context(self, spec: LaunchSpec) -> None:
+        context = spec.human_proxy_context
+        expected = spec.human_proxy_context_sha256
+        if context is None and expected is None:
+            return
+        if context is None or expected is None:
+            raise ValueError(
+                f"incomplete Human Proxy context contract for {spec.run_id}")
+        context_root = spec.human_proxy_context_dir
+        if context_root is None:
+            raise ValueError(
+                f"missing persisted Human Proxy context directory for {spec.run_id}")
+        linked = _symlink_component(context)
+        if linked is not None:
+            raise ValueError(
+                f"Human Proxy context path has symlink component for {spec.run_id}: "
+                f"{linked}")
+        if not context.is_file():
+            raise ValueError(
+                f"Human Proxy context missing or not a regular non-symlink file for "
+                f"{spec.run_id}: {context}")
+        actual = context.resolve()
+        # Compare against the immutable lexical roots captured before launch. Do not
+        # resolve context_root again: a replaced parent symlink must be detected as an
+        # escape, not silently accepted as the new root.
+        if not _inside(actual, context_root):
+            raise ValueError(
+                f"Human Proxy context resolved outside persisted context directory "
+                f"for {spec.run_id}: {actual} not under {context_root}")
+        runs_lexical = self.runs_dir.absolute()
+        runs_actual = self.runs_dir.resolve()
+        if _inside(context.absolute(), runs_lexical) or _inside(actual, runs_actual):
+            raise ValueError(
+                f"Human Proxy context must remain outside runs/ for {spec.run_id}")
+        for inp in spec.batch_input_dirs:
+            if _inside(context.absolute(), inp) or _inside(actual, inp.resolve()):
+                raise ValueError(
+                    f"Human Proxy context must remain outside inputs for {spec.run_id}: "
+                    f"{inp}")
+        actual = _sha256_file(context)
+        if actual != expected:
+            raise ValueError(
+                f"Human Proxy context SHA-256 drift for {spec.run_id}: "
+                f"expected {expected}, got {actual}")
+
+    @staticmethod
+    def _verify_solver_identity(spec: LaunchSpec) -> None:
+        if spec.solver_model is None and spec.solver_reasoning_effort is None:
+            return
+        expected = {
+            "model": spec.solver_model,
+            "reasoning_effort": spec.solver_reasoning_effort,
+        }
+        actual = _resolve_solver_identity()
+        if actual != expected:
+            raise ValueError(
+                f"Solver identity drift for {spec.run_id}: expected {expected}, "
+                f"host resolves {actual}")
+
+    def _verify_spawn_manifest_contract(self, spec: LaunchSpec) -> None:
+        """Fail closed when a standalone watcher sees root/run contract drift."""
+        if not self.manifest_path.is_file():
+            # start() persists the complete contract before even the first-wave Popen.
+            # Therefore absence is always corruption/deletion, never a valid launch.
+            raise ValueError(
+                f"batch manifest missing before spawn: {self.manifest_path}")
+        man = self._read_manifest()
+        record = next(
+            (r for r in man.get("runs", []) if r.get("run_id") == spec.run_id), None)
+        if record is None:
+            raise ValueError(
+                f"spawn contract has no run record for {spec.run_id}")
+        schema_version = int(man.get("schema_version", 1))
+        if schema_version < BATCH_SCHEMA_VERSION:
+            has_legacy_hp = bool(man.get("human_proxy_context_dir")) or any(
+                r.get("human_proxy_context") or r.get("human_proxy_context_sha256")
+                for r in man.get("runs", []))
+            if has_legacy_hp:
+                raise ValueError(
+                    "legacy batch with Human Proxy data lacks an independent run "
+                    "contract; recreate it with the current launcher")
+            if spec.human_proxy_context is not None or \
+                    spec.human_proxy_context_sha256 is not None:
+                raise ValueError("legacy no-HP batch cannot spawn an HP run")
+            if str(Path(record.get("input_dir", "")).resolve()) != str(spec.input_dir):
+                raise ValueError(
+                    f"legacy run input contract mismatch for {spec.run_id}")
+            return
+
+        root_contract = man.get("run_contracts", {}).get(spec.run_id)
+        if not isinstance(root_contract, dict):
+            raise ValueError(
+                f"top-level run contract missing for {spec.run_id}")
+        record_contract = {
+            "input_dir": str(Path(record.get("input_dir", "")).resolve()),
+            "human_proxy_context": record.get("human_proxy_context"),
+            "human_proxy_context_sha256": record.get(
+                "human_proxy_context_sha256"),
+        }
+        spec_contract = {
+            "input_dir": str(spec.input_dir),
+            "human_proxy_context": (
+                str(spec.human_proxy_context) if spec.human_proxy_context else None),
+            "human_proxy_context_sha256": spec.human_proxy_context_sha256,
+        }
+        if root_contract != record_contract or root_contract != spec_contract:
+            raise ValueError(
+                f"run contract mismatch before spawn for {spec.run_id}: "
+                f"top={root_contract!r}, record={record_contract!r}, "
+                f"spec={spec_contract!r}")
+        run_human = {
+            "timeout_s": spec.human_agent_timeout_s,
+            "model": spec.human_agent_model,
+            "reasoning_effort": spec.human_agent_reasoning_effort,
+        }
+        run_solver = None
+        if spec.solver_model is not None or spec.solver_reasoning_effort is not None:
+            run_solver = {
+                "model": spec.solver_model,
+                "reasoning_effort": spec.solver_reasoning_effort,
+            }
+        checks = {
+            "Human Agent contract": (
+                man.get("human_agent", {
+                    "timeout_s": None, "model": None, "reasoning_effort": None}),
+                run_human),
+            "Solver identity contract": (man.get("solver"), run_solver),
+            "context directory contract": (
+                man.get("human_proxy_context_dir"),
+                str(spec.human_proxy_context_dir)
+                if spec.human_proxy_context_dir else None),
+            "inputs contract": (
+                man.get("inputs", [r.get("input_dir") for r in man.get("runs", [])]),
+                [str(p) for p in spec.batch_input_dirs]),
+            "feedback contract": (
+                man.get("feedback", "with_artifacts"), spec.feedback),
+            "solver strength contract": (
+                man.get("solver_strength", "weak"), spec.solver_strength),
+        }
+        for name, (root_value, run_value) in checks.items():
+            if root_value != run_value:
+                raise ValueError(
+                    f"{name} mismatch before spawn for {spec.run_id}: "
+                    f"batch={root_value!r}, run={run_value!r}")
 
     def _build_argv(self, spec: LaunchSpec, *, budget_s: float, python: str,
                     extra_args: list[str], cpu_mode: bool = False) -> list[str]:
+        self._verify_human_proxy_context(spec)
+        self._verify_solver_identity(spec)
         argv = [python, "-m", "coscientist.coevo.cli",
                 "--input", str(spec.input_dir),
                 "--solver", "codex", "--supervisor", "no-human-no-proxy",
@@ -267,6 +725,8 @@ class Batch:
                 # 8h run in minutes, so lift the turn cap far above any real run —
                 # solve_and_evolve then loops until self.deadline.expired().
                 "--max-turns", "100000",
+                "--feedback", spec.feedback,
+                "--solver-strength", spec.solver_strength,
                 "--resume",
                 "--runs-dir", str(self.runs_dir),
                 "--run-id", spec.run_id]
@@ -287,11 +747,24 @@ class Batch:
             # --resume respawn recompute the same pin => a respawned run keeps its card.
             dev = f"device={spec.gpu_device}"
             argv += ["--solver-gpus", dev, "--verifier-gpus", dev]
+        if spec.human_proxy_context is not None:
+            argv += ["--human-proxy-context", str(spec.human_proxy_context)]
+            argv += ["--human-proxy-context-sha256",
+                     str(spec.human_proxy_context_sha256)]
+        if spec.human_agent_timeout_s is not None:
+            argv += ["--human-agent-timeout-s", str(spec.human_agent_timeout_s)]
+        if spec.human_agent_model is not None:
+            argv += ["--human-agent-model", spec.human_agent_model]
+        if spec.human_agent_reasoning_effort is not None:
+            argv += ["--human-agent-reasoning-effort",
+                     spec.human_agent_reasoning_effort]
         argv += list(extra_args)
         return argv
 
     def _spawn(self, spec: LaunchSpec, *, budget_s: float, python: str,
                extra_args: list[str], cpu_mode: bool = False) -> int:
+        _validate_extra_args(extra_args)
+        self._verify_spawn_manifest_contract(spec)
         argv = self._build_argv(spec, budget_s=budget_s, python=python,
                                 extra_args=extra_args, cpu_mode=cpu_mode)
         env = dict(os.environ)
@@ -541,10 +1014,50 @@ class Batch:
     # -- manifest io ------------------------------------------------------
     def _write_manifest(self, obj: dict) -> None:
         self.batch_dir.mkdir(parents=True, exist_ok=True)
-        self.manifest_path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
+        temp_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", dir=self.batch_dir,
+                    prefix=".batch.json.", suffix=".tmp", delete=False) as f:
+                temp_path = Path(f.name)
+                json.dump(obj, f, indent=2)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_path, self.manifest_path)
+        except Exception:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
 
     def _read_manifest(self) -> dict:
-        return _read_json(self.manifest_path, default={"batch": self.batch, "runs": []})
+        if not self.manifest_path.is_file():
+            raise ValueError(f"batch manifest missing: {self.manifest_path}")
+        try:
+            man = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"invalid/corrupt batch manifest: {self.manifest_path}") from exc
+        if not isinstance(man, dict) or man.get("batch") != self.batch or \
+                not isinstance(man.get("runs"), list):
+            raise ValueError(
+                f"invalid batch manifest schema: {self.manifest_path}")
+        schema_version = man.get("schema_version", 1)
+        if not isinstance(schema_version, int) or schema_version < 1 or \
+                schema_version > BATCH_SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported batch manifest schema_version: {schema_version!r}")
+        if schema_version >= BATCH_SCHEMA_VERSION:
+            contracts = man.get("run_contracts")
+            run_ids = [r.get("run_id") for r in man["runs"]
+                       if isinstance(r, dict)]
+            if not isinstance(contracts, dict) or set(contracts) != set(run_ids):
+                raise ValueError(
+                    "invalid batch manifest run_contracts: keys must exactly match runs")
+        return man
 
 
 # ---------------------------------------------------------------------------
@@ -672,10 +1185,12 @@ def _print_status(rows: list[dict]) -> None:
 
 def main(argv: Optional[list[str]] = None) -> None:
     ap = argparse.ArgumentParser(
-        description="Parallel launcher for agent-system case-study runs")
+        description="Parallel launcher for agent-system case-study runs",
+        allow_abbrev=False)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    sp = sub.add_parser("start", help="launch the first GPU wave; queue the rest pending")
+    sp = sub.add_parser("start", help="launch the first GPU wave; queue the rest pending",
+                        allow_abbrev=False)
     sp.add_argument("inputs", nargs="+", help="problem dirs (one run each)")
     sp.add_argument("--batch", required=True, help="batch id (groups the runs)")
     sp.add_argument("--hours", type=float, default=4.0, help="wall-clock budget per run")
@@ -687,6 +1202,24 @@ def main(argv: Optional[list[str]] = None) -> None:
                          "(e.g. AutoLab); overrides --gpus.")
     sp.add_argument("--runs-dir", default="runs")
     sp.add_argument("--python", default=sys.executable)
+    sp.add_argument("--human-proxy-context-dir", default=None,
+                    help="private context directory; each input basename maps to "
+                         "<dir>/<basename>.md and is pinned by SHA-256")
+    sp.add_argument("--human-agent-timeout-s", type=float, default=None,
+                    help="wall-clock cap for each Human Proxy agent turn")
+    sp.add_argument("--human-agent-model", default=None,
+                    help="model used by the independent Human Proxy")
+    sp.add_argument("--human-agent-reasoning-effort", default=None,
+                    help="reasoning effort used by the independent Human Proxy")
+    sp.add_argument("--solver-model", default=None,
+                    help="assert the host Codex gateway resolves this Solver model")
+    sp.add_argument("--solver-reasoning-effort", default=None,
+                    help="assert the host Codex gateway resolves this Solver effort")
+    sp.add_argument("--feedback", default="with_artifacts",
+                    choices=["score_only", "feasible_score", "with_artifacts"],
+                    help="first-class evaluator disclosure level for every run")
+    sp.add_argument("--solver-strength", default="weak", choices=["weak", "strong"],
+                    help="first-class Solver topology for every run")
     sp.add_argument("--dry-run", action="store_true",
                     help="print the first-wave argv (each with its --*-gpus device=N "
                          "pin) + the pending queue; spawn nothing, write no manifest")
@@ -697,28 +1230,31 @@ def main(argv: Optional[list[str]] = None) -> None:
     sp.add_argument("--watch-interval-s", type=float, default=30.0,
                     help="seconds between wave-supervision passes when --watch is set")
     sp.add_argument("--extra-args", nargs="*", default=[],
-                    help="extra flags appended verbatim to every child cli.py argv "
-                         "(persisted in the manifest, reused on every --resume respawn). "
-                         "NOTE: to pass a flag that starts with '-', use the '=' form, "
-                         "e.g. --extra-args=--freeze-verifier (a bare "
-                         "'--extra-args --freeze-verifier' makes argparse reject it).")
+                    help="exact allowlisted non-contract flags appended to every child "
+                         "cli.py argv (persisted and reused on respawn). Protected "
+                         "experiment flags, abbreviations, and duplicates are rejected; "
+                         "promote such settings to first-class launcher options.")
 
-    st = sub.add_parser("status", help="show a table of all runs in a batch")
+    st = sub.add_parser("status", help="show a table of all runs in a batch",
+                        allow_abbrev=False)
     st.add_argument("--batch", required=True)
     st.add_argument("--runs-dir", default="runs")
 
-    wp = sub.add_parser("watch", help="wave-schedule a batch until every run finishes")
+    wp = sub.add_parser("watch", help="wave-schedule a batch until every run finishes",
+                        allow_abbrev=False)
     wp.add_argument("--batch", required=True)
     wp.add_argument("--runs-dir", default="runs")
     wp.add_argument("--interval-s", type=float, default=30.0)
 
-    kp = sub.add_parser("stop", help="SIGTERM every run in a batch (resume-able after)")
+    kp = sub.add_parser("stop", help="SIGTERM every run in a batch (resume-able after)",
+                        allow_abbrev=False)
     kp.add_argument("--batch", required=True)
     kp.add_argument("--runs-dir", default="runs")
 
     pk = sub.add_parser("package",
                         help="copy raw K3 task dirs into launchable problem dirs "
-                             "(idempotent; writes the gla resource.toml template)")
+                             "(idempotent; writes the gla resource.toml template)",
+                        allow_abbrev=False)
     pk.add_argument("tasks", nargs="+",
                     help="raw task names under the K3 tasks root (or full paths)")
     pk.add_argument("--tasks-root",
@@ -749,6 +1285,18 @@ def main(argv: Optional[list[str]] = None) -> None:
                             python=args.python, gpu_devices=pool,
                             cpu_slots=args.cpu_slots,
                             extra_args=list(args.extra_args or []),
+                            human_proxy_context_dir=(
+                                Path(args.human_proxy_context_dir)
+                                if args.human_proxy_context_dir else None),
+                            human_agent_timeout_s=args.human_agent_timeout_s,
+                            human_agent_model=args.human_agent_model,
+                            human_agent_reasoning_effort=(
+                                args.human_agent_reasoning_effort),
+                            solver_model=args.solver_model,
+                            solver_reasoning_effort=(
+                                args.solver_reasoning_effort),
+                            feedback=args.feedback,
+                            solver_strength=args.solver_strength,
                             dry_run=args.dry_run)
         if args.dry_run:
             kind = (f"pool of {args.cpu_slots} CPU slot(s)" if cpu_mode

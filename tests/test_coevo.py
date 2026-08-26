@@ -915,6 +915,676 @@ def test_launcher_assigns_unique_run_ids_and_resume(tmp_path, monkeypatch):
     assert all(isinstance(r["pid"], int) for r in man["runs"])
 
 
+def _launcher_human_proxy_fixture(tmp_path):
+    inputs = []
+    context_dir = tmp_path / "private_contexts"
+    context_dir.mkdir()
+    for name, text in (("task_a", "accepted evaluator A"),
+                       ("task_b", "accepted evaluator B")):
+        inp = tmp_path / "problems" / name
+        inp.mkdir(parents=True)
+        inputs.append(inp)
+        (context_dir / f"{name}.md").write_text(text)
+    return inputs, context_dir
+
+
+def test_launcher_binds_distinct_human_proxy_contexts_and_persists_hashes(
+        tmp_path, monkeypatch, capsys):
+    """Each task gets only its matching private context, and the immutable context
+    path/hash plus first-class Human Agent settings survive in batch.json."""
+    import hashlib
+    from coscientist.coevo import launcher as L
+
+    inputs, context_dir = _launcher_human_proxy_fixture(tmp_path)
+    calls = []
+
+    class FakePopen:
+        def __init__(self, argv, **kw):
+            calls.append(argv)
+            self.pid = 7000 + len(calls)
+
+    monkeypatch.setattr(L.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(
+        L, "_resolve_solver_identity",
+        lambda: {"model": "gpt-5.6-sol", "reasoning_effort": "high"},
+        raising=False)
+    batch = L.Batch("hp", runs_dir=tmp_path / "runs")
+    specs = batch.start(
+        inputs, hours=4.0, cpu_slots=2,
+        human_proxy_context_dir=context_dir,
+        solver_model="gpt-5.6-sol", solver_reasoning_effort="high",
+        feedback="with_artifacts", solver_strength="weak",
+        human_agent_timeout_s=300.0,
+        human_agent_model="gpt-5.6-sol",
+        human_agent_reasoning_effort="high")
+
+    assert len(calls) == 2
+    for spec, argv in zip(specs, calls):
+        expected = context_dir / f"{spec.input_dir.name}.md"
+        assert argv[argv.index("--human-proxy-context") + 1] == str(expected.resolve())
+        assert argv[argv.index("--human-proxy-context-sha256") + 1] == (
+            hashlib.sha256(expected.read_bytes()).hexdigest())
+        other = context_dir / ("task_b.md" if spec.input_dir.name == "task_a"
+                               else "task_a.md")
+        assert str(other.resolve()) not in argv
+        assert argv[argv.index("--human-agent-timeout-s") + 1] == "300.0"
+        assert argv[argv.index("--human-agent-model") + 1] == "gpt-5.6-sol"
+        assert argv[argv.index("--human-agent-reasoning-effort") + 1] == "high"
+        assert argv[argv.index("--feedback") + 1] == "with_artifacts"
+        assert argv[argv.index("--solver-strength") + 1] == "weak"
+
+    man = json.loads(batch.manifest_path.read_text())
+    assert man["schema_version"] >= 2
+    assert man["human_agent"] == {
+        "timeout_s": 300.0,
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "high",
+    }
+    assert man["solver"] == {
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "high",
+    }
+    assert man["feedback"] == "with_artifacts"
+    assert man["solver_strength"] == "weak"
+    for record in man["runs"]:
+        context = context_dir / f"{Path(record['input_dir']).name}.md"
+        assert record["human_proxy_context"] == str(context.resolve())
+        assert record["human_proxy_context_sha256"] == hashlib.sha256(
+            context.read_bytes()).hexdigest()
+        assert man["run_contracts"][record["run_id"]] == {
+            "input_dir": str(Path(record["input_dir"]).resolve()),
+            "human_proxy_context": str(context.resolve()),
+            "human_proxy_context_sha256": hashlib.sha256(
+                context.read_bytes()).hexdigest(),
+        }
+
+    # The exact same contract is a true idempotent resume, not a re-plan/re-spawn.
+    monkeypatch.setattr(L, "_alive", lambda pid: True)
+    resumed = batch.start(
+        inputs, hours=4.0, cpu_slots=2,
+        human_proxy_context_dir=context_dir,
+        solver_model="gpt-5.6-sol", solver_reasoning_effort="high",
+        feedback="with_artifacts", solver_strength="weak",
+        human_agent_timeout_s=300.0,
+        human_agent_model="gpt-5.6-sol",
+        human_agent_reasoning_effort="high")
+    assert len(resumed) == 2 and len(calls) == 2
+
+    # Dry-run renders the same one-to-one mapping without writing a manifest.
+    dry = L.Batch("hp_dry", runs_dir=tmp_path / "dry_runs")
+    dry.start(
+        inputs, hours=4.0, cpu_slots=2, dry_run=True,
+        human_proxy_context_dir=context_dir,
+        solver_model="gpt-5.6-sol", solver_reasoning_effort="high",
+        feedback="with_artifacts", solver_strength="weak",
+        human_agent_timeout_s=300.0,
+        human_agent_model="gpt-5.6-sol",
+        human_agent_reasoning_effort="high")
+    rendered = capsys.readouterr().out
+    assert str((context_dir / "task_a.md").resolve()) in rendered
+    assert str((context_dir / "task_b.md").resolve()) in rendered
+    assert not dry.manifest_path.exists()
+
+
+def test_launcher_human_proxy_context_missing_fails_before_spawn(tmp_path, monkeypatch):
+    """A partial task->context mapping must fail closed before any child is launched."""
+    import pytest
+    from coscientist.coevo import launcher as L
+
+    inputs, context_dir = _launcher_human_proxy_fixture(tmp_path)
+    (context_dir / "task_b.md").unlink()
+    monkeypatch.setattr(L.subprocess, "Popen",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("must validate all contexts before spawn")))
+
+    batch = L.Batch("hp", runs_dir=tmp_path / "runs")
+    with pytest.raises(ValueError, match="task_b.*context|context.*task_b"):
+        batch.start(inputs, hours=4.0, cpu_slots=2,
+                    human_proxy_context_dir=context_dir)
+    assert not batch.manifest_path.exists()
+
+
+def test_launcher_rejects_context_inside_inputs_runs_or_through_symlink(tmp_path):
+    """Private evaluator material must be a regular non-symlink file outside both
+    raw problem inputs and the launcher runs tree."""
+    import pytest
+    from coscientist.coevo import launcher as L
+
+    inp = tmp_path / "problems" / "task"
+    inp.mkdir(parents=True)
+
+    inside_input = inp
+    (inside_input / "task.md").write_text("secret")
+    with pytest.raises(ValueError, match="outside.*input|input"):
+        L.Batch("a", runs_dir=tmp_path / "runs_a").start(
+            [inp], hours=1, dry_run=True,
+            human_proxy_context_dir=inside_input)
+
+    runs = tmp_path / "runs_b"
+    inside_runs = runs / "contexts"
+    inside_runs.mkdir(parents=True)
+    (inside_runs / "task.md").write_text("secret")
+    with pytest.raises(ValueError, match="outside.*runs|runs"):
+        L.Batch("b", runs_dir=runs).start(
+            [inp], hours=1, dry_run=True,
+            human_proxy_context_dir=inside_runs)
+
+    real = tmp_path / "real_contexts"
+    real.mkdir()
+    (real / "task.md").write_text("secret")
+    linked = tmp_path / "linked_contexts"
+    linked.symlink_to(real, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        L.Batch("c", runs_dir=tmp_path / "runs_c").start(
+            [inp], hours=1, dry_run=True,
+            human_proxy_context_dir=linked)
+
+
+def test_launcher_context_drift_blocks_pending_promotion(tmp_path, monkeypatch):
+    """The queued wave rechecks its recorded SHA immediately before first spawn."""
+    import pytest
+    from coscientist.coevo import launcher as L
+
+    inputs, context_dir = _launcher_human_proxy_fixture(tmp_path)
+
+    class FakePopen:
+        next_pid = 8000
+        def __init__(self, argv, **kw):
+            self.pid = self.next_pid
+            FakePopen.next_pid += 1
+
+    monkeypatch.setattr(L.subprocess, "Popen", FakePopen)
+    batch = L.Batch("hp", runs_dir=tmp_path / "runs")
+    batch.start(inputs, hours=4.0, cpu_slots=1,
+                human_proxy_context_dir=context_dir)
+    man = json.loads(batch.manifest_path.read_text())
+    running = next(r for r in man["runs"] if r["status"] == "running")
+    pending = next(r for r in man["runs"] if r["status"] == "pending")
+    run_dir = batch.runs_dir / running["run_id"]
+    run_dir.mkdir(parents=True)
+    (run_dir / "events.jsonl").write_text(json.dumps({"kind": "run_stop"}) + "\n")
+    monkeypatch.setattr(L, "_alive", lambda pid: False)
+    Path(pending["human_proxy_context"]).write_text("tampered evaluator")
+
+    with pytest.raises(ValueError, match="SHA-256|drift"):
+        batch._wave_tick(now=running["last_launch_epoch"] + 100.0)
+
+
+def test_launcher_context_drift_blocks_remaining_budget_respawn(tmp_path, monkeypatch):
+    """A crashed run cannot resume against context bytes different from its manifest."""
+    import pytest
+    from coscientist.coevo import launcher as L
+
+    inputs, context_dir = _launcher_human_proxy_fixture(tmp_path)
+
+    class FakePopen:
+        def __init__(self, argv, **kw):
+            self.pid = 9000
+
+    monkeypatch.setattr(L.subprocess, "Popen", FakePopen)
+    batch = L.Batch("hp", runs_dir=tmp_path / "runs")
+    batch.start(inputs[:1], hours=4.0, cpu_slots=1,
+                human_proxy_context_dir=context_dir)
+    record = json.loads(batch.manifest_path.read_text())["runs"][0]
+    (batch.runs_dir / record["run_id"]).mkdir(parents=True)
+    monkeypatch.setattr(L, "_alive", lambda pid: False)
+    Path(record["human_proxy_context"]).write_text("tampered evaluator")
+
+    with pytest.raises(ValueError, match="SHA-256|drift"):
+        batch._wave_tick(now=record["last_launch_epoch"] + 100.0)
+
+
+def test_launcher_idempotent_start_rejects_contract_drift(tmp_path, monkeypatch):
+    """Repeating start is safe only when scheduling, inputs, private-context mapping,
+    and Human Agent settings exactly match the persisted launch contract."""
+    import pytest
+    from coscientist.coevo import launcher as L
+
+    inputs, context_dir = _launcher_human_proxy_fixture(tmp_path)
+    monkeypatch.setattr(L.Batch, "_spawn", lambda *a, **k: 1234)
+    monkeypatch.setattr(
+        L, "_resolve_solver_identity",
+        lambda: {"model": "gpt-5.6-sol", "reasoning_effort": "high"},
+        raising=False)
+    batch = L.Batch("hp", runs_dir=tmp_path / "runs")
+    settings = dict(
+        hours=4.0, cpu_slots=2, human_proxy_context_dir=context_dir,
+        solver_model="gpt-5.6-sol", solver_reasoning_effort="high",
+        feedback="with_artifacts", solver_strength="weak",
+        human_agent_timeout_s=300.0, human_agent_model="gpt-5.6-sol",
+        human_agent_reasoning_effort="high")
+    batch.start(inputs, **settings)
+    monkeypatch.setattr(batch, "_wave_tick",
+                        lambda: (_ for _ in ()).throw(
+                            AssertionError("drift must fail before resume tick")))
+
+    variants = [
+        ([*inputs], {**settings, "hours": 5.0}),
+        ([*inputs], {**settings, "cpu_slots": 1}),
+        (list(reversed(inputs)), settings),
+        ([*inputs], {**settings, "human_agent_timeout_s": 301.0}),
+        ([*inputs], {**settings, "human_agent_model": "other-model"}),
+        ([*inputs], {**settings, "human_agent_reasoning_effort": "medium"}),
+        ([*inputs], {**settings, "solver_model": "other-model"}),
+        ([*inputs], {**settings, "solver_reasoning_effort": "medium"}),
+        ([*inputs], {**settings, "feedback": "score_only"}),
+        ([*inputs], {**settings, "solver_strength": "strong"}),
+    ]
+    alternate = tmp_path / "alternate_contexts"
+    alternate.mkdir()
+    for p in context_dir.glob("*.md"):
+        (alternate / p.name).write_bytes(p.read_bytes())
+    variants.append(([*inputs], {**settings, "human_proxy_context_dir": alternate}))
+
+    for requested_inputs, requested in variants:
+        with pytest.raises(ValueError, match="contract"):
+            batch.start(requested_inputs, **requested)
+
+    (context_dir / "task_a.md").write_text("hash drift")
+    with pytest.raises(ValueError, match="contract|SHA-256|drift"):
+        batch.start(inputs, **settings)
+
+
+def test_launcher_rejects_unresolved_solver_identity(tmp_path, monkeypatch):
+    """The requested Solver identity is a validated host-gateway contract, not a
+    decorative manifest label: launch fails if the actual Codex gateway differs."""
+    import pytest
+    from coscientist.coevo import launcher as L
+
+    inputs, context_dir = _launcher_human_proxy_fixture(tmp_path)
+    monkeypatch.setattr(
+        L, "_resolve_solver_identity",
+        lambda: {"model": "gpt-5.6-luna", "reasoning_effort": "low"},
+        raising=False)
+    batch = L.Batch("hp", runs_dir=tmp_path / "runs")
+    with pytest.raises(ValueError, match="Solver.*identity|model.*gpt-5.6-sol"):
+        batch.start(
+            inputs, hours=4.0, cpu_slots=2,
+            human_proxy_context_dir=context_dir,
+            solver_model="gpt-5.6-sol", solver_reasoning_effort="high")
+
+
+def test_launcher_solver_identity_drift_blocks_pending_promotion(tmp_path, monkeypatch):
+    """The persisted Solver identity is re-resolved before a later wave is spawned."""
+    import pytest
+    from coscientist.coevo import launcher as L
+
+    inputs, context_dir = _launcher_human_proxy_fixture(tmp_path)
+    identity = {"model": "gpt-5.6-sol", "reasoning_effort": "high"}
+    monkeypatch.setattr(L, "_resolve_solver_identity", lambda: dict(identity))
+
+    class FakePopen:
+        next_pid = 9500
+        def __init__(self, argv, **kw):
+            self.pid = self.next_pid
+            FakePopen.next_pid += 1
+
+    monkeypatch.setattr(L.subprocess, "Popen", FakePopen)
+    batch = L.Batch("hp", runs_dir=tmp_path / "runs")
+    batch.start(
+        inputs, hours=4.0, cpu_slots=1,
+        human_proxy_context_dir=context_dir,
+        solver_model="gpt-5.6-sol", solver_reasoning_effort="high")
+    man = json.loads(batch.manifest_path.read_text())
+    running = next(r for r in man["runs"] if r["status"] == "running")
+    run_dir = batch.runs_dir / running["run_id"]
+    run_dir.mkdir(parents=True)
+    (run_dir / "events.jsonl").write_text(json.dumps({"kind": "run_stop"}) + "\n")
+    monkeypatch.setattr(L, "_alive", lambda pid: False)
+    identity["model"] = "gpt-5.6-luna"
+
+    with pytest.raises(ValueError, match="Solver identity.*drift|Solver.*mismatch"):
+        batch._wave_tick(now=running["last_launch_epoch"] + 100.0)
+
+
+def test_launcher_rejects_extra_args_that_override_human_proxy_contract(tmp_path):
+    """Verbatim extra args cannot override first-class private context/agent flags."""
+    import pytest
+    from coscientist.coevo import launcher as L
+
+    inputs, context_dir = _launcher_human_proxy_fixture(tmp_path)
+    for override in (
+            "--human-agent-model=other",
+            "--human-proxy-context=/tmp/wrong.md",
+            "--solver=stub", "--sup=proxy", "--freeze-v",
+            "--res", "--budget-s=1", "--budget-h", "--feed=score_only",
+            "--solver-str=strong"):
+        batch = L.Batch("hp", runs_dir=tmp_path / override.split("=")[0][2:])
+        with pytest.raises(ValueError, match="first-class|extra.args|override"):
+            batch.start(
+                inputs, hours=4.0, cpu_slots=2, dry_run=True,
+                human_proxy_context_dir=context_dir,
+                human_agent_model="gpt-5.6-sol",
+                extra_args=[override])
+
+    with pytest.raises(ValueError, match="duplicate"):
+        L.Batch("dup", runs_dir=tmp_path / "dup").start(
+            inputs, hours=4.0, cpu_slots=2, dry_run=True,
+            human_proxy_context_dir=context_dir,
+            extra_args=["--bootstrap-timeout-s=10", "--bootstrap-timeout-s", "20"])
+
+
+def test_launcher_cli_threads_first_class_human_and_solver_flags(tmp_path, monkeypatch):
+    """The public launcher CLI exposes the audited configuration without extra_args."""
+    from coscientist.coevo import launcher as L
+
+    inp = tmp_path / "task"
+    inp.mkdir()
+    context_dir = tmp_path / "contexts"
+    context_dir.mkdir()
+    (context_dir / "task.md").write_text("accepted evaluator")
+    seen = {}
+
+    def fake_start(self, inputs, **kwargs):
+        seen["inputs"] = inputs
+        seen.update(kwargs)
+        return []
+
+    monkeypatch.setattr(L.Batch, "start", fake_start)
+    L.main([
+        "start", str(inp), "--batch", "hp", "--dry-run", "--cpu-slots", "10",
+        "--human-proxy-context-dir", str(context_dir),
+        "--human-agent-timeout-s", "300",
+        "--human-agent-model", "gpt-5.6-sol",
+        "--human-agent-reasoning-effort", "high",
+        "--solver-model", "gpt-5.6-sol",
+        "--solver-reasoning-effort", "high",
+        "--feedback", "with_artifacts", "--solver-strength", "weak",
+    ])
+
+    assert seen["human_proxy_context_dir"] == context_dir
+    assert seen["human_agent_timeout_s"] == 300.0
+    assert seen["human_agent_model"] == "gpt-5.6-sol"
+    assert seen["human_agent_reasoning_effort"] == "high"
+    assert seen["solver_model"] == "gpt-5.6-sol"
+    assert seen["solver_reasoning_effort"] == "high"
+    assert seen["feedback"] == "with_artifacts"
+    assert seen["solver_strength"] == "weak"
+
+
+def test_launcher_cli_disables_argparse_option_abbreviations(tmp_path, monkeypatch):
+    """Top-level launcher flags also require exact spelling; --feed is not accepted."""
+    import pytest
+    from coscientist.coevo import launcher as L
+
+    inp = tmp_path / "task"
+    inp.mkdir()
+    monkeypatch.setattr(
+        L.Batch, "start",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("abbreviation reached Batch.start")))
+    with pytest.raises(SystemExit):
+        L.main(["start", str(inp), "--batch", "hp", "--dry-run",
+                "--feed", "with_artifacts"])
+
+
+def test_launcher_dry_run_prints_context_and_sha_for_running_and_pending(
+        tmp_path, capsys):
+    """Every planned run is auditable before launch, including queued wave members."""
+    import hashlib
+    from coscientist.coevo import launcher as L
+
+    inputs, context_dir = _launcher_human_proxy_fixture(tmp_path)
+    batch = L.Batch("hp", runs_dir=tmp_path / "runs")
+    batch.start(inputs, hours=4.0, cpu_slots=1, dry_run=True,
+                human_proxy_context_dir=context_dir)
+
+    output = capsys.readouterr().out
+    assert "RUNNING" in output and "PENDING" in output
+    for inp in inputs:
+        context = (context_dir / f"{inp.name}.md").resolve()
+        digest = hashlib.sha256(context.read_bytes()).hexdigest()
+        assert f"context={context}" in output
+        assert f"sha256={digest}" in output
+
+
+def test_launcher_watch_rejects_run_level_human_or_solver_contract_drift(
+        tmp_path, monkeypatch):
+    """A standalone watcher must not spawn from inconsistent root/run contracts."""
+    import pytest
+    from coscientist.coevo import launcher as L
+
+    inputs, context_dir = _launcher_human_proxy_fixture(tmp_path)
+    monkeypatch.setattr(
+        L, "_resolve_solver_identity",
+        lambda: {"model": "gpt-5.6-sol", "reasoning_effort": "high"})
+
+    class FakePopen:
+        next_pid = 9800
+        def __init__(self, argv, **kw):
+            self.pid = self.next_pid
+            FakePopen.next_pid += 1
+
+    monkeypatch.setattr(L.subprocess, "Popen", FakePopen)
+    batch = L.Batch("hp", runs_dir=tmp_path / "runs")
+    batch.start(
+        inputs, hours=4.0, cpu_slots=1,
+        human_proxy_context_dir=context_dir,
+        human_agent_model="gpt-5.6-sol",
+        solver_model="gpt-5.6-sol", solver_reasoning_effort="high")
+    man = json.loads(batch.manifest_path.read_text())
+    running = next(r for r in man["runs"] if r["status"] == "running")
+    rd = batch.runs_dir / running["run_id"]
+    rd.mkdir(parents=True)
+    (rd / "events.jsonl").write_text(json.dumps({"kind": "run_stop"}) + "\n")
+    monkeypatch.setattr(L, "_alive", lambda pid: False)
+
+    man["human_agent"]["model"] = "tampered-human"
+    batch.manifest_path.write_text(json.dumps(man))
+    with pytest.raises(ValueError, match="Human Agent.*contract|contract.*Human"):
+        batch._wave_tick(now=running["last_launch_epoch"] + 100.0)
+
+    man["human_agent"]["model"] = "gpt-5.6-sol"
+    man["solver"]["model"] = "tampered-solver"
+    batch.manifest_path.write_text(json.dumps(man))
+    with pytest.raises(ValueError, match="Solver.*contract|contract.*Solver"):
+        batch._wave_tick(now=running["last_launch_epoch"] + 100.0)
+
+    man["solver"]["model"] = "gpt-5.6-sol"
+    man["extra_args"] = ["--freeze-v"]
+    batch.manifest_path.write_text(json.dumps(man))
+    with pytest.raises(ValueError, match="protected|allowlist|abbrevi"):
+        batch._wave_tick(now=running["last_launch_epoch"] + 100.0)
+
+
+def test_launcher_spawn_rejects_context_parent_replaced_by_symlink(tmp_path, monkeypatch):
+    """Hash equality cannot bless a path that escaped its persisted private directory."""
+    import pytest
+    from coscientist.coevo import launcher as L
+
+    inputs, context_dir = _launcher_human_proxy_fixture(tmp_path)
+
+    class FakePopen:
+        next_pid = 9900
+        def __init__(self, argv, **kw):
+            self.pid = self.next_pid
+            FakePopen.next_pid += 1
+
+    monkeypatch.setattr(L.subprocess, "Popen", FakePopen)
+    batch = L.Batch("hp", runs_dir=tmp_path / "runs")
+    batch.start(inputs, hours=4.0, cpu_slots=1,
+                human_proxy_context_dir=context_dir)
+    man = json.loads(batch.manifest_path.read_text())
+    assert man["human_proxy_context_dir"] == str(context_dir.resolve())
+    assert man["inputs"] == [str(p.resolve()) for p in inputs]
+    running = next(r for r in man["runs"] if r["status"] == "running")
+    rd = batch.runs_dir / running["run_id"]
+    rd.mkdir(parents=True)
+    (rd / "events.jsonl").write_text(json.dumps({"kind": "run_stop"}) + "\n")
+    monkeypatch.setattr(L, "_alive", lambda pid: False)
+
+    moved = tmp_path / "moved_contexts"
+    context_dir.rename(moved)
+    context_dir.symlink_to(moved, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink|outside.*context"):
+        batch._wave_tick(now=running["last_launch_epoch"] + 100.0)
+
+
+def test_launcher_initial_spawn_also_checks_persisted_batch_contract(
+        tmp_path, monkeypatch):
+    """There is no unvalidated first-wave exception: batch.json precedes every spawn."""
+    from coscientist.coevo import launcher as L
+
+    inputs, context_dir = _launcher_human_proxy_fixture(tmp_path)
+    checked = []
+    original = L.Batch._verify_spawn_manifest_contract
+
+    def asserting_check(self, spec):
+        assert self.manifest_path.is_file(), "initial spawn preceded batch contract"
+        checked.append(spec.run_id)
+        return original(self, spec)
+
+    class FakePopen:
+        def __init__(self, argv, **kw):
+            self.pid = 10001
+
+    monkeypatch.setattr(L.Batch, "_verify_spawn_manifest_contract", asserting_check)
+    monkeypatch.setattr(L.subprocess, "Popen", FakePopen)
+    batch = L.Batch("hp", runs_dir=tmp_path / "runs")
+    batch.start(inputs, hours=4.0, cpu_slots=2,
+                human_proxy_context_dir=context_dir)
+    assert len(checked) == 2
+
+
+def test_launcher_spawn_fails_closed_when_batch_manifest_was_deleted(
+        tmp_path, monkeypatch):
+    """Neither a queued launch nor a remaining-budget respawn may run without the
+    persisted top-level contract that authenticates its run-level configuration."""
+    import pytest
+    from coscientist.coevo import launcher as L
+
+    inputs, context_dir = _launcher_human_proxy_fixture(tmp_path)
+
+    class FakePopen:
+        next_pid = 10100
+        def __init__(self, argv, **kw):
+            self.pid = self.next_pid
+            FakePopen.next_pid += 1
+
+    monkeypatch.setattr(L.subprocess, "Popen", FakePopen)
+    batch = L.Batch("hp", runs_dir=tmp_path / "runs")
+    batch.start(inputs, hours=4.0, cpu_slots=1,
+                human_proxy_context_dir=context_dir)
+    man = json.loads(batch.manifest_path.read_text())
+    pending = batch._spec_of(next(r for r in man["runs"]
+                                  if r["status"] == "pending"))
+    respawn = batch._spec_of(next(r for r in man["runs"]
+                                  if r["status"] == "running"))
+    batch.manifest_path.unlink()
+    monkeypatch.setattr(
+        L.subprocess, "Popen",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("must not Popen without batch.json")))
+
+    for spec in (pending, respawn):
+        with pytest.raises(ValueError, match="batch.*manifest|batch.json|contract"):
+            batch._spawn(spec, budget_s=100.0, python="python",
+                         extra_args=[], cpu_mode=True)
+
+
+def test_launcher_spawn_rejects_task_context_swap_against_top_level_contract(
+        tmp_path, monkeypatch):
+    """Swapping two internally-valid run records cannot swap their private evaluators."""
+    import pytest
+    from coscientist.coevo import launcher as L
+
+    inputs, context_dir = _launcher_human_proxy_fixture(tmp_path)
+
+    class FakePopen:
+        next_pid = 10200
+        def __init__(self, argv, **kw):
+            self.pid = self.next_pid
+            FakePopen.next_pid += 1
+
+    monkeypatch.setattr(L.subprocess, "Popen", FakePopen)
+    batch = L.Batch("hp", runs_dir=tmp_path / "runs")
+    batch.start(inputs, hours=4.0, cpu_slots=1,
+                human_proxy_context_dir=context_dir)
+    man = json.loads(batch.manifest_path.read_text())
+    first, second = man["runs"]
+    for field in ("human_proxy_context", "human_proxy_context_sha256"):
+        first[field], second[field] = second[field], first[field]
+    batch._write_manifest(man)
+    swapped = batch._spec_of(second)
+    monkeypatch.setattr(
+        L.subprocess, "Popen",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("swapped task context reached Popen")))
+
+    with pytest.raises(ValueError, match="run contract|context.*contract|input.*contract"):
+        batch._spawn(swapped, budget_s=100, python="python",
+                     extra_args=[], cpu_mode=True)
+
+
+def test_launcher_manifest_write_is_atomic_and_read_fails_closed(
+        tmp_path, monkeypatch):
+    """A failed replace preserves the previous JSON; missing/truncated manifests raise."""
+    import pytest
+    from coscientist.coevo import launcher as L
+
+    batch = L.Batch("b", runs_dir=tmp_path / "runs")
+    old = {"schema_version": 2, "batch": "b", "runs": []}
+    batch._write_manifest(old)
+    old_bytes = batch.manifest_path.read_bytes()
+    monkeypatch.setattr(
+        L.os, "replace",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("replace interrupted")),
+        raising=False)
+    with pytest.raises(OSError, match="interrupted"):
+        batch._write_manifest({"schema_version": 2, "batch": "b", "runs": [1]})
+    assert batch.manifest_path.read_bytes() == old_bytes
+
+    monkeypatch.undo()
+    batch.manifest_path.write_text('{"batch":')
+    with pytest.raises(ValueError, match="invalid|corrupt|JSON"):
+        batch._read_manifest()
+    batch.manifest_path.unlink()
+    with pytest.raises(ValueError, match="missing"):
+        batch._read_manifest()
+    with pytest.raises(ValueError, match="missing"):
+        batch.watch(max_ticks=1)
+
+
+def test_launcher_legacy_no_human_proxy_manifest_can_really_spawn(
+        tmp_path, monkeypatch):
+    """Schema-v1 batches without any HP fields remain safely resumable."""
+    from coscientist.coevo import launcher as L
+
+    inp = tmp_path / "problem"
+    inp.mkdir()
+    runs = tmp_path / "runs"
+    batch = L.Batch("legacy", runs_dir=runs)
+    batch.batch_dir.mkdir(parents=True)
+    rid = "legacy__problem"
+    batch.manifest_path.write_text(json.dumps({
+        "batch": "legacy", "hours": 1.0, "python": "python",
+        "gpu_devices": ["slot0"], "cpu_mode": True, "extra_args": [],
+        "runs": [{
+            "run_id": rid, "input_dir": str(inp.resolve()),
+            "log": str(batch.batch_dir / "legacy.log"), "pid": None,
+            "status": "pending", "budget_s": 3600.0,
+            "deadline_epoch": None, "last_launch_epoch": None, "respawns": 0,
+            "resource_config": None, "gpu_device": None,
+        }],
+    }))
+    calls = []
+
+    class FakePopen:
+        def __init__(self, argv, **kw):
+            calls.append(argv)
+            self.pid = 10300
+
+    monkeypatch.setattr(L.subprocess, "Popen", FakePopen)
+    actions = batch._wave_tick(now=1_000_000.0)
+    assert actions == [{"run_id": rid, "action": "launched",
+                        "pid": 10300, "gpu_device": "slot0"}]
+    assert len(calls) == 1 and "--human-proxy-context" not in calls[0]
+    monkeypatch.setattr(L, "_alive", lambda pid: False)
+    respawned = batch._wave_tick(now=1_000_100.0)
+    assert respawned[0]["action"] == "respawned"
+    assert len(calls) == 2 and "--human-proxy-context" not in calls[1]
+
+
 # ---------------------------------------------------------------------------
 # free-form evaluator evolution: authored feedback, host-side creds, plateau→proof
 # modality switch, evaluator smoke checks, resume, checker ingest,

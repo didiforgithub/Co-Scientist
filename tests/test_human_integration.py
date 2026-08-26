@@ -298,6 +298,7 @@ def test_cli_wires_private_text_context_for_model_human_proxy(tmp_path, monkeypa
         solver_strength="weak", solver_image=None, solver_gpus=None,
         llm_config=None, feishu_expert_id=None,
         human_proxy_context=str(proxy_context),
+        human_proxy_context_sha256="a" * 64,
         human_agent_timeout_s=90.0,
         human_agent_model="proxy-model",
         human_agent_reasoning_effort="medium",
@@ -306,6 +307,7 @@ def test_cli_wires_private_text_context_for_model_human_proxy(tmp_path, monkeypa
     cli.run_agent_system(args)
 
     assert captured["human_proxy_context_path"] == proxy_context
+    assert captured["human_proxy_context_sha256"] == "a" * 64
     assert captured["human_agent_timeout_s"] == 90.0
     assert captured["human_agent_model"] == "proxy-model"
     assert captured["human_agent_reasoning_effort"] == "medium"

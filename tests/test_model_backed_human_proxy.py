@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -326,6 +327,8 @@ def test_agent_system_builds_proxy_from_text_without_importing_or_executing_it(
         raw_input_dir=raw,
         run_dir=tmp_path / "run",
         human_proxy_context_path=private_context,
+        human_proxy_context_sha256=hashlib.sha256(
+            private_context.read_bytes()).hexdigest(),
     )
     system.gateway = GatewayConfig(codex_home=tmp_path / "codex-home")
     system.agent_elf = tmp_path / "codex"
@@ -338,6 +341,45 @@ def test_agent_system_builds_proxy_from_text_without_importing_or_executing_it(
     assert "useful failure modes" in system.human_port.proxy_agent.evaluator_context
     assert not canary.exists()
     assert not list(system.run_dir.rglob("private_evaluator.py"))
+
+
+def test_agent_system_hashes_single_context_read_and_uses_same_in_memory_bytes(
+        tmp_path, monkeypatch):
+    """Replacing the file after read_bytes cannot change what the Proxy receives."""
+    from coscientist.coevo import agent_system as agent_system_module
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "instruction.md").write_text("public")
+    private_context = tmp_path / "private.md"
+    original_text = "ORIGINAL accepted evaluator guidance"
+    private_context.write_text(original_text)
+    expected = hashlib.sha256(private_context.read_bytes()).hexdigest()
+    system = AgentSystem(
+        raw_input_dir=raw,
+        run_dir=tmp_path / "run",
+        human_proxy_context_path=private_context,
+        human_proxy_context_sha256=expected,
+    )
+    system.gateway = GatewayConfig(codex_home=tmp_path / "codex-home")
+    system.agent_elf = tmp_path / "codex"
+    monkeypatch.setattr(agent_system_module, "docker_unavailable", lambda: None)
+    original_read_bytes = Path.read_bytes
+    reads = {"n": 0}
+
+    def swap_after_read(path):
+        data = original_read_bytes(path)
+        if path == private_context:
+            reads["n"] += 1
+            private_context.write_text("SWAPPED malicious context")
+        return data
+
+    monkeypatch.setattr(Path, "read_bytes", swap_after_read)
+    system.preflight()
+
+    assert reads["n"] == 1
+    assert system.human_port.proxy_agent.evaluator_context == original_text
+    assert private_context.read_text() == "SWAPPED malicious context"
 
 
 def test_execution_backed_proxy_api_is_removed():

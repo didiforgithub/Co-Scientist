@@ -41,6 +41,7 @@ instead of the hardcoded curve-fit ones.
 from __future__ import annotations
 
 import difflib
+import hashlib
 import json
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -404,6 +405,7 @@ class AgentSystem:
     human_agent_model: str = "gpt-5.6-luna"
     human_agent_reasoning_effort: str = "low"
     human_proxy_context_path: Optional[Path] = None
+    human_proxy_context_sha256: Optional[str] = None
 
     store: RunStore = field(init=False)
     deadline: Deadline = field(init=False)
@@ -530,7 +532,17 @@ class AgentSystem:
 
             try:
                 proxy_context_path = Path(self.human_proxy_context_path).resolve()
-                proxy_context = proxy_context_path.read_text(encoding="utf-8")
+                expected_sha = (self.human_proxy_context_sha256 or "").lower()
+                if len(expected_sha) != 64 or any(
+                        c not in "0123456789abcdef" for c in expected_sha):
+                    raise ValueError("missing or invalid expected context SHA-256")
+                # One immutable snapshot: hash and decode the SAME bytes. Never check
+                # the path and then read it again to construct the private Proxy.
+                proxy_context_bytes = proxy_context_path.read_bytes()
+                actual_sha = hashlib.sha256(proxy_context_bytes).hexdigest()
+                if actual_sha != expected_sha:
+                    raise ValueError("Human Proxy context SHA-256 mismatch")
+                proxy_context = proxy_context_bytes.decode("utf-8")
                 proxy_agent = ModelBackedHumanProxyAgent(
                     evaluator_context=proxy_context,
                     gateway=human_gateway,
