@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import base64
 import json
 import stat
 import subprocess
@@ -14,6 +15,7 @@ from coscientist.experiments.autolab_human_proxy import (
     AUTOLAB_GROUPS,
     MAX_CONTEXT_CHARACTERS,
     audit_contexts,
+    audit_live_privacy,
     audit_runs,
     evaluate_results,
     main,
@@ -1442,3 +1444,103 @@ def test_evaluate_results_manifest_hash_binds_the_same_snapshot_as_payload(tmp_p
     row = next(item for item in report["tasks"] if item["task"] == task)
     assert row["run"]["final_verifier_version"] == 3
     assert row["run"]["manifest_sha256"] == hashlib.sha256(initial_raw).hexdigest()
+
+
+def _live_privacy_fixture(tmp_path: Path) -> tuple[Path, Path, str, dict[str, str]]:
+    runs = tmp_path / "runs"
+    contexts = tmp_path / "contexts"
+    batch = "autolab_hp_live_privacy"
+    runs.mkdir()
+    contexts.mkdir()
+    rows = []
+    context_texts = {}
+    for tasks in AUTOLAB_GROUPS.values():
+        for task in tasks:
+            private = (
+                f"Private accepted evaluator context for {task}. "
+                + (f"hidden-{task}-criterion " * 20)
+            )
+            context_texts[task] = private
+            context_path = contexts / f"autolab_{task}.md"
+            context_path.write_text(private, encoding="utf-8")
+            run_id = f"{batch}__autolab_{task}"
+            run = runs / run_id
+            session = run / "human" / "session_001"
+            session.mkdir(parents=True)
+            (session / "session.json").write_text(
+                json.dumps({"state": "closed"}), encoding="utf-8"
+            )
+            (session / "transcript.jsonl").write_text(
+                json.dumps({"role": "human", "text": "Use an independent edge case."})
+                + "\n",
+                encoding="utf-8",
+            )
+            (run / "human_guidance.md").write_text(
+                "Try a boundary case without revealing evaluator details.\n",
+                encoding="utf-8",
+            )
+            rows.append(
+                {
+                    "run_id": run_id,
+                    "input_dir": f"/problems/autolab_{task}",
+                    "human_proxy_context": str(context_path.resolve()),
+                    "human_proxy_context_sha256": hashlib.sha256(
+                        private.encode("utf-8")
+                    ).hexdigest(),
+                }
+            )
+    batch_dir = runs / batch
+    batch_dir.mkdir()
+    (batch_dir / "batch.json").write_text(
+        json.dumps(
+            {
+                "batch": batch,
+                "human_proxy_context_dir": str(contexts.resolve()),
+                "runs": rows,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return runs, contexts, batch, context_texts
+
+
+def test_audit_live_privacy_validates_closed_sessions_without_scanning_batch_paths(
+    tmp_path,
+):
+    runs, contexts, batch, _private = _live_privacy_fixture(tmp_path)
+
+    summary = audit_live_privacy(
+        runs_root=runs,
+        batch_name=batch,
+        context_dir=contexts,
+        require_closed_tasks=10,
+    )
+
+    assert summary["status"] == "pass"
+    assert summary["task_count"] == 17
+    assert summary["closed_session_tasks"] == 17
+    assert summary["scanned_files"] == 51
+
+
+def test_audit_live_privacy_rejects_encoded_private_context_in_transcript(tmp_path):
+    runs, contexts, batch, private = _live_privacy_fixture(tmp_path)
+    task = "adaptive_compression"
+    transcript = (
+        runs
+        / f"{batch}__autolab_{task}"
+        / "human"
+        / "session_001"
+        / "transcript.jsonl"
+    )
+    encoded = base64.b64encode(private[task].encode("utf-8")).decode("ascii")
+    transcript.write_text(
+        json.dumps({"role": "human", "text": encoded}) + "\n", encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError, match="private context content leaked"):
+        audit_live_privacy(
+            runs_root=runs,
+            batch_name=batch,
+            context_dir=contexts,
+            require_closed_tasks=1,
+        )

@@ -1184,6 +1184,217 @@ def prepare_runs(
     }
 
 
+def _load_live_private_contexts(
+    context_dir: Path,
+) -> dict[str, tuple[Path, str, str]]:
+    if not context_dir.is_dir():
+        raise RuntimeError("private context directory is missing")
+    contexts: dict[str, tuple[Path, str, str]] = {}
+    total_bytes = 0
+    for task in _tasks():
+        path = _reject_symlink_components(context_dir / f"autolab_{task}.md")
+        try:
+            raw = _read_bounded_regular(
+                path,
+                max_bytes=MAX_RUN_CONTEXT_FILE_BYTES,
+                label="private context",
+            )
+            total_bytes += len(raw)
+            if total_bytes > MAX_RUN_CONTEXT_TOTAL_BYTES:
+                raise RuntimeError("private context total exceeds size limit")
+            text = raw.decode("utf-8")
+        except ValueError as exc:
+            raise RuntimeError("private context size/read validation failed") from exc
+        except UnicodeDecodeError as exc:
+            raise RuntimeError("private context is not valid UTF-8") from exc
+        if len(text) > MAX_CONTEXT_CHARACTERS:
+            raise RuntimeError("private context exceeds character limit")
+        contexts[task] = (path, text, _sha256_bytes(raw))
+    return contexts
+
+
+def _live_privacy_files(run: Path) -> list[Path]:
+    """Return only durable Human-derived surfaces, never the private batch manifest."""
+
+    candidates: dict[tuple[int, int], Path] = {}
+
+    def add(path: Path) -> None:
+        safe = _reject_symlink_components(path)
+        info = os.stat(safe, follow_symlinks=False)
+        candidates[(info.st_dev, info.st_ino)] = safe
+
+    human = run / "human"
+    if os.path.lexists(human):
+        _reject_symlink_components(human)
+        if not human.is_dir():
+            raise RuntimeError("live Human artifact root is not a directory")
+        for path in human.rglob("*"):
+            _reject_symlink_components(path)
+            mode = os.lstat(path).st_mode
+            if stat.S_ISREG(mode):
+                add(path)
+            elif not stat.S_ISDIR(mode):
+                raise RuntimeError("live Human artifacts contain an unsafe entry")
+    guidance = run / "human_guidance.md"
+    if os.path.lexists(guidance):
+        add(guidance)
+    for path in run.rglob("HUMAN_GUIDANCE.md"):
+        add(path)
+    for path in candidates.values():
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError("live Human artifact is not a regular file")
+    return sorted(candidates.values())
+
+
+def _live_privacy_payload(path: Path, raw: bytes) -> Any:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("live Human artifact is not valid UTF-8") from exc
+    try:
+        if path.suffix == ".json":
+            return json.loads(text)
+        if path.suffix == ".jsonl":
+            return [
+                json.loads(line)
+                for line in text.splitlines()
+                if line.strip()
+            ]
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("live Human artifact contains invalid JSON") from exc
+    return text
+
+
+def audit_live_privacy(
+    *,
+    runs_root: Path | str,
+    batch_name: str,
+    context_dir: Path | str,
+    require_closed_tasks: int = 0,
+) -> dict[str, Any]:
+    """Audit persisted Human Proxy output after launch without reading solver payloads.
+
+    The launcher manifest necessarily contains private context paths and hashes, so it
+    is validated as provenance but deliberately excluded from the content-leak scan.
+    Only durable transcripts, outcomes, guidance, and their workspace copies are
+    scanned with the same normalized/encoded detector used at the Proxy boundary.
+    """
+
+    if not 0 <= require_closed_tasks <= 17:
+        raise ValueError("require_closed_tasks must be between 0 and 17")
+    batch_name = _validated_batch_name(batch_name)
+    runs_root = _reject_symlink_components(runs_root)
+    context_dir = _reject_symlink_components(context_dir)
+    if not runs_root.is_dir():
+        raise RuntimeError("dedicated runs root is missing")
+    try:
+        context_dir.resolve().relative_to(runs_root.resolve())
+    except ValueError:
+        pass
+    else:
+        raise RuntimeError("private context directory must be outside the runs root")
+    contexts = _load_live_private_contexts(context_dir)
+
+    batch_path = runs_root / batch_name / "batch.json"
+    batch, batch_sha256 = _read_json_snapshot(
+        batch_path,
+        label="live batch manifest",
+        max_bytes=MAX_RUN_AUDIT_FILE_BYTES,
+    )
+    if batch.get("batch") != batch_name:
+        raise RuntimeError("live batch manifest names a different batch")
+    if batch.get("human_proxy_context_dir") != str(context_dir.resolve()):
+        raise RuntimeError("live batch context root mismatch")
+    rows = batch.get("runs")
+    if not isinstance(rows, list) or len(rows) != 17:
+        raise RuntimeError("live batch must contain exactly 17 runs")
+    expected_ids = {f"{batch_name}__autolab_{task}" for task in _tasks()}
+    row_by_id: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("run_id"), str):
+            raise RuntimeError("live batch contains an invalid run record")
+        if row["run_id"] in row_by_id:
+            raise RuntimeError("live batch contains duplicate run records")
+        row_by_id[row["run_id"]] = row
+    if set(row_by_id) != expected_ids:
+        raise RuntimeError("live batch task set does not match the exact 17 tasks")
+
+    from coscientist.coevo.human_proxy_sessions import (
+        HUMAN_PROXY_E_PRIVATE_CONTEXT_LEAK,
+        assert_no_private_context_leak,
+    )
+
+    forbidden_paths = tuple(
+        {
+            str(context_dir),
+            str(context_dir.resolve()),
+            *(str(path) for path, _text, _sha in contexts.values()),
+            *(str(path.resolve()) for path, _text, _sha in contexts.values()),
+        }
+    )
+    scanned_files = 0
+    closed_tasks = 0
+    for task in _tasks():
+        run_id = f"{batch_name}__autolab_{task}"
+        row = row_by_id[run_id]
+        context_path, private_context, context_sha256 = contexts[task]
+        if Path(str(row.get("human_proxy_context", ""))) != context_path.resolve():
+            raise RuntimeError(f"live batch context mapping mismatch for {task}")
+        if row.get("human_proxy_context_sha256") != context_sha256:
+            raise RuntimeError(f"live batch context hash mismatch for {task}")
+        if Path(str(row.get("input_dir", ""))).name != f"autolab_{task}":
+            raise RuntimeError(f"live batch input mapping mismatch for {task}")
+        run = _reject_symlink_components(runs_root / run_id)
+        if not run.is_dir():
+            raise RuntimeError(f"live run is missing for {task}")
+
+        task_has_closed_session = False
+        for path in _live_privacy_files(run):
+            try:
+                raw = _read_bounded_regular(
+                    path,
+                    max_bytes=MAX_RUN_AUDIT_FILE_BYTES,
+                    label="live Human artifact",
+                )
+            except ValueError as exc:
+                raise RuntimeError("live Human artifact failed bounded read") from exc
+            payload = _live_privacy_payload(path, raw)
+            try:
+                assert_no_private_context_leak(
+                    payload,
+                    private_context,
+                    min_span_characters=160,
+                    forbidden_literals=forbidden_paths,
+                )
+            except RuntimeError as exc:
+                if str(exc) == HUMAN_PROXY_E_PRIVATE_CONTEXT_LEAK:
+                    relative = path.relative_to(run).as_posix()
+                    raise RuntimeError(
+                        f"private context content leaked in live artifact: {task}/{relative}"
+                    ) from None
+                raise
+            scanned_files += 1
+            if path.name == "session.json" and isinstance(payload, dict):
+                task_has_closed_session |= payload.get("state") == "closed"
+        closed_tasks += int(task_has_closed_session)
+
+    if closed_tasks < require_closed_tasks:
+        raise RuntimeError(
+            f"only {closed_tasks} tasks have a closed Human session; "
+            f"required {require_closed_tasks}"
+        )
+    return {
+        "arm": ARM,
+        "batch_name": batch_name,
+        "status": "pass",
+        "task_count": 17,
+        "closed_session_tasks": closed_tasks,
+        "required_closed_session_tasks": require_closed_tasks,
+        "scanned_files": scanned_files,
+        "batch_manifest_sha256": batch_sha256,
+    }
+
+
 def _canonical_sha256(value: Any) -> str:
     raw = json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
@@ -1813,6 +2024,11 @@ def main(argv: list[str] | None = None) -> int:
         child.add_argument("--problems-root", type=Path, required=True)
         if command == "audit-runs":
             child.add_argument("--context-dir", type=Path, required=True)
+    live = subparsers.add_parser("audit-live-privacy")
+    live.add_argument("--runs-root", type=Path, required=True)
+    live.add_argument("--batch-name", required=True)
+    live.add_argument("--context-dir", type=Path, required=True)
+    live.add_argument("--require-closed-tasks", type=int, default=0)
     evaluate = subparsers.add_parser("evaluate-results")
     evaluate.add_argument("--batch-name", required=True)
     evaluate.add_argument("--runs-root", type=Path, required=True)
@@ -1845,6 +2061,13 @@ def main(argv: list[str] | None = None) -> int:
             args.batch_name,
             problems_root=args.problems_root,
             context_dir=args.context_dir,
+        )
+    elif args.command == "audit-live-privacy":
+        summary = audit_live_privacy(
+            runs_root=args.runs_root,
+            batch_name=args.batch_name,
+            context_dir=args.context_dir,
+            require_closed_tasks=args.require_closed_tasks,
         )
     else:
         summary = evaluate_results(
