@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
+import time
+import traceback
 from dataclasses import replace
 from pathlib import Path
 
@@ -15,6 +18,8 @@ from coscientist.coevo.human_proxy_sessions import (
     HumanProxySessionPort,
     LoopbackTransport,
     ModelBackedHumanProxyAgent,
+    assert_no_private_context_leak,
+    scan_private_context_leaks,
 )
 from coscientist.coevo.human_sessions import (
     HumanSession,
@@ -161,7 +166,7 @@ def test_model_proxy_freely_requests_then_confirms_close_with_reasoned_outcome(
 
 @pytest.mark.parametrize("decision", [None, 7, "allow"])
 def test_model_proxy_rejects_invalid_outcome_decisions(decision):
-    with pytest.raises(RuntimeError, match="unsupported Human Proxy decision"):
+    with pytest.raises(RuntimeError) as caught:
         ModelBackedHumanProxyAgent._parse_turn(
             {
                 "message": "确认这个结论。",
@@ -170,6 +175,7 @@ def test_model_proxy_rejects_invalid_outcome_decisions(decision):
             },
             state=SessionState.CLOSE_REQUESTED,
         )
+    assert str(caught.value) == "HUMAN_PROXY_E_TURN_INVALID"
 
 
 def test_model_proxy_prompt_forbids_execution_and_centers_environment_codesign(
@@ -388,3 +394,450 @@ def test_execution_backed_proxy_api_is_removed():
     assert not hasattr(proxy_module, "PythonReferenceEvaluator")
     assert not hasattr(proxy_module, "EvaluatorBackedHumanProxyAgent")
     assert not hasattr(AgentSystem, "_human_comparison_cases")
+
+
+@pytest.mark.parametrize("field", ["message", "outcome"])
+def test_model_proxy_rejects_normalized_long_private_spans_before_return(
+    tmp_path, field
+):
+    secret = (
+        "PRIVATE CHECKER CONTRACT: candidates must satisfy the exact hidden "
+        "matrix dimensions, sentinel ordering, nonce derivation, and rejection "
+        "branches recorded only in this accepted final evaluator package. "
+    )
+    context = f"Evaluator overview.\n{secret}\nKnown issues."
+    leaked = "  \n".join(secret.upper().split(" "))
+    payload = {
+        "message": "Here is high-level guidance.",
+        "action": "continue",
+        "outcome": None,
+    }
+    if field == "message":
+        payload["message"] = leaked
+    else:
+        payload["action"] = "request_close"
+        payload["outcome"] = {
+            "decision": "guide",
+            "human_guidance": [leaked],
+        }
+    runner = RecordingRunner([payload])
+    agent = ModelBackedHumanProxyAgent(
+        evaluator_context=context,
+        gateway=GatewayConfig(codex_home=tmp_path / "codex-home"),
+        agent_elf=tmp_path / "codex",
+        runner=runner,
+    )
+
+    conversation = agent.start_conversation(purpose="verifier_change")
+
+    with pytest.raises(RuntimeError) as caught:
+        conversation.next_turn(session=_session(), transcript=[])
+    assert str(caught.value) == "HUMAN_PROXY_E_PRIVATE_CONTEXT_LEAK"
+
+
+def test_private_context_scan_recurses_and_allows_high_level_semantic_advice():
+    secret = (
+        "The accepted private evaluator checks exact payload framing, rejects "
+        "ambiguous numeric encodings, validates every hidden sentinel, and binds "
+        "the benchmark seed to a protected campaign-specific nonce before scoring."
+    )
+
+    safe = scan_private_context_leaks(
+        {
+            "message": "Add probes for malformed payloads and seed leakage.",
+            "outcome": {"human_guidance": ["Separate correctness from speed."]},
+        },
+        secret,
+    )
+    unsafe = scan_private_context_leaks(
+        {"outcome": {"nested": [{"guidance": f"prefix {secret} suffix"}]}},
+        secret,
+    )
+
+    assert safe == []
+    assert len(unsafe) == 1
+    assert unsafe[0].matched_characters == 160
+
+
+def _long_private_contract() -> str:
+    return (
+        "Candidate framing must match every protected dimension and sentinel; "
+        "numeric encodings are canonicalized before the hidden campaign nonce "
+        "binds the deterministic benchmark seed to the accepted evaluator. "
+        "Malformed payload branches fail closed before any performance score."
+    )
+
+
+@pytest.mark.parametrize("separator", ["", " "])
+def test_private_context_scan_catches_a_span_split_across_nested_leaves(separator):
+    secret = _long_private_contract()
+    chunks = [secret[index : index + 48] for index in range(0, len(secret), 48)]
+    payload = {
+        "message": chunks[0],
+        "outcome": {"guidance": [{"part": chunk} for chunk in chunks[1:]]},
+    }
+    if separator:
+        secret = separator.join(chunks)
+
+    findings = scan_private_context_leaks(payload, secret)
+
+    assert findings
+
+
+def test_private_context_scan_catches_zero_width_and_punctuation_insertion():
+    secret = _long_private_contract()
+    obfuscated = "\u200b!".join(secret)
+
+    findings = scan_private_context_leaks({"message": obfuscated}, secret)
+
+    assert findings
+
+
+@pytest.mark.parametrize("encoding", ["hex", "base64"])
+def test_private_context_scan_decodes_encoded_spans_split_across_leaves(encoding):
+    secret = _long_private_contract()
+    raw = secret.encode("utf-8")
+    encoded = raw.hex() if encoding == "hex" else base64.b64encode(raw).decode()
+    chunks = [encoded[index : index + 52] for index in range(0, len(encoded), 52)]
+    payload = {
+        "message": "safe high-level advice",
+        "action": "request_close",
+        "outcome": {"decision": "guide", "human_guidance": chunks},
+    }
+
+    findings = scan_private_context_leaks(payload, secret)
+
+    assert findings
+
+
+def test_private_context_scan_decodes_unpadded_urlsafe_base64_subtree():
+    secret = _long_private_contract()
+    encoded = base64.urlsafe_b64encode(secret.encode()).decode().rstrip("=")
+    chunks = [encoded[index : index + 47] for index in range(0, len(encoded), 47)]
+    payload = {
+        "message": "safe",
+        "action": "request_close",
+        "outcome": {"decision": "guide", "human_guidance": chunks},
+    }
+
+    findings = scan_private_context_leaks(payload, secret)
+
+    assert findings
+
+
+@pytest.mark.parametrize("chunk_size", [1, 7, 15])
+@pytest.mark.parametrize("encoding", ["hex", "base64", "urlsafe"])
+def test_private_context_scan_decodes_short_encoded_chunks_in_one_container(
+    encoding, chunk_size
+):
+    secret = _long_private_contract()
+    if encoding == "hex":
+        encoded = secret.encode().hex()
+    elif encoding == "base64":
+        encoded = base64.b64encode(secret.encode()).decode()
+    else:
+        encoded = base64.urlsafe_b64encode(secret.encode()).decode().rstrip("=")
+    chunks = [
+        encoded[index : index + chunk_size]
+        for index in range(0, len(encoded), chunk_size)
+    ]
+    payload = {
+        "message": "safe high-level advice",
+        "action": "request_close",
+        "outcome": {"decision": "guide", "human_guidance": chunks},
+    }
+
+    findings = scan_private_context_leaks(payload, secret)
+
+    assert findings
+
+
+@pytest.mark.parametrize("encoding", ["hex", "base64", "urlsafe"])
+def test_private_context_scan_decodes_one_char_chunks_across_outcome_lists(encoding):
+    secret = _long_private_contract()
+    if encoding == "hex":
+        encoded = secret.encode().hex()
+    elif encoding == "base64":
+        encoded = base64.b64encode(secret.encode()).decode()
+    else:
+        encoded = base64.urlsafe_b64encode(secret.encode()).decode().rstrip("=")
+    fields = (
+        "task_contract_updates",
+        "new_risks",
+        "approved_changes",
+        "rejected_changes",
+        "human_guidance",
+        "evidence_requested",
+        "evidence_generated",
+        "unresolved_questions",
+    )
+    boundaries = [len(encoded) * index // len(fields) for index in range(9)]
+    outcome = {"decision": "guide"}
+    for index, field in enumerate(fields):
+        outcome[field] = list(encoded[boundaries[index] : boundaries[index + 1]])
+    payload = {
+        "message": "safe high-level advice",
+        "action": "request_close",
+        "outcome": outcome,
+    }
+
+    findings = scan_private_context_leaks(payload, secret)
+
+    assert findings
+
+
+def test_model_proxy_does_not_echo_runner_note_or_stderr(tmp_path):
+    secret_note = "PRIVATE_NOTE_FROM_UNTRUSTED_AGENT"
+    secret_stderr = "PRIVATE_STDERR_FROM_UNTRUSTED_AGENT"
+
+    def failed_runner(*args, **kwargs):
+        return AgentSession(
+            ok=False,
+            returncode=1,
+            stdout="",
+            stderr=secret_stderr,
+            note=secret_note,
+        )
+
+    agent = ModelBackedHumanProxyAgent(
+        evaluator_context=_long_private_contract(),
+        gateway=GatewayConfig(codex_home=tmp_path / "codex-home"),
+        agent_elf=tmp_path / "codex",
+        runner=failed_runner,
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        agent.start_conversation(purpose="verifier_change").next_turn(
+            session=_session(), transcript=[]
+        )
+
+    assert str(caught.value) == "HUMAN_PROXY_E_RUN_FAILED"
+    assert secret_note not in repr(caught.value)
+    assert secret_stderr not in repr(caught.value)
+
+
+def test_model_proxy_maps_a_runner_exception_to_a_fixed_safe_code(tmp_path):
+    secret = "PRIVATE_EXCEPTION_FROM_UNTRUSTED_RUNNER"
+
+    def exploding_runner(*args, **kwargs):
+        raise RuntimeError(secret)
+
+    agent = ModelBackedHumanProxyAgent(
+        evaluator_context=_long_private_contract(),
+        gateway=GatewayConfig(codex_home=tmp_path / "codex-home"),
+        agent_elf=tmp_path / "codex",
+        runner=exploding_runner,
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        agent.start_conversation(purpose="verifier_change").next_turn(
+            session=_session(), transcript=[]
+        )
+
+    assert str(caught.value) == "HUMAN_PROXY_E_RUN_FAILED"
+    assert secret not in repr(caught.value)
+    rendered = "".join(
+        traceback.format_exception(caught.type, caught.value, caught.tb)
+    )
+    assert secret not in rendered
+
+
+def test_model_proxy_maps_pathologically_nested_json_to_a_fixed_safe_code(tmp_path):
+    class NestedJsonRunner:
+        def __call__(self, workspace, prompt, **kwargs):
+            (workspace / "turn.json").write_text("[" * 2000 + "]" * 2000)
+            return AgentSession(ok=True, returncode=0, stdout="", stderr="")
+
+    agent = ModelBackedHumanProxyAgent(
+        evaluator_context=_long_private_contract(),
+        gateway=GatewayConfig(codex_home=tmp_path / "codex-home"),
+        agent_elf=tmp_path / "codex",
+        runner=NestedJsonRunner(),
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        agent.start_conversation(purpose="verifier_change").next_turn(
+            session=_session(), transcript=[]
+        )
+
+    assert str(caught.value) == "HUMAN_PROXY_E_TURN_INVALID"
+
+
+@pytest.mark.parametrize("depth", [100, 800])
+def test_private_scan_is_bounded_and_fast_for_deep_200kb_payload(depth):
+    payload = "x" * 200_000
+    for _ in range(depth):
+        payload = {"nested": [payload]}
+
+    started = time.monotonic()
+    findings = scan_private_context_leaks(payload, _long_private_contract())
+    elapsed = time.monotonic() - started
+
+    assert findings == []
+    assert elapsed < 2.0
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [f"leaf-{index}" for index in range(20_000)],
+        "x" * 2_100_000,
+    ],
+    ids=["candidate-count", "candidate-characters"],
+)
+def test_private_scan_fails_closed_when_candidate_budget_is_exceeded(payload):
+    with pytest.raises(RuntimeError) as caught:
+        assert_no_private_context_leak(payload, _long_private_contract())
+
+    assert str(caught.value) == "HUMAN_PROXY_E_PRIVATE_CONTEXT_LEAK"
+
+
+def test_model_proxy_suppresses_untrusted_json_parser_exception_chain(
+    tmp_path, monkeypatch
+):
+    from coscientist.coevo import human_proxy_sessions as proxy_module
+
+    canary = "PRIVATE_JSON_EXCEPTION_CANARY"
+    runner = RecordingRunner(
+        [{"message": "safe", "action": "continue", "outcome": None}]
+    )
+    agent = ModelBackedHumanProxyAgent(
+        evaluator_context=_long_private_contract(),
+        gateway=GatewayConfig(codex_home=tmp_path / "codex-home"),
+        agent_elf=tmp_path / "codex",
+        runner=runner,
+    )
+
+    def explode_json(*args, **kwargs):
+        raise RuntimeError(canary)
+
+    monkeypatch.setattr(proxy_module.json, "loads", explode_json)
+
+    with pytest.raises(RuntimeError) as caught:
+        agent.start_conversation(purpose="verifier_change").next_turn(
+            session=_session(), transcript=[]
+        )
+
+    rendered = "".join(
+        traceback.format_exception(caught.type, caught.value, caught.tb)
+    )
+    assert str(caught.value) == "HUMAN_PROXY_E_TURN_INVALID"
+    assert canary not in rendered
+
+
+def test_model_proxy_suppresses_session_outcome_parser_exception_chain(
+    tmp_path, monkeypatch
+):
+    canary = "PRIVATE_OUTCOME_EXCEPTION_CANARY"
+    runner = RecordingRunner(
+        [
+            {
+                "message": "safe",
+                "action": "request_close",
+                "outcome": {"decision": "guide"},
+            }
+        ]
+    )
+    agent = ModelBackedHumanProxyAgent(
+        evaluator_context=_long_private_contract(),
+        gateway=GatewayConfig(codex_home=tmp_path / "codex-home"),
+        agent_elf=tmp_path / "codex",
+        runner=runner,
+    )
+
+    def explode_outcome(cls, payload):
+        raise RuntimeError(canary)
+
+    monkeypatch.setattr(SessionOutcome, "from_dict", classmethod(explode_outcome))
+
+    with pytest.raises(RuntimeError) as caught:
+        agent.start_conversation(purpose="verifier_change").next_turn(
+            session=_session(), transcript=[]
+        )
+
+    rendered = "".join(
+        traceback.format_exception(caught.type, caught.value, caught.tb)
+    )
+    assert str(caught.value) == "HUMAN_PROXY_E_TURN_INVALID"
+    assert canary not in rendered
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_code"),
+    [
+        (
+            {"message": "safe", "action": "PRIVATE_INVALID_ACTION", "outcome": None},
+            "HUMAN_PROXY_E_TURN_INVALID",
+        ),
+        (
+            {"message": "safe", "action": "continue", "outcome": {"decision": []}},
+            "HUMAN_PROXY_E_TURN_INVALID",
+        ),
+    ],
+)
+def test_model_proxy_turn_validation_uses_only_fixed_safe_codes(
+    tmp_path, payload, expected_code
+):
+    runner = RecordingRunner([payload])
+    agent = ModelBackedHumanProxyAgent(
+        evaluator_context=_long_private_contract(),
+        gateway=GatewayConfig(codex_home=tmp_path / "codex-home"),
+        agent_elf=tmp_path / "codex",
+        runner=runner,
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        agent.start_conversation(purpose="verifier_change").next_turn(
+            session=_session(), transcript=[]
+        )
+
+    assert str(caught.value) == expected_code
+    assert "PRIVATE_INVALID_ACTION" not in repr(caught.value)
+
+
+def test_model_proxy_leak_error_does_not_echo_untrusted_json_key_or_location(tmp_path):
+    secret = _long_private_contract()
+    untrusted_key = "PRIVATE_ATTACKER_CHOSEN_KEY"
+    runner = RecordingRunner(
+        [
+            {
+                "message": "safe",
+                "action": "continue",
+                "outcome": {untrusted_key: secret},
+            }
+        ]
+    )
+    agent = ModelBackedHumanProxyAgent(
+        evaluator_context=secret,
+        gateway=GatewayConfig(codex_home=tmp_path / "codex-home"),
+        agent_elf=tmp_path / "codex",
+        runner=runner,
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        agent.start_conversation(purpose="verifier_change").next_turn(
+            session=_session(), transcript=[]
+        )
+
+    assert str(caught.value) == "HUMAN_PROXY_E_PRIVATE_CONTEXT_LEAK"
+    assert untrusted_key not in repr(caught.value)
+
+
+def test_model_proxy_refuses_oversized_turn_before_reading_json(tmp_path):
+    oversized = "x" * 300_000
+    runner = RecordingRunner(
+        [{"message": oversized, "action": "continue", "outcome": None}]
+    )
+    agent = ModelBackedHumanProxyAgent(
+        evaluator_context=_long_private_contract(),
+        gateway=GatewayConfig(codex_home=tmp_path / "codex-home"),
+        agent_elf=tmp_path / "codex",
+        runner=runner,
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        agent.start_conversation(purpose="verifier_change").next_turn(
+            session=_session(), transcript=[]
+        )
+
+    assert str(caught.value) == "HUMAN_PROXY_E_TURN_TOO_LARGE"

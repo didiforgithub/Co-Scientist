@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import traceback
 
 import pytest
 
@@ -188,8 +189,13 @@ def test_proxy_failure_pauses_and_resume_reuses_same_session(tmp_path):
     agent = FailOnceAgent()
     port, store, _ = _port(tmp_path, agent)
 
-    with pytest.raises(RuntimeError, match="Human Proxy driver failed"):
+    with pytest.raises(RuntimeError) as caught:
         port.consult(purpose="verifier_change", context={})
+    assert str(caught.value) == "HUMAN_PROXY_E_DRIVER_FAILED"
+    rendered = "".join(
+        traceback.format_exception(caught.type, caught.value, caught.tb)
+    )
+    assert "synthetic model failure" not in rendered
 
     assert store.sessions()[0].state is SessionState.PAUSED
     assert store.opened_count == 1
@@ -207,15 +213,17 @@ def test_proxy_watchdog_pauses_one_consult_without_spending_another_session(
 ):
     port, store, _ = _port(tmp_path, EndlessAgent(), max_turns=2)
 
-    with pytest.raises(RuntimeError, match="watchdog reached 2 turns"):
+    with pytest.raises(RuntimeError) as caught:
         port.consult(purpose="verifier_change", context={})
+    assert str(caught.value) == "HUMAN_PROXY_E_DRIVER_FAILED"
 
     assert store.sessions()[0].state is SessionState.PAUSED
     assert store.opened_count == 1
     first_length = len(store.transcript("session_001"))
 
-    with pytest.raises(RuntimeError, match="watchdog reached 2 turns"):
+    with pytest.raises(RuntimeError) as caught:
         port.consult(purpose="verifier_change", context={})
+    assert str(caught.value) == "HUMAN_PROXY_E_DRIVER_FAILED"
 
     assert store.sessions()[0].state is SessionState.PAUSED
     assert store.opened_count == 1

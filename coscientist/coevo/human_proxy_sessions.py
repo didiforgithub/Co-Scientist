@@ -6,12 +6,17 @@ evaluator callable, solution runner, Solver workspace, or GPU environment.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import os
+import re
+import stat
 import tempfile
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Iterable, Iterator, Protocol
 
 from .container import AgentSession, GatewayConfig, one_shot_agent
 from .feishu_human import FeishuHumanSessionService
@@ -58,6 +63,221 @@ class HumanProxyAgent(Protocol):
 
 
 ProxyRunner = Callable[..., AgentSession]
+MAX_TURN_JSON_BYTES = 256 * 1024
+
+HUMAN_PROXY_E_RUN_FAILED = "HUMAN_PROXY_E_RUN_FAILED"
+HUMAN_PROXY_E_TURN_MISSING = "HUMAN_PROXY_E_TURN_MISSING"
+HUMAN_PROXY_E_TURN_TOO_LARGE = "HUMAN_PROXY_E_TURN_TOO_LARGE"
+HUMAN_PROXY_E_TURN_INVALID = "HUMAN_PROXY_E_TURN_INVALID"
+HUMAN_PROXY_E_PRIVATE_CONTEXT_LEAK = "HUMAN_PROXY_E_PRIVATE_CONTEXT_LEAK"
+HUMAN_PROXY_E_DRIVER_FAILED = "HUMAN_PROXY_E_DRIVER_FAILED"
+MAX_PRIVACY_LEAVES = 10_000
+MAX_PRIVACY_NODES = 100_000
+MAX_PRIVACY_CANDIDATES = 10_000
+MAX_PRIVACY_CANDIDATE_CHARACTERS = 1_000_000
+
+
+@dataclass(frozen=True)
+class PrivateContextLeak:
+    """Location of a forbidden private-context span, without echoing the secret."""
+
+    location: str
+    matched_characters: int
+
+
+def _normalized_private_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return "".join(character for character in normalized if character.isalnum())
+
+
+def _collect_payload_leaves(value: Any) -> tuple[list[str], list[str], bool]:
+    leaves = []
+    container_encoded_aggregates = []
+    leaf_characters = 0
+    aggregate_characters = 0
+    nodes = 0
+    stack = [value]
+    while stack:
+        current = stack.pop()
+        nodes += 1
+        if nodes > MAX_PRIVACY_NODES:
+            return leaves, container_encoded_aggregates, True
+        if isinstance(current, str):
+            leaves.append(current)
+            leaf_characters += len(current)
+            if (
+                len(leaves) > MAX_PRIVACY_LEAVES
+                or leaf_characters > MAX_PRIVACY_CANDIDATE_CHARACTERS
+            ):
+                return leaves, container_encoded_aggregates, True
+        elif isinstance(current, dict):
+            stack.extend(reversed(tuple(current.values())))
+        elif isinstance(current, (list, tuple)):
+            if len(current) > MAX_PRIVACY_LEAVES:
+                return leaves, container_encoded_aggregates, True
+            if len(current) >= 2 and all(
+                isinstance(child, str)
+                and bool(child)
+                and re.fullmatch(r"[A-Za-z0-9+/_=-]+", child) is not None
+                for child in current
+            ):
+                container_size = sum(len(child) for child in current)
+                aggregate_characters += container_size
+                if aggregate_characters > MAX_PRIVACY_CANDIDATE_CHARACTERS:
+                    return leaves, container_encoded_aggregates, True
+                container_encoded_aggregates.append("".join(current))
+            stack.extend(reversed(current))
+    return leaves, container_encoded_aggregates, False
+
+
+def _decoded_text_candidates(value: str) -> Iterator[str]:
+    compact = "".join(value.split())
+    if len(compact) >= 2 and len(compact) % 2 == 0 and re.fullmatch(
+        r"[0-9a-fA-F]+", compact
+    ):
+        try:
+            yield bytes.fromhex(compact).decode("utf-8")
+        except (UnicodeDecodeError, ValueError):
+            pass
+    if len(compact) >= 4 and re.fullmatch(r"[A-Za-z0-9+/_-]*={0,2}", compact):
+        try:
+            padded = compact + "=" * (-len(compact) % 4)
+            yield base64.b64decode(
+                padded, altchars=b"-_", validate=True
+            ).decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError, ValueError):
+            pass
+
+
+def scan_private_context_leaks(
+    payload: Any,
+    private_context: str,
+    *,
+    min_span_characters: int = 160,
+    forbidden_literals: Iterable[str] = (),
+) -> list[PrivateContextLeak]:
+    """Find normalized verbatim context spans in nested model or audit payloads.
+
+    The return value intentionally identifies only the payload location and span
+    length, so logging a finding cannot itself disclose private evaluator text.
+    Short exact literals (for example host context paths) can be supplied by a
+    later filesystem audit through ``forbidden_literals``.
+    """
+
+    if min_span_characters < 1:
+        raise ValueError("min_span_characters must be positive")
+    normalized_private = _normalized_private_text(private_context)
+    normalized_literals = tuple(
+        normalized
+        for literal in forbidden_literals
+        if (normalized := _normalized_private_text(literal))
+    )
+    leaves, container_encoded_aggregates, exceeded = _collect_payload_leaves(payload)
+    if exceeded:
+        return [PrivateContextLeak(location="budget", matched_characters=0)]
+
+    candidates: list[tuple[str, str]] = []
+    normalized_seen = set()
+    candidate_characters = 0
+
+    def add_candidate(location: str, raw_text: str) -> bool:
+        nonlocal candidate_characters
+        normalized = _normalized_private_text(raw_text)
+        if not normalized or normalized in normalized_seen:
+            return True
+        normalized_seen.add(normalized)
+        candidate_characters += len(raw_text)
+        if (
+            len(candidates) >= MAX_PRIVACY_CANDIDATES
+            or candidate_characters > MAX_PRIVACY_CANDIDATE_CHARACTERS
+        ):
+            return False
+        candidates.append((location, raw_text))
+        return True
+
+    for leaf in leaves:
+        if not add_candidate("leaf", leaf):
+            return [PrivateContextLeak(location="budget", matched_characters=0)]
+    if len(leaves) > 1:
+        for aggregate in ("".join(leaves), " ".join(leaves)):
+            if not add_candidate("root_aggregate", aggregate):
+                return [PrivateContextLeak(location="budget", matched_characters=0)]
+        encoded_leaves = [
+            leaf
+            for leaf in leaves
+            if len(leaf) >= 16
+            and re.fullmatch(r"[A-Za-z0-9+/_=-]+", leaf)
+        ]
+        if len(encoded_leaves) > 1 and not add_candidate(
+            "root_encoded_aggregate", "".join(encoded_leaves)
+        ):
+            return [PrivateContextLeak(location="budget", matched_characters=0)]
+    for aggregate in container_encoded_aggregates:
+        if not add_candidate("container_encoded_aggregate", aggregate):
+            return [PrivateContextLeak(location="budget", matched_characters=0)]
+    if len(container_encoded_aggregates) > 1 and not add_candidate(
+        "global_encoded_container_aggregate",
+        "".join(container_encoded_aggregates),
+    ):
+        return [PrivateContextLeak(location="budget", matched_characters=0)]
+
+    encoded_sources = tuple(candidates)
+    for _location, raw_text in encoded_sources:
+        for decoded in _decoded_text_candidates(raw_text):
+            if not add_candidate("decoded", decoded):
+                return [PrivateContextLeak(location="budget", matched_characters=0)]
+
+    if len(normalized_private) >= min_span_characters:
+        private_windows = {
+            normalized_private[start : start + min_span_characters]
+            for start in range(len(normalized_private) - min_span_characters + 1)
+        }
+    else:
+        private_windows = set()
+    for location, raw_text in candidates:
+        normalized = _normalized_private_text(raw_text)
+        matched = 0
+        if len(normalized) >= min_span_characters and any(
+            normalized[start : start + min_span_characters] in private_windows
+            for start in range(len(normalized) - min_span_characters + 1)
+        ):
+            matched = min_span_characters
+        if not matched:
+            matched = max(
+                (
+                    len(literal)
+                    for literal in normalized_literals
+                    if literal in normalized
+                ),
+                default=0,
+            )
+        if matched:
+            return [
+                PrivateContextLeak(
+                    location=location,
+                    matched_characters=matched,
+                )
+            ]
+    return []
+
+
+def assert_no_private_context_leak(
+    payload: Any,
+    private_context: str,
+    *,
+    min_span_characters: int = 160,
+    forbidden_literals: Iterable[str] = (),
+) -> None:
+    """Reject a payload without including private text in the exception."""
+
+    findings = scan_private_context_leaks(
+        payload,
+        private_context,
+        min_span_characters=min_span_characters,
+        forbidden_literals=forbidden_literals,
+    )
+    if findings:
+        raise RuntimeError(HUMAN_PROXY_E_PRIVATE_CONTEXT_LEAK) from None
 
 
 @dataclass
@@ -133,23 +353,51 @@ class ModelBackedHumanProxyAgent:
                 ),
                 encoding="utf-8",
             )
-            result = self._run(
-                workspace,
-                self._prompt(purpose=purpose, state=session.state),
-            )
-            if not result.ok:
-                raise RuntimeError(
-                    "Human Proxy model turn failed: "
-                    f"{result.note or result.stderr[-200:]}"
-                )
-            turn_path = workspace / "turn.json"
-            if not turn_path.is_file():
-                raise RuntimeError("Human Proxy model did not write turn.json")
             try:
-                payload = json.loads(turn_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError as exc:
-                raise RuntimeError("Human Proxy model wrote invalid turn.json") from exc
-        return self._parse_turn(payload, state=session.state)
+                result = self._run(
+                    workspace,
+                    self._prompt(purpose=purpose, state=session.state),
+                )
+            except Exception:
+                raise RuntimeError(HUMAN_PROXY_E_RUN_FAILED) from None
+            if not result.ok:
+                raise RuntimeError(HUMAN_PROXY_E_RUN_FAILED) from None
+            turn_path = workspace / "turn.json"
+            try:
+                turn_stat = turn_path.lstat()
+            except OSError:
+                raise RuntimeError(HUMAN_PROXY_E_TURN_MISSING) from None
+            if stat.S_ISLNK(turn_stat.st_mode) or not stat.S_ISREG(turn_stat.st_mode):
+                raise RuntimeError(HUMAN_PROXY_E_TURN_INVALID) from None
+            if turn_stat.st_size > MAX_TURN_JSON_BYTES:
+                raise RuntimeError(HUMAN_PROXY_E_TURN_TOO_LARGE) from None
+            try:
+                with turn_path.open("rb") as stream:
+                    turn_raw = stream.read(MAX_TURN_JSON_BYTES + 1)
+            except OSError:
+                raise RuntimeError(HUMAN_PROXY_E_TURN_INVALID) from None
+            if len(turn_raw) > MAX_TURN_JSON_BYTES:
+                raise RuntimeError(HUMAN_PROXY_E_TURN_TOO_LARGE) from None
+            try:
+                payload = json.loads(turn_raw.decode("utf-8"))
+            except Exception:
+                raise RuntimeError(HUMAN_PROXY_E_TURN_INVALID) from None
+            try:
+                assert_no_private_context_leak(payload, self.evaluator_context)
+            except RuntimeError as exc:
+                if str(exc) == HUMAN_PROXY_E_PRIVATE_CONTEXT_LEAK:
+                    raise RuntimeError(HUMAN_PROXY_E_PRIVATE_CONTEXT_LEAK) from None
+                raise RuntimeError(HUMAN_PROXY_E_TURN_INVALID) from None
+            except Exception:
+                raise RuntimeError(HUMAN_PROXY_E_TURN_INVALID) from None
+        try:
+            return self._parse_turn(payload, state=session.state)
+        except RuntimeError as exc:
+            if str(exc) == HUMAN_PROXY_E_TURN_INVALID:
+                raise RuntimeError(HUMAN_PROXY_E_TURN_INVALID) from None
+            raise RuntimeError(HUMAN_PROXY_E_TURN_INVALID) from None
+        except Exception:
+            raise RuntimeError(HUMAN_PROXY_E_TURN_INVALID) from None
 
     def _run(self, workspace: Path, prompt: str) -> AgentSession:
         if self.runner is not None:
@@ -208,19 +456,30 @@ decision 只能是 approve/reject/guide/none。它必须来自本轮对话中的
     @staticmethod
     def _parse_turn(payload: Any, *, state: SessionState) -> HumanProxyTurn:
         if not isinstance(payload, dict):
-            raise RuntimeError("Human Proxy turn must be a JSON object")
-        message = str(payload.get("message", "")).strip()
+            raise RuntimeError(HUMAN_PROXY_E_TURN_INVALID) from None
+        raw_message = payload.get("message")
+        if not isinstance(raw_message, str):
+            raise RuntimeError(HUMAN_PROXY_E_TURN_INVALID) from None
+        message = raw_message.strip()
         if not message:
-            raise RuntimeError("Human Proxy turn is missing message")
-        action = str(payload.get("action", "continue")).strip().lower()
+            raise RuntimeError(HUMAN_PROXY_E_TURN_INVALID) from None
+        raw_action = payload.get("action", "continue")
+        if not isinstance(raw_action, str):
+            raise RuntimeError(HUMAN_PROXY_E_TURN_INVALID) from None
+        action = raw_action.strip().lower()
         if action not in {"continue", "request_close", "confirm_close", "keep_open"}:
-            raise RuntimeError(f"unsupported Human Proxy action: {action}")
+            raise RuntimeError(HUMAN_PROXY_E_TURN_INVALID) from None
         raw_outcome = payload.get("outcome")
-        outcome = (
-            SessionOutcome.from_dict(raw_outcome)
-            if isinstance(raw_outcome, dict)
-            else None
-        )
+        if raw_outcome is not None and not isinstance(raw_outcome, dict):
+            raise RuntimeError(HUMAN_PROXY_E_TURN_INVALID) from None
+        try:
+            outcome = (
+                SessionOutcome.from_dict(raw_outcome)
+                if isinstance(raw_outcome, dict)
+                else None
+            )
+        except Exception:
+            raise RuntimeError(HUMAN_PROXY_E_TURN_INVALID) from None
         if outcome is not None:
             decision = outcome.decision
             if not isinstance(decision, str) or decision.strip().lower() not in {
@@ -229,22 +488,36 @@ decision 只能是 approve/reject/guide/none。它必须来自本轮对话中的
                 "guide",
                 "none",
             }:
-                raise RuntimeError(
-                    f"unsupported Human Proxy decision: {decision!r}"
-                )
+                raise RuntimeError(HUMAN_PROXY_E_TURN_INVALID) from None
+            list_fields = (
+                outcome.task_contract_updates,
+                outcome.new_risks,
+                outcome.approved_changes,
+                outcome.rejected_changes,
+                outcome.human_guidance,
+                outcome.evidence_requested,
+                outcome.evidence_generated,
+                outcome.unresolved_questions,
+            )
+            if any(
+                not isinstance(items, list)
+                or any(not isinstance(item, str) for item in items)
+                for items in list_fields
+            ) or not isinstance(outcome.human_rationale, str):
+                raise RuntimeError(HUMAN_PROXY_E_TURN_INVALID) from None
         if action in {"request_close", "confirm_close"} and outcome is None:
-            raise RuntimeError(f"Human Proxy {action} requires an outcome")
+            raise RuntimeError(HUMAN_PROXY_E_TURN_INVALID) from None
         if state is SessionState.CLOSE_REQUESTED and action != "confirm_close":
             # The expert is still revising the discussion.  Do not expose or freeze a
             # provisional judgement until it explicitly confirms the final summary.
             outcome = None
         if action == "confirm_close":
             if state is not SessionState.CLOSE_REQUESTED:
-                raise RuntimeError("Human Proxy can confirm only a requested close")
+                raise RuntimeError(HUMAN_PROXY_E_TURN_INVALID) from None
             return HumanProxyTurn("确认结束", outcome=outcome)
         if action == "keep_open":
             if state is not SessionState.CLOSE_REQUESTED:
-                raise RuntimeError("Human Proxy can keep open only after a close request")
+                raise RuntimeError(HUMAN_PROXY_E_TURN_INVALID) from None
             if "继续聊" not in message:
                 message = f"继续聊：{message}"
             return HumanProxyTurn(message, outcome=outcome)
@@ -351,11 +624,11 @@ class HumanProxySessionPort:
                 if not handled:
                     raise RuntimeError("Human Proxy turn was rejected by the service")
                 driven_turns += 1
-        except Exception as exc:
+        except Exception:
             current = self.service.store.get(session.session_id)
             if current.state is not SessionState.CLOSED:
                 self.service.store.pause(session.session_id)
-            raise RuntimeError(f"Human Proxy driver failed: {exc}") from exc
+            raise RuntimeError(HUMAN_PROXY_E_DRIVER_FAILED) from None
         return self.service.store.outcome(session.session_id)
 
     def _proxy_state_path(self, session_id: str) -> Path:
