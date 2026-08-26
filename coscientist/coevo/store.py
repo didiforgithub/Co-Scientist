@@ -31,6 +31,8 @@ injectable clock so it stamps the same wall-clock the Deadline uses.
 from __future__ import annotations
 
 import json
+import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -69,6 +71,43 @@ class RunStore:
         for sub in ("solver/candidates", "supervisor/verifier_versions",
                     "supervisor/probes", "eval"):
             (self.root / sub).mkdir(parents=True, exist_ok=True)
+        self._candidate_seq = self._next_sequence(
+            self.root / "solver" / "candidates", r"cand_(\d+)\.json"
+        )
+        self._probe_seq = self._next_sequence(
+            self.root / "supervisor" / "probes", r"probe_(\d+)\.json"
+        )
+
+    @staticmethod
+    def _next_sequence(directory: Path, pattern: str) -> int:
+        matcher = re.compile(pattern).fullmatch
+        suffixes = (
+            int(match.group(1))
+            for path in directory.iterdir()
+            if path.is_file() and (match := matcher(path.name)) is not None
+        )
+        return max(suffixes, default=-1) + 1
+
+    def _reserve_sequence_file(
+        self, *, directory: Path, prefix: str, width: int, sequence_attr: str
+    ) -> tuple[str, Path, int]:
+        """Atomically reserve a never-before-used id across RunStore instances."""
+
+        while True:
+            with self._lock:
+                sequence = int(getattr(self, sequence_attr))
+                setattr(self, sequence_attr, sequence + 1)
+            identifier = f"{prefix}_{sequence:0{width}d}"
+            path = directory / f"{identifier}.json"
+            try:
+                descriptor = os.open(
+                    path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o644,
+                )
+            except FileExistsError:
+                continue
+            return identifier, path, descriptor
 
     # -- time -------------------------------------------------------------
     def t(self) -> float:
@@ -126,14 +165,23 @@ class RunStore:
 
     def candidate(self, payload: dict, feedback: dict, *, score: Optional[float]) -> str:
         """Persist a submitted solution + the feedback it received. Returns its id."""
-        with self._lock:
-            cid = f"cand_{self._candidate_seq:05d}"
-            self._candidate_seq += 1
-        (self.root / "solver" / "candidates" / f"{cid}.json").write_text(
-            json.dumps(_jsonable({"id": cid, "t": self.t(), "score": score,
-                                  "payload": payload, "feedback": feedback}), indent=2),
-            encoding="utf-8",
+        cid, path, descriptor = self._reserve_sequence_file(
+            directory=self.root / "solver" / "candidates",
+            prefix="cand",
+            width=5,
+            sequence_attr="_candidate_seq",
         )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump(
+                    _jsonable({"id": cid, "t": self.t(), "score": score,
+                               "payload": payload, "feedback": feedback}),
+                    stream,
+                    indent=2,
+                )
+        except Exception:
+            path.unlink(missing_ok=True)
+            raise
         return cid
 
     # -- supervisor channel ----------------------------------------------
@@ -160,15 +208,24 @@ class RunStore:
     def probe(self, *, description: str, payload: dict, score: Optional[float],
               expected_low: bool, fooled: bool) -> str:
         """Record a Supervisor red-team probe and whether V was fooled by it."""
-        with self._lock:
-            pid = f"probe_{self._probe_seq:04d}"
-            self._probe_seq += 1
-        (self.root / "supervisor" / "probes" / f"{pid}.json").write_text(
-            json.dumps(_jsonable({
-                "id": pid, "t": self.t(), "description": description,
-                "payload": payload, "score": score,
-                "expected_low": expected_low, "fooled": fooled,
-            }), indent=2),
-            encoding="utf-8",
+        pid, path, descriptor = self._reserve_sequence_file(
+            directory=self.root / "supervisor" / "probes",
+            prefix="probe",
+            width=4,
+            sequence_attr="_probe_seq",
         )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump(
+                    _jsonable({
+                        "id": pid, "t": self.t(), "description": description,
+                        "payload": payload, "score": score,
+                        "expected_low": expected_low, "fooled": fooled,
+                    }),
+                    stream,
+                    indent=2,
+                )
+        except Exception:
+            path.unlink(missing_ok=True)
+            raise
         return pid

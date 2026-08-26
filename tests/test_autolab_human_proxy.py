@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import stat
+import threading
 from pathlib import Path
 
 import pytest
@@ -12,8 +13,103 @@ from coscientist.experiments.autolab_human_proxy import (
     AUTOLAB_GROUPS,
     MAX_CONTEXT_CHARACTERS,
     audit_contexts,
+    audit_runs,
     prepare_contexts,
+    prepare_runs,
 )
+
+
+FROZEN_TAIL = '''## Frozen evaluation contract
+
+Your submission is evaluated only by this task's original shipped `tests/test.sh`.
+The evaluator returns `reward.json["reward"]` unchanged as the raw score; higher is better.
+The verifier is frozen at version 0 for this control run. No verifier hardening or
+Bootstrap-authored hidden checks will be added during the run.
+'''
+
+
+def _corrected_control_fixture(root: Path, problems_root: Path) -> Path:
+    root.mkdir()
+    problems_root.mkdir()
+    for tasks in AUTOLAB_GROUPS.values():
+        for task in tasks:
+            run = root / (
+                "autolab_shippedv0_control17_4h_v2_20260825"
+                f"__autolab_{task}"
+            )
+            bws = run / "bootstrap_ws"
+            vdir = run / "supervisor" / "verifier_versions"
+            checker = run / "checker"
+            bws.mkdir(parents=True)
+            vdir.mkdir(parents=True)
+            (checker / "tests").mkdir(parents=True)
+            (checker / "tests" / "test.sh").write_text(
+                f"#!/bin/sh\n# shipped weak test for {task}\n", encoding="utf-8"
+            )
+            (checker / "instruction.md").write_text(
+                f"task={task}\n", encoding="utf-8"
+            )
+            verifier = f"# mechanical shipped-V0 adapter for {task}\n"
+            (bws / "verifier.py").write_text(verifier, encoding="utf-8")
+            (vdir / "v0.py").write_text(verifier, encoding="utf-8")
+            (bws / "seed_solution.json").write_text(
+                json.dumps({"source": f"seed-{task}"}), encoding="utf-8"
+            )
+            (bws / "ctx.json").write_text(
+                json.dumps({"adapter": "AUTOLAB_SHIPPED_TEST_ADAPTER_V1"}),
+                encoding="utf-8",
+            )
+            (bws / "probes.json").write_text("[]\n", encoding="utf-8")
+            (bws / "solver_env.json").write_text("{}\n", encoding="utf-8")
+            (bws / "reframe_policy.json").write_text(
+                json.dumps({"admits_proof": False, "provable_claim": ""}),
+                encoding="utf-8",
+            )
+            (bws / "SOLVER_BRIEF.md").write_text(
+                f"# AutoLab task: {task}\n\nSolve it.\n\n{FROZEN_TAIL}",
+                encoding="utf-8",
+            )
+            (run / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "raw_input_dir": f"/stale/main/autolab_{task}",
+                        "initial_feedback_level": "with_artifacts",
+                        "initial_verifier_origin": "autolab_shipped_tests/test.sh",
+                        "initial_verifier_sha256": _sha256(vdir / "v0.py"),
+                        "original_test_sha256": _sha256(checker / "tests" / "test.sh"),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run / "events.jsonl").write_text(
+                '{"kind":"bootstrap_start"}\n{"kind":"run_stop"}\n',
+                encoding="utf-8",
+            )
+            (run / "supervisor" / "versions.jsonl").write_text(
+                '{"version":0,"origin":"old control"}\n', encoding="utf-8"
+            )
+            (run / "solver" / "candidates").mkdir(parents=True)
+            (run / "solver" / "candidates" / "cand_00000.json").write_text(
+                '{"payload":{"source":"old-result"}}', encoding="utf-8"
+            )
+            (run / "result.json").write_text('{"old":true}', encoding="utf-8")
+            problem = problems_root / f"autolab_{task}"
+            (problem / "tests").mkdir(parents=True)
+            (problem / "tests" / "test.sh").write_bytes(
+                (checker / "tests" / "test.sh").read_bytes()
+            )
+    return root
+
+
+def _private_context_text(task: str) -> str:
+    return (
+        f"PRIVATE FINAL EVALUATOR SECTION FOR {task}. "
+        + "This accepted verifier binds every hidden sentinel dimension and payload "
+        "branch to the protected deterministic benchmark contract, rejects malformed "
+        "numeric encodings before scoring, validates the task-specific correctness "
+        "oracle on held-out inputs, and prevents benchmark recognition shortcuts. "
+        "Only high-level semantic guidance may leave the Human Proxy boundary. "
+    )
 
 
 def _sha256(path: Path) -> str:
@@ -310,3 +406,634 @@ def test_audit_rejects_oversized_output_before_reading_it(tmp_path, monkeypatch)
 
     with pytest.raises(RuntimeError, match="size|large|mismatch"):
         audit_contexts(accepted, output)
+
+
+def test_prepare_runs_copies_only_authoritative_initial_state_and_rewrites_brief(
+    tmp_path,
+):
+    controls = _corrected_control_fixture(
+        tmp_path / "controls", tmp_path / "problems"
+    )
+    contexts = tmp_path / "private-contexts"
+    contexts.mkdir()
+    for tasks in AUTOLAB_GROUPS.values():
+        for task in tasks:
+            (contexts / f"autolab_{task}.md").write_text(
+                _private_context_text(task), encoding="utf-8"
+            )
+    runs = tmp_path / "runs"
+
+    summary = prepare_runs(
+        controls,
+        runs,
+        "autolab_hp_4h_test",
+        problems_root=tmp_path / "problems",
+    )
+
+    assert summary["task_count"] == 17
+    assert summary["status"] == "pass"
+    for tasks in AUTOLAB_GROUPS.values():
+        for task in tasks:
+            source = controls / (
+                "autolab_shippedv0_control17_4h_v2_20260825"
+                f"__autolab_{task}"
+            )
+            prepared = runs / f"autolab_hp_4h_test__autolab_{task}"
+            assert (prepared / "bootstrap_ws" / "verifier.py").read_bytes() == (
+                source / "bootstrap_ws" / "verifier.py"
+            ).read_bytes()
+            assert (prepared / "supervisor/verifier_versions/v0.py").read_bytes() == (
+                source / "supervisor/verifier_versions/v0.py"
+            ).read_bytes()
+            assert (prepared / "bootstrap_ws/seed_solution.json").read_bytes() == (
+                source / "bootstrap_ws/seed_solution.json"
+            ).read_bytes()
+            assert _tree_hash(prepared / "checker") == _tree_hash(source / "checker")
+            assert (prepared / "checker/tests/test.sh").read_bytes() == (
+                source / "checker/tests/test.sh"
+            ).read_bytes()
+            brief = (prepared / "bootstrap_ws/SOLVER_BRIEF.md").read_text()
+            assert brief.startswith(f"# AutoLab task: {task}\n")
+            assert "## Evolving evaluation contract" in brief
+            assert "Frozen evaluation contract" not in brief
+            assert "verifier hardening is enabled" in brief
+            manifest = json.loads((prepared / "manifest.json").read_text())
+            assert manifest["freeze_verifier"] is False
+            assert manifest["initial_verifier_origin"] == (
+                "autolab_shipped_tests/test.sh"
+            )
+            assert manifest["raw_input_dir"] == str(
+                (tmp_path / "problems" / f"autolab_{task}").resolve()
+            )
+            assert json.loads(
+                (prepared / "bootstrap_ws/reframe_policy.json").read_text()
+            )["admits_proof"] is False
+            event_kinds = [
+                json.loads(line)["kind"]
+                for line in (prepared / "events.jsonl").read_text().splitlines()
+            ]
+            assert event_kinds == ["shipped_verifier_preseed"]
+            assert not (prepared / "solver/candidates/cand_00000.json").exists()
+            assert not (prepared / "result.json").exists()
+
+    audited = audit_runs(
+        controls,
+        runs,
+        "autolab_hp_4h_test",
+        problems_root=tmp_path / "problems",
+        context_dir=contexts,
+    )
+    assert audited == {
+        "arm": "autolab_coevolve_human_proxy",
+        "batch_name": "autolab_hp_4h_test",
+        "status": "pass",
+        "task_count": 17,
+    }
+
+
+def test_prepare_runs_refuses_to_overwrite_any_existing_run(tmp_path):
+    controls = _corrected_control_fixture(
+        tmp_path / "controls", tmp_path / "problems"
+    )
+    runs = tmp_path / "runs"
+    collision = runs / "autolab_hp_4h_test__autolab_adaptive_compression"
+    collision.mkdir(parents=True)
+    sentinel = collision / "keep.txt"
+    sentinel.write_text("owned by user", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="refus|exist|overwrite"):
+        prepare_runs(
+            controls,
+            runs,
+            "autolab_hp_4h_test",
+            problems_root=tmp_path / "problems",
+        )
+
+    assert sentinel.read_text() == "owned by user"
+    assert len(list(runs.iterdir())) == 1
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "v0",
+        "checker",
+        "seed",
+        "bootstrap_event",
+        "frozen",
+        "proof",
+        "context_path",
+        "context_content",
+        "context_partial_normalized",
+        "oversized_text",
+    ],
+)
+def test_audit_runs_fails_closed_on_drift_or_private_context_leak(tmp_path, damage):
+    controls = _corrected_control_fixture(
+        tmp_path / "controls", tmp_path / "problems"
+    )
+    contexts = tmp_path / "private-contexts"
+    contexts.mkdir()
+    for tasks in AUTOLAB_GROUPS.values():
+        for task in tasks:
+            (contexts / f"autolab_{task}.md").write_text(
+                _private_context_text(task), encoding="utf-8"
+            )
+    runs = tmp_path / "runs"
+    batch = "autolab_hp_4h_test"
+    prepare_runs(controls, runs, batch, problems_root=tmp_path / "problems")
+    run = runs / f"{batch}__autolab_adaptive_compression"
+
+    if damage == "v0":
+        (run / "supervisor/verifier_versions/v0.py").write_text("changed")
+    elif damage == "checker":
+        (run / "checker/tests/test.sh").write_text("changed")
+    elif damage == "seed":
+        (run / "bootstrap_ws/seed_solution.json").write_text("{}")
+    elif damage == "bootstrap_event":
+        with (run / "events.jsonl").open("a") as stream:
+            stream.write('{"kind":"bootstrap_start"}\n')
+    elif damage == "frozen":
+        manifest = json.loads((run / "manifest.json").read_text())
+        manifest["freeze_verifier"] = True
+        (run / "manifest.json").write_text(json.dumps(manifest))
+    elif damage == "proof":
+        (run / "bootstrap_ws/reframe_policy.json").write_text(
+            json.dumps({"admits_proof": True})
+        )
+    elif damage == "context_path":
+        (run / "leak.txt").write_text(str(contexts.resolve()))
+    elif damage == "context_content":
+        (run / "leak.txt").write_bytes(
+            (contexts / "autolab_adaptive_compression.md").read_bytes()
+        )
+    elif damage == "context_partial_normalized":
+        private = (contexts / "autolab_adaptive_compression.md").read_text()
+        leaked_section = private[35:390].upper().replace(" ", " \n!! ")
+        (run / "leak.txt").write_text(leaked_section, encoding="utf-8")
+    else:
+        (run / "oversized.txt").write_text("x" * 4_100_000, encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="audit|mismatch|drift|bootstrap|frozen|proof|private|context"):
+        audit_runs(
+            controls,
+            runs,
+            batch,
+            problems_root=tmp_path / "problems",
+            context_dir=contexts,
+        )
+
+
+@pytest.mark.parametrize("damage", ["manifest_v0_sha", "tracked_test"])
+def test_prepare_runs_rejects_a_forged_corrected_control_source(tmp_path, damage):
+    controls = _corrected_control_fixture(
+        tmp_path / "controls", tmp_path / "problems"
+    )
+    task = "adaptive_compression"
+    source = controls / (
+        "autolab_shippedv0_control17_4h_v2_20260825"
+        f"__autolab_{task}"
+    )
+    if damage == "manifest_v0_sha":
+        manifest_path = source / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["initial_verifier_sha256"] = "0" * 64
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    else:
+        (tmp_path / "problems" / f"autolab_{task}" / "tests/test.sh").write_text(
+            "#!/bin/sh\n# forged tracked test\n", encoding="utf-8"
+        )
+
+    with pytest.raises(ValueError, match="hash|tracked|test|V0|source"):
+        prepare_runs(
+            controls,
+            tmp_path / "runs",
+            "autolab_hp_4h_test",
+            problems_root=tmp_path / "problems",
+        )
+
+
+@pytest.mark.parametrize(
+    "contamination",
+    [
+        "candidate",
+        "eval_query",
+        "human",
+        "solver_ws",
+        "cost",
+        "v1",
+        "manifest_best",
+        "manifest_final",
+        "result_json",
+        "human_guidance",
+        "outcome_json",
+    ],
+)
+def test_audit_runs_rejects_prelaunch_runtime_contamination(
+    tmp_path, contamination
+):
+    controls = _corrected_control_fixture(
+        tmp_path / "controls", tmp_path / "problems"
+    )
+    runs = tmp_path / "runs"
+    batch = "autolab_hp_4h_test"
+    prepare_runs(controls, runs, batch, problems_root=tmp_path / "problems")
+    run = runs / f"{batch}__autolab_adaptive_compression"
+    if contamination == "candidate":
+        path = run / "solver/candidates/cand_00000.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}", encoding="utf-8")
+    elif contamination == "eval_query":
+        (run / "eval/queries.jsonl").write_text("{}\n", encoding="utf-8")
+    elif contamination == "human":
+        (run / "human").mkdir()
+    elif contamination == "solver_ws":
+        (run / "solver_ws").mkdir()
+    elif contamination == "cost":
+        (run / "cost.jsonl").write_text("{}\n", encoding="utf-8")
+    elif contamination == "v1":
+        (run / "supervisor/verifier_versions/v1.py").write_text(
+            "# hardened", encoding="utf-8"
+        )
+    elif contamination == "result_json":
+        (run / "result.json").write_text('{"score": 1}', encoding="utf-8")
+    elif contamination == "human_guidance":
+        (run / "human_guidance.md").write_text("guidance", encoding="utf-8")
+    elif contamination == "outcome_json":
+        (run / "outcome.json").write_text('{"decision": "guide"}', encoding="utf-8")
+    else:
+        manifest_path = run / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        if contamination == "manifest_best":
+            manifest["best_solution"] = {"source": "old result"}
+        else:
+            manifest["final_verifier_version"] = 0
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="prelaunch|contamin|candidate|runtime|final|best"):
+        audit_runs(
+            controls,
+            runs,
+            batch,
+            problems_root=tmp_path / "problems",
+        )
+
+
+def _tree_hash(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        digest.update(path.relative_to(root).as_posix().encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def test_prepare_runs_and_audit_runs_cli_commands(tmp_path, capsys):
+    from coscientist.experiments.autolab_human_proxy import main
+
+    controls = _corrected_control_fixture(
+        tmp_path / "controls", tmp_path / "problems"
+    )
+    contexts = tmp_path / "contexts"
+    contexts.mkdir()
+    for tasks in AUTOLAB_GROUPS.values():
+        for task in tasks:
+            (contexts / f"autolab_{task}.md").write_text(
+                _private_context_text(task), encoding="utf-8"
+            )
+    runs = tmp_path / "runs"
+    common = [
+        "--control-runs-root", str(controls),
+        "--runs-root", str(runs),
+        "--batch-name", "autolab_hp_4h_test",
+        "--problems-root", str(tmp_path / "problems"),
+    ]
+
+    assert main(["prepare-runs", *common]) == 0
+    assert json.loads(capsys.readouterr().out)["task_count"] == 17
+    assert main(["audit-runs", *common, "--context-dir", str(contexts)]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "pass"
+
+
+def test_privacy_audit_allows_only_a_context_span_already_bound_in_control(tmp_path):
+    controls = _corrected_control_fixture(
+        tmp_path / "controls", tmp_path / "problems"
+    )
+    task = "adaptive_compression"
+    source = controls / (
+        "autolab_shippedv0_control17_4h_v2_20260825"
+        f"__autolab_{task}"
+    )
+    public_checker_text = (
+        "This public shipped checker validates canonical payload framing and the "
+        "documented correctness oracle before measuring performance on deterministic "
+        "inputs. It rejects malformed submissions, missing output fields, invalid "
+        "numeric values, and candidates that fail the task's published semantics. "
+        "This paragraph deliberately exceeds the privacy detector span threshold.\n"
+    )
+    source_test = source / "checker/tests/test.sh"
+    source_test.write_text(public_checker_text, encoding="utf-8")
+    tracked_test = tmp_path / "problems" / f"autolab_{task}" / "tests/test.sh"
+    tracked_test.write_text(public_checker_text, encoding="utf-8")
+    source_manifest_path = source / "manifest.json"
+    source_manifest = json.loads(source_manifest_path.read_text())
+    source_manifest["original_test_sha256"] = _sha256(source_test)
+    source_manifest_path.write_text(json.dumps(source_manifest), encoding="utf-8")
+    runs = tmp_path / "runs"
+    batch = "autolab_hp_4h_test"
+    prepare_runs(controls, runs, batch, problems_root=tmp_path / "problems")
+    contexts = tmp_path / "contexts"
+    contexts.mkdir()
+    for candidate_task in (
+        task for tasks in AUTOLAB_GROUPS.values() for task in tasks
+    ):
+        text = _private_context_text(candidate_task)
+        if candidate_task == task:
+            text += public_checker_text
+        (contexts / f"autolab_{candidate_task}.md").write_text(
+            text, encoding="utf-8"
+        )
+
+    assert audit_runs(
+        controls,
+        runs,
+        batch,
+        problems_root=tmp_path / "problems",
+        context_dir=contexts,
+    )["status"] == "pass"
+
+    leaked = runs / f"{batch}__autolab_{task}" / "leak.txt"
+    leaked.write_text(public_checker_text, encoding="utf-8")
+    with pytest.raises(RuntimeError, match="private context"):
+        audit_runs(
+            controls,
+            runs,
+            batch,
+            problems_root=tmp_path / "problems",
+            context_dir=contexts,
+        )
+
+
+def test_prepare_runs_single_publish_failure_leaves_no_visible_root_and_can_retry(
+    tmp_path, monkeypatch
+):
+    from coscientist.experiments import autolab_human_proxy as experiment
+
+    controls = _corrected_control_fixture(
+        tmp_path / "controls", tmp_path / "problems"
+    )
+    runs = tmp_path / "runs"
+    batch = "autolab_hp_4h_test"
+    original_publish = experiment._rename_noreplace
+
+    def fail_publish(source, destination):
+        raise OSError("synthetic publish failure")
+
+    monkeypatch.setattr(experiment, "_rename_noreplace", fail_publish)
+    with pytest.raises(OSError, match="synthetic publish"):
+        prepare_runs(
+            controls, runs, batch, problems_root=tmp_path / "problems"
+        )
+
+    assert not runs.exists()
+    assert not list(tmp_path.glob(f".{batch}.runs.tmp.*"))
+
+    monkeypatch.setattr(experiment, "_rename_noreplace", original_publish)
+    assert prepare_runs(
+        controls, runs, batch, problems_root=tmp_path / "problems"
+    )["task_count"] == 17
+
+
+def test_prepare_runs_concurrent_atomic_publish_has_exactly_one_winner(
+    tmp_path, monkeypatch
+):
+    from coscientist.experiments import autolab_human_proxy as experiment
+
+    controls = _corrected_control_fixture(
+        tmp_path / "controls", tmp_path / "problems"
+    )
+    runs = tmp_path / "runs"
+    batch = "autolab_hp_4h_test"
+    publish_barrier = threading.Barrier(2)
+    original_publish = experiment._rename_noreplace
+
+    def rendezvous_publish(source, destination):
+        publish_barrier.wait(timeout=10)
+        return original_publish(source, destination)
+
+    monkeypatch.setattr(experiment, "_rename_noreplace", rendezvous_publish)
+    outcomes = []
+    outcome_lock = threading.Lock()
+
+    def prepare_one():
+        try:
+            outcome = prepare_runs(
+                controls, runs, batch, problems_root=tmp_path / "problems"
+            )["status"]
+        except Exception as exc:  # pragma: no cover - asserted below
+            outcome = exc
+        with outcome_lock:
+            outcomes.append(outcome)
+
+    threads = [threading.Thread(target=prepare_one) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=20)
+
+    assert outcomes.count("pass") == 1
+    failures = [outcome for outcome in outcomes if outcome != "pass"]
+    assert len(failures) == 1 and isinstance(failures[0], FileExistsError)
+    assert len(list(runs.glob(f"{batch}__autolab_*"))) == 17
+    assert not list(tmp_path.glob(f".{batch}.runs.tmp.*"))
+
+
+def test_atomic_publish_never_overwrites_target_created_during_prepare(
+    tmp_path, monkeypatch
+):
+    from coscientist.experiments import autolab_human_proxy as experiment
+
+    controls = _corrected_control_fixture(
+        tmp_path / "controls", tmp_path / "problems"
+    )
+    runs = tmp_path / "runs"
+    batch = "autolab_hp_4h_test"
+    original_publish = experiment._rename_noreplace
+    sentinel = runs / "owned.txt"
+
+    def inject_competing_target(source, destination):
+        runs.mkdir()
+        sentinel.write_text("competitor", encoding="utf-8")
+        return original_publish(source, destination)
+
+    monkeypatch.setattr(experiment, "_rename_noreplace", inject_competing_target)
+    with pytest.raises(FileExistsError):
+        prepare_runs(controls, runs, batch, problems_root=tmp_path / "problems")
+
+    assert sentinel.read_text() == "competitor"
+    assert list(runs.iterdir()) == [sentinel]
+    assert not list(tmp_path.glob(f".{batch}.runs.tmp.*"))
+
+
+@pytest.mark.parametrize("payload", ["raw_private", "unknown_binary"])
+def test_privacy_audit_fails_closed_on_untrusted_non_utf8_files(tmp_path, payload):
+    controls = _corrected_control_fixture(
+        tmp_path / "controls", tmp_path / "problems"
+    )
+    runs = tmp_path / "runs"
+    batch = "autolab_hp_4h_test"
+    prepare_runs(controls, runs, batch, problems_root=tmp_path / "problems")
+    contexts = tmp_path / "contexts"
+    contexts.mkdir()
+    for task in (task for tasks in AUTOLAB_GROUPS.values() for task in tasks):
+        (contexts / f"autolab_{task}.md").write_text(
+            _private_context_text(task), encoding="utf-8"
+        )
+    run = runs / f"{batch}__autolab_adaptive_compression"
+    if payload == "raw_private":
+        raw = (contexts / "autolab_adaptive_compression.md").read_bytes()
+        (run / "leak.bin").write_bytes(b"\xff" + raw[25:380])
+    else:
+        (run / "unknown.bin").write_bytes(b"\xff\xfe\x00untrusted")
+
+    with pytest.raises(RuntimeError, match="private|binary|decode|prelaunch"):
+        audit_runs(
+            controls,
+            runs,
+            batch,
+            problems_root=tmp_path / "problems",
+            context_dir=contexts,
+        )
+
+
+def test_privacy_audit_allows_byte_bound_control_binary(tmp_path):
+    controls = _corrected_control_fixture(
+        tmp_path / "controls", tmp_path / "problems"
+    )
+    task = "adaptive_compression"
+    source = controls / (
+        "autolab_shippedv0_control17_4h_v2_20260825"
+        f"__autolab_{task}"
+    )
+    (source / "checker/public_fixture.bin").write_bytes(b"\xff\xfe\x00public")
+    runs = tmp_path / "runs"
+    batch = "autolab_hp_4h_test"
+    prepare_runs(controls, runs, batch, problems_root=tmp_path / "problems")
+    contexts = tmp_path / "contexts"
+    contexts.mkdir()
+    for candidate_task in (
+        task for tasks in AUTOLAB_GROUPS.values() for task in tasks
+    ):
+        (contexts / f"autolab_{candidate_task}.md").write_text(
+            _private_context_text(candidate_task), encoding="utf-8"
+        )
+
+    assert audit_runs(
+        controls,
+        runs,
+        batch,
+        problems_root=tmp_path / "problems",
+        context_dir=contexts,
+    )["status"] == "pass"
+
+
+@pytest.mark.parametrize(
+    "attack", ["bootstrap_parent", "checker_parent", "manifest", "tracked_tests_parent"]
+)
+def test_prepare_runs_rejects_symlinks_in_every_trusted_source_path(tmp_path, attack):
+    controls = _corrected_control_fixture(
+        tmp_path / "controls", tmp_path / "problems"
+    )
+    task = "adaptive_compression"
+    source = controls / (
+        "autolab_shippedv0_control17_4h_v2_20260825"
+        f"__autolab_{task}"
+    )
+    if attack == "bootstrap_parent":
+        target = source / "bootstrap-real"
+        (source / "bootstrap_ws").rename(target)
+        (source / "bootstrap_ws").symlink_to(target, target_is_directory=True)
+    elif attack == "checker_parent":
+        target = source / "checker-real"
+        (source / "checker").rename(target)
+        (source / "checker").symlink_to(target, target_is_directory=True)
+    elif attack == "manifest":
+        target = source / "manifest-real.json"
+        (source / "manifest.json").rename(target)
+        (source / "manifest.json").symlink_to(target)
+    else:
+        tests = tmp_path / "problems" / f"autolab_{task}" / "tests"
+        target = tests.with_name("tests-real")
+        tests.rename(target)
+        tests.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink|unsafe"):
+        prepare_runs(
+            controls,
+            tmp_path / "runs",
+            "autolab_hp_4h_test",
+            problems_root=tmp_path / "problems",
+        )
+
+
+@pytest.mark.parametrize("oversize", ["bootstrap_file", "checker_total", "context"])
+def test_preseed_and_context_reads_enforce_size_limits(
+    tmp_path, monkeypatch, oversize
+):
+    from coscientist.experiments import autolab_human_proxy as experiment
+
+    controls = _corrected_control_fixture(
+        tmp_path / "controls", tmp_path / "problems"
+    )
+    task = "adaptive_compression"
+    source = controls / (
+        "autolab_shippedv0_control17_4h_v2_20260825"
+        f"__autolab_{task}"
+    )
+    if oversize == "bootstrap_file":
+        monkeypatch.setattr(experiment, "MAX_PRESEED_FILE_BYTES", 32)
+        (source / "bootstrap_ws/seed_solution.json").write_text(
+            json.dumps({"source": "x" * 100}), encoding="utf-8"
+        )
+        with pytest.raises(ValueError, match="large|size|limit"):
+            prepare_runs(
+                controls,
+                tmp_path / "runs",
+                "autolab_hp_4h_test",
+                problems_root=tmp_path / "problems",
+            )
+        return
+    if oversize == "checker_total":
+        monkeypatch.setattr(experiment, "MAX_CHECKER_TOTAL_BYTES", 64)
+        with pytest.raises(ValueError, match="checker.*large|total|limit"):
+            prepare_runs(
+                controls,
+                tmp_path / "runs",
+                "autolab_hp_4h_test",
+                problems_root=tmp_path / "problems",
+            )
+        return
+
+    runs = tmp_path / "runs"
+    batch = "autolab_hp_4h_test"
+    prepare_runs(controls, runs, batch, problems_root=tmp_path / "problems")
+    contexts = tmp_path / "contexts"
+    contexts.mkdir()
+    for candidate_task in (
+        task for tasks in AUTOLAB_GROUPS.values() for task in tasks
+    ):
+        text = _private_context_text(candidate_task)
+        if candidate_task == task:
+            text = "x" * 200_001
+        (contexts / f"autolab_{candidate_task}.md").write_text(
+            text, encoding="utf-8"
+        )
+    with pytest.raises((ValueError, RuntimeError), match="200000|large|size|limit"):
+        audit_runs(
+            controls,
+            runs,
+            batch,
+            problems_root=tmp_path / "problems",
+            context_dir=contexts,
+        )
