@@ -42,6 +42,7 @@ import stat
 import subprocess
 import tempfile
 import threading
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -600,19 +601,59 @@ class DockerContainer:
             name = self.gateway.provider_env_key
             key_flags = ["-e", name]
             exec_env = {**os.environ, name: key_val}
-        argv = ["docker", "exec", "-i", "-w", allowed_dir, *key_flags, self._cid,
+        pid_file = f"/tmp/coscientist-codex-{uuid.uuid4().hex}.pid"
+        launcher = (
+            'pid_file="$1"; shift; printf "%s\\n" "$$" > "$pid_file"; exec "$@"'
+        )
+        argv = ["docker", "exec", "-w", allowed_dir, *key_flags, self._cid,
+                "sh", "-c", launcher, "coscientist-codex", pid_file,
                 "codex", "exec", "--skip-git-repo-check",
                 "--dangerously-bypass-approvals-and-sandbox", prompt]
         try:
             proc = subprocess.run(argv, capture_output=True, text=True,
-                                  env=exec_env, timeout=max(1.0, timeout_s))
+                                  env=exec_env, stdin=subprocess.DEVNULL,
+                                  timeout=max(1.0, timeout_s))
         except subprocess.TimeoutExpired:
+            self._terminate_agent_process(pid_file)
             return AgentSession(ok=False, returncode=-1, stdout="", stderr="",
                                 note="agent hit the wall-clock budget")
+        self._remove_agent_pid_file(pid_file)
         ok = proc.returncode == 0
         return AgentSession(ok=ok, returncode=proc.returncode,
                             stdout=proc.stdout or "", stderr=proc.stderr or "",
                             note="" if ok else "codex exited nonzero")
+
+    def _terminate_agent_process(self, pid_file: str) -> None:
+        """Stop the in-container Codex process after the docker client times out."""
+        if self._cid is None:
+            return
+        script = (
+            'pid_file="$1"; pid="$(cat "$pid_file" 2>/dev/null)" || exit 0; '
+            'case "$pid" in ""|*[!0-9]*) rm -f "$pid_file"; exit 0;; esac; '
+            'kill -TERM "$pid" 2>/dev/null || true; i=0; '
+            'while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 20 ]; do '
+            'sleep 0.1; i=$((i + 1)); done; '
+            'kill -KILL "$pid" 2>/dev/null || true; rm -f "$pid_file"'
+        )
+        try:
+            subprocess.run(
+                ["docker", "exec", self._cid, "sh", "-c", script,
+                 "coscientist-cleanup", pid_file],
+                capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    def _remove_agent_pid_file(self, pid_file: str) -> None:
+        if self._cid is None:
+            return
+        try:
+            subprocess.run(
+                ["docker", "exec", self._cid, "rm", "-f", pid_file],
+                capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
     def stop(self) -> None:
         if self._cid is not None:
