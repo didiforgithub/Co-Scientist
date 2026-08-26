@@ -7,16 +7,22 @@ pre-seeding and result replay are separate experiment stages.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import ctypes
 import errno
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
+import socket
 import stat
+import subprocess
 import sys
 import tempfile
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -24,6 +30,13 @@ from typing import Any, Iterable
 ARM = "autolab_coevolve_human_proxy"
 CORRECTED_CONTROL_PREFIX = "autolab_shippedv0_control17_4h_v2_20260825"
 SHIPPED_VERIFIER_ORIGIN = "autolab_shipped_tests/test.sh"
+FINAL_REPLAY_AUDIT_SEED = (
+    "shipped-v0-control17-final-replay-audit-only-20260825-v1"
+)
+TRUSTED_REPLAY_BATCHES = {
+    "old10": "autolab_all_4h",
+    "new7": "autolab_proofgate_4h",
+}
 MAX_CONTEXT_CHARACTERS = 200_000
 MAX_ACCEPTED_SOURCE_BYTES = 1_000_000
 MAX_RUN_AUDIT_FILE_BYTES = 4_000_000
@@ -89,6 +102,26 @@ RUN_BOOTSTRAP_FILES = (
     "solver_env.json",
     "reframe_policy.json",
 )
+
+NATIVE_METRICS = {
+    "adaptive_compression": "8.0 minus aggregate bits per byte; lower native bpb becomes a higher score",
+    "fft_rust": "fixed baseline seconds divided by median runtime",
+    "flash_attention": "0.75 divided by median kernel seconds",
+    "gaussian_blur": "12.0 divided by median kernel seconds after correctness",
+    "hash_join": "20.0 divided by median runtime seconds",
+    "levenshtein_distance": "2.0845 divided by median runtime seconds",
+    "radix_sort": "4.5 divided by median runtime seconds",
+    "regex_engine": "fixed baseline seconds divided by median runtime",
+    "sstable_compaction_rs": "scaled baseline seconds divided by median runtime",
+    "z_order_range_scan": "2.0 divided by median runtime seconds",
+    "aes128_ctr": "median-normalized throughput speedup mapped through the historical log reward",
+    "agent_tool_routing": "3.85 divided by median benchmark wall seconds",
+    "bm25_search_go": "2.1 divided by median runtime seconds",
+    "bvh_raytracer": "3.8-second anchor divided by normalized median frame time",
+    "concurrent_kv_wal": "logarithmic speedup score capped at 1.0",
+    "discover_sorting": "61 divided by comparator count plus one",
+    "sha256_throughput": "2.5 divided by effective protected benchmark seconds",
+}
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -1151,6 +1184,611 @@ def prepare_runs(
     }
 
 
+def _canonical_sha256(value: Any) -> str:
+    raw = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return _sha256_bytes(raw)
+
+
+def _replay_seed(
+    *, hidden_seed_file: Path | str | None, audit_seed: str | None
+) -> tuple[str, dict[str, Any]]:
+    if (hidden_seed_file is None) == (audit_seed is None):
+        raise ValueError(
+            "choose exactly one hidden-seed mode: --hidden-seed-file or --audit-seed"
+        )
+    if audit_seed is not None:
+        if audit_seed != FINAL_REPLAY_AUDIT_SEED:
+            raise ValueError(
+                "--audit-seed must use the explicit fixed audit-only replay seed"
+            )
+        return audit_seed, {
+            "mode": "fixed_audit_only",
+            "value": audit_seed,
+            "classification": "audit-only; MUST NOT deploy",
+            "persist_across_repeats": True,
+            "disclosed": True,
+        }
+
+    raw = _read_bounded_regular(
+        Path(hidden_seed_file), max_bytes=16_384, label="private hidden seed"
+    )
+    try:
+        seed = raw.decode("utf-8").strip()
+    except UnicodeDecodeError as exc:
+        raise ValueError("private hidden seed is not valid UTF-8") from exc
+    if not seed or seed == "REQUIRED_PRIVATE":
+        raise ValueError("private hidden seed file is empty or still a placeholder")
+    return seed, {
+        "mode": "private_file",
+        "sha256": _sha256_bytes(seed.encode("utf-8")),
+        "persist_across_repeats": True,
+        "disclosed": False,
+    }
+
+
+def _inspect_immutable_image(
+    image: str, *, run_command: Any
+) -> dict[str, Any]:
+    proc = run_command(
+        ["docker", "image", "inspect", image, "--format", "{{json .}}"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"docker image inspect failed for {image}: {(proc.stderr or '')[-2000:]}"
+        )
+    try:
+        inspected = json.loads(proc.stdout)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"docker image inspect returned invalid JSON for {image}") from exc
+    if isinstance(inspected, list) and len(inspected) == 1:
+        inspected = inspected[0]
+    if not isinstance(inspected, dict):
+        raise RuntimeError(f"docker image inspect returned ambiguous data for {image}")
+    immutable_id = inspected.get("Id")
+    if not isinstance(immutable_id, str) or re.fullmatch(
+        r"sha256:[0-9a-f]{64}", immutable_id
+    ) is None:
+        raise RuntimeError(f"docker image lacks an immutable sha256 ID: {image}")
+    return {
+        "reference": image,
+        "id": immutable_id,
+        "repo_digests": inspected.get("RepoDigests") or [],
+        "created": inspected.get("Created"),
+    }
+
+
+def _read_json_snapshot(
+    path: Path, *, label: str, max_bytes: int
+) -> tuple[dict[str, Any], str]:
+    raw = _read_bounded_regular(path, max_bytes=max_bytes, label=label)
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} is not a valid JSON object: {path}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} is not a JSON object: {path}")
+    return value, _sha256_bytes(raw)
+
+
+def _read_replay_resource(manifest_path: Path) -> tuple[dict[str, Any], str]:
+    manifest, manifest_sha256 = _read_json_snapshot(
+        manifest_path,
+        label="trusted reference manifest",
+        max_bytes=MAX_RUN_AUDIT_FILE_BYTES,
+    )
+    resource = (manifest.get("resource_spec") or {}).get("verifier")
+    if not isinstance(resource, dict):
+        raise ValueError(f"trusted verifier resource is missing: {manifest_path}")
+    required = ("image", "cpus", "memory_mb", "timeout_sec")
+    if any(resource.get(key) is None for key in required):
+        raise ValueError(f"trusted verifier resource is incomplete: {manifest_path}")
+    if not isinstance(resource["image"], str) or not resource["image"].strip():
+        raise ValueError(f"trusted verifier image is invalid: {manifest_path}")
+    for key in ("cpus", "memory_mb", "timeout_sec"):
+        if isinstance(resource[key], bool) or not isinstance(resource[key], (int, float)):
+            raise ValueError(f"trusted verifier resource {key} is invalid: {manifest_path}")
+        if float(resource[key]) <= 0:
+            raise ValueError(f"trusted verifier resource {key} must be positive")
+    if resource.get("allow_internet") is not False:
+        raise ValueError("trusted verifier resource must explicitly disable internet")
+    normalized = {
+        "image": resource["image"],
+        "cpus": float(resource["cpus"]),
+        "memory_mb": int(resource["memory_mb"]),
+        "timeout_sec": float(resource["timeout_sec"]),
+        "allow_internet": False,
+    }
+    return normalized, manifest_sha256
+
+
+def _accepted_replay_contracts(accepted_root: Path) -> tuple[str, dict[tuple[str, str], dict[str, Any]]]:
+    report_path = accepted_root / "acceptance_report.json"
+    report_raw, report_text = _read_source(report_path, label="acceptance report")
+    try:
+        report = json.loads(report_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError("acceptance report is invalid JSON") from exc
+    if not isinstance(report, dict):
+        raise ValueError("acceptance report must be a JSON object")
+    records = _accepted_records(report)
+    return _sha256_bytes(report_raw), records
+
+
+def _build_replay_contracts(
+    *,
+    batch_name: str,
+    runs_root: Path | str,
+    accepted_root: Path | str,
+    trusted_runs_root: Path | str,
+    dry_run: bool,
+    run_command: Any,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    batch_name = _validated_batch_name(batch_name)
+    runs_root = _reject_symlink_components(runs_root)
+    accepted_root = _validated_accepted_root(accepted_root)
+    trusted_runs_root = _reject_symlink_components(trusted_runs_root)
+    if not runs_root.is_dir() or not trusted_runs_root.is_dir():
+        raise ValueError("replay runs roots must be existing non-symlinked directories")
+
+    expected_run_ids = {
+        f"{batch_name}__autolab_{task}" for task in _tasks()
+    }
+    prefixed_entries = {
+        path.name
+        for path in runs_root.iterdir()
+        if path.name.startswith(f"{batch_name}__autolab_")
+    }
+    if prefixed_entries != expected_run_ids:
+        raise ValueError(
+            "dedicated target runs root does not contain the exact 17 unambiguous task runs"
+        )
+    for run_id in expected_run_ids:
+        run = runs_root / run_id
+        if run.is_symlink() or not run.is_dir():
+            raise ValueError(f"target run is missing or unsafe: {run_id}")
+
+    batch_path = runs_root / batch_name / "batch.json"
+    batch, batch_sha256 = _read_json_snapshot(
+        batch_path,
+        label="target batch manifest",
+        max_bytes=MAX_RUN_AUDIT_FILE_BYTES,
+    )
+    if batch.get("batch") != batch_name:
+        raise ValueError("target batch manifest names a different batch")
+    rows = batch.get("runs")
+    if not isinstance(rows, list) or len(rows) != 17:
+        raise ValueError("target batch manifest must contain exactly 17 runs")
+    row_by_id: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("run_id"), str):
+            raise ValueError("target batch contains an invalid run record")
+        if row["run_id"] in row_by_id:
+            raise ValueError(f"target batch contains an ambiguous run: {row['run_id']}")
+        row_by_id[row["run_id"]] = row
+    if set(row_by_id) != expected_run_ids:
+        raise ValueError("target batch task set does not match the exact 17 tasks")
+
+    report_sha256, accepted_records = _accepted_replay_contracts(accepted_root)
+    contracts: list[dict[str, Any]] = []
+    for group, tasks in AUTOLAB_GROUPS.items():
+        checker_batch = TRUSTED_REPLAY_BATCHES[group]
+        for task in tasks:
+            run_id = f"{batch_name}__autolab_{task}"
+            row = row_by_id[run_id]
+            input_name = Path(str(row.get("input_dir", ""))).name
+            if input_name != f"autolab_{task}":
+                raise ValueError(f"target batch input mapping mismatch for {task}")
+            if not dry_run and row.get("status") != "done":
+                raise RuntimeError(f"target run is not complete/done: {task}")
+
+            run = runs_root / run_id
+            manifest_path = run / "manifest.json"
+            manifest, manifest_sha256 = _read_json_snapshot(
+                manifest_path,
+                label="target run manifest",
+                max_bytes=MAX_RUN_AUDIT_FILE_BYTES,
+            )
+            if manifest.get("arm") != ARM:
+                raise ValueError(f"target run arm mismatch for {task}")
+            if manifest.get("freeze_verifier") is not False:
+                raise ValueError(f"target run is a frozen-control contract: {task}")
+            if manifest.get("initial_verifier_origin") != SHIPPED_VERIFIER_ORIGIN:
+                raise ValueError(f"target run did not begin from shipped V0: {task}")
+            best = manifest.get("best_solution")
+            if not dry_run and not isinstance(best, dict):
+                raise RuntimeError(f"target run lacks a final best_solution payload: {task}")
+            if not dry_run:
+                events_path = run / "events.jsonl"
+                raw_events = _read_bounded_regular(
+                    events_path, max_bytes=MAX_RUN_AUDIT_FILE_BYTES,
+                    label="target run events"
+                )
+                try:
+                    events = [json.loads(line) for line in raw_events.decode("utf-8").splitlines() if line.strip()]
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise RuntimeError(f"target run events are invalid: {task}") from exc
+                if not any(event.get("kind") == "run_stop" for event in events):
+                    raise RuntimeError(f"target run has no run_stop completion event: {task}")
+
+            accepted_record = accepted_records[(group, task)]
+            package = accepted_root / group / task
+            verifier = package / "final_verifier.py"
+            template = package / "final_ctx.template.json"
+            verifier_sha = _sha256_path(
+                verifier, max_bytes=MAX_ACCEPTED_SOURCE_BYTES,
+                label="accepted final verifier"
+            )
+            template_raw = _read_bounded_regular(
+                template, max_bytes=MAX_ACCEPTED_SOURCE_BYTES,
+                label="accepted final context template"
+            )
+            template_sha = _sha256_bytes(template_raw)
+            if verifier_sha != accepted_record["final_verifier_sha256"]:
+                raise ValueError(f"accepted final verifier hash mismatch for {task}")
+            if template_sha != accepted_record["final_ctx_template_sha256"]:
+                raise ValueError(f"accepted final context template hash mismatch for {task}")
+            try:
+                template_value = json.loads(template_raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"accepted final context template is invalid for {task}") from exc
+            if not isinstance(template_value, dict) or not {
+                "checker_dir", "hidden_seed"
+            }.issubset(template_value):
+                raise ValueError(f"accepted final context template is incomplete for {task}")
+
+            trusted_run = trusted_runs_root / f"{checker_batch}__autolab_{task}"
+            if trusted_run.is_symlink() or not trusted_run.is_dir():
+                raise ValueError(f"trusted checker source run is missing for {task}")
+            checker = trusted_run / "checker"
+            checker_inventory = _tree_inventory(checker)
+            trusted_manifest = trusted_run / "manifest.json"
+            resource, trusted_manifest_sha = _read_replay_resource(trusted_manifest)
+            image = _inspect_immutable_image(resource["image"], run_command=run_command)
+            contracts.append(
+                {
+                    "task": task,
+                    "group": group,
+                    "run": run,
+                    "run_id": run_id,
+                    "batch_row": row,
+                    "manifest": manifest,
+                    "manifest_path": manifest_path,
+                    "manifest_sha256": manifest_sha256,
+                    "best": best if isinstance(best, dict) else None,
+                    "package": package,
+                    "verifier": verifier,
+                    "template": template,
+                    "verifier_sha256": verifier_sha,
+                    "template_sha256": template_sha,
+                    "checker": checker,
+                    "checker_batch": checker_batch,
+                    "checker_inventory": checker_inventory,
+                    "trusted_manifest": trusted_manifest,
+                    "trusted_manifest_sha256": trusted_manifest_sha,
+                    "resource": resource,
+                    "image": image,
+                }
+            )
+    return {
+        "path": str(batch_path),
+        "sha256": batch_sha256,
+        "accepted_report_path": str(accepted_root / "acceptance_report.json"),
+        "accepted_report_sha256": report_sha256,
+    }, contracts
+
+
+_FINAL_REPLAY_WRAPPER = r'''import importlib.util,json,time
+spec=importlib.util.spec_from_file_location("final_verifier","/review/final_verifier.py")
+module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+payload=json.load(open("/input/payload.json"))
+template=json.load(open("/review/final_ctx.template.json"))
+runtime=json.load(open("/input/runtime_ctx.json"))
+if not isinstance(template,dict) or "checker_dir" not in template or "hidden_seed" not in template:
+    raise RuntimeError("invalid final context template")
+ctx=dict(template);ctx.update(runtime)
+started=time.time();result=module.verify(payload,ctx);finished=time.time()
+print(json.dumps({"result":result,"duration_seconds":finished-started},sort_keys=True))
+'''
+
+
+def _docker_command(
+    contract: dict[str, Any], *, payload_path: str, runtime_path: str
+) -> list[str]:
+    resource = contract["resource"]
+    return [
+        "docker", "run", "--rm", "--network", "none",
+        "--cpus", str(resource["cpus"]),
+        "--memory", f"{resource['memory_mb']}m",
+        "-v", f"{contract['verifier']}:/review/final_verifier.py:ro",
+        "-v", f"{contract['template']}:/review/final_ctx.template.json:ro",
+        "-v", f"{payload_path}:/input/payload.json:ro",
+        "-v", f"{runtime_path}:/input/runtime_ctx.json:ro",
+        "-v", f"{contract['checker']}:/checker:ro",
+        contract["image"]["id"], "python3", "-c", _FINAL_REPLAY_WRAPPER,
+    ]
+
+
+def _parse_replay_result(output: str) -> dict[str, Any] | None:
+    for line in reversed([line for line in output.splitlines() if line.strip()]):
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and isinstance(value.get("result"), dict):
+            return value
+    return None
+
+
+def _task_report_base(contract: dict[str, Any]) -> dict[str, Any]:
+    best = contract["best"]
+    payload = (
+        {"mapping": "identity", "sha256": _canonical_sha256(best), "keys": sorted(best)}
+        if isinstance(best, dict)
+        else {"mapping": "identity", "status": "not_available"}
+    )
+    placeholder_command = _docker_command(
+        contract,
+        payload_path="<private-temp>/payload.json",
+        runtime_path="<private-temp>/runtime_ctx.json",
+    )
+    return {
+        "task": contract["task"],
+        "group": contract["group"],
+        "run": {
+            "run_id": contract["run_id"],
+            "manifest_path": str(contract["manifest_path"]),
+            "manifest_sha256": contract["manifest_sha256"],
+            "original_best_score": contract["manifest"].get("best_score"),
+            "final_verifier_version": contract["manifest"].get("final_verifier_version"),
+            "verifier_hardenings": contract["manifest"].get("verifier_hardenings"),
+            "freeze_verifier": False,
+        },
+        "payload": payload,
+        "accepted_evaluator": {
+            "package_path": str(contract["package"]),
+            "verifier_sha256": contract["verifier_sha256"],
+            "ctx_template_sha256": contract["template_sha256"],
+        },
+        "checker": {
+            "path": str(contract["checker"]),
+            "source_batch": contract["checker_batch"],
+            "inventory": contract["checker_inventory"],
+            "trusted_manifest_path": str(contract["trusted_manifest"]),
+            "trusted_manifest_sha256": contract["trusted_manifest_sha256"],
+        },
+        "metric": {
+            "direction": "higher_is_better",
+            "native_meaning": NATIVE_METRICS[contract["task"]],
+        },
+        "resource": contract["resource"],
+        "docker": {
+            "network": "none",
+            "mounts": "read_only",
+            "image_reference": contract["image"]["reference"],
+            "image_used": contract["image"]["id"],
+            "image_identity": contract["image"],
+            "timeout_seconds": contract["resource"]["timeout_sec"] + 120.0,
+            "command_template": placeholder_command,
+        },
+    }
+
+
+def _replay_task(
+    contract: dict[str, Any], *, repeat: int, hidden_seed: str, run_command: Any
+) -> dict[str, Any]:
+    base = _task_report_base(contract)
+    best = contract["best"]
+    if not isinstance(best, dict):
+        raise RuntimeError(f"target run lacks a final best_solution payload: {contract['task']}")
+    rows = []
+    with tempfile.TemporaryDirectory(prefix=f"autolab-final-{contract['task']}-") as temp:
+        payload_path = Path(temp) / "payload.json"
+        runtime_path = Path(temp) / "runtime_ctx.json"
+        payload_path.write_text(
+            json.dumps(best, ensure_ascii=False), encoding="utf-8"
+        )
+        runtime_path.write_text(
+            json.dumps(
+                {
+                    "checker_dir": "/checker",
+                    "hidden_seed": hidden_seed,
+                    "validation_mode": False,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        os.chmod(payload_path, 0o600)
+        os.chmod(runtime_path, 0o600)
+        command = _docker_command(
+            contract, payload_path=str(payload_path), runtime_path=str(runtime_path)
+        )
+        for ordinal in range(1, repeat + 1):
+            started = datetime.now(timezone.utc).isoformat()
+            before = time.monotonic()
+            proc = run_command(
+                command,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=contract["resource"]["timeout_sec"] + 120.0,
+            )
+            combined_output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+            if hidden_seed in combined_output:
+                raise RuntimeError(
+                    f"{contract['task']} verifier output crossed the private-seed boundary"
+                )
+            parsed = _parse_replay_result(proc.stdout or "")
+            if proc.returncode != 0 or parsed is None:
+                detail = ((proc.stderr or "") + "\n" + (proc.stdout or ""))[-4000:]
+                raise RuntimeError(
+                    f"{contract['task']} repeat {ordinal} failed rc={proc.returncode}: {detail}"
+                )
+            result = parsed["result"]
+            if not isinstance(result.get("feasible"), bool) or isinstance(
+                result.get("raw"), bool
+            ) or not isinstance(result.get("raw"), (int, float)):
+                raise RuntimeError(
+                    f"{contract['task']} repeat {ordinal} returned an invalid verifier result"
+                )
+            rows.append(
+                {
+                    "ordinal": ordinal,
+                    "host_started_at_utc": started,
+                    "host_duration_seconds": time.monotonic() - before,
+                    "docker_exit_code": proc.returncode,
+                    **parsed,
+                }
+            )
+    return {
+        **base,
+        "status": "replayed",
+        "repeat_count": len(rows),
+        "repeats": rows,
+        "raw_values": [row["result"]["raw"] for row in rows],
+        "feasible_values": [row["result"]["feasible"] for row in rows],
+    }
+
+
+def _write_replay_report(output: Path | str, report: dict[str, Any]) -> None:
+    output = _reject_symlink_components(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    _reject_symlink_components(output.parent)
+    if os.path.lexists(output) and (output.is_symlink() or not output.is_file()):
+        raise ValueError(f"replay report target is not a regular file: {output}")
+    raw = (
+        json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output.name}.tmp.", dir=output.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, output)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def evaluate_results(
+    *,
+    batch_name: str,
+    runs_root: Path | str,
+    accepted_root: Path | str,
+    trusted_runs_root: Path | str,
+    workers: int,
+    repeat: int,
+    output: Path | str,
+    hidden_seed_file: Path | str | None = None,
+    audit_seed: str | None = None,
+    dry_run: bool = False,
+    run_command: Any = None,
+) -> dict[str, Any]:
+    """Replay this arm's exact 17 identity-mapped finalists on accepted evaluators."""
+
+    if workers < 1 or repeat < 1:
+        raise ValueError("workers and repeat must both be positive")
+    hidden_seed, seed_report = _replay_seed(
+        hidden_seed_file=hidden_seed_file, audit_seed=audit_seed
+    )
+    runner = subprocess.run if run_command is None else run_command
+    provenance, contracts = _build_replay_contracts(
+        batch_name=batch_name,
+        runs_root=runs_root,
+        accepted_root=accepted_root,
+        trusted_runs_root=trusted_runs_root,
+        dry_run=dry_run,
+        run_command=runner,
+    )
+    started = datetime.now(timezone.utc).isoformat()
+    failures: list[str] = []
+    if dry_run:
+        tasks = [
+            {**_task_report_base(contract), "status": "contract_validated", "repeats": [], "raw_values": [], "feasible_values": []}
+            for contract in contracts
+        ]
+    else:
+        by_task: dict[str, dict[str, Any]] = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    _replay_task,
+                    contract,
+                    repeat=repeat,
+                    hidden_seed=hidden_seed,
+                    run_command=runner,
+                ): contract
+                for contract in contracts
+            }
+            for future in concurrent.futures.as_completed(futures):
+                contract = futures[future]
+                try:
+                    by_task[contract["task"]] = future.result()
+                except Exception as exc:
+                    failures.append(contract["task"])
+                    by_task[contract["task"]] = {
+                        **_task_report_base(contract),
+                        "status": "runner_error",
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "repeats": [],
+                        "raw_values": [],
+                        "feasible_values": [],
+                    }
+        tasks = [by_task[task] for task in _tasks()]
+
+    replayed = sum(row["status"] == "replayed" for row in tasks)
+    report = {
+        "schema_version": 1,
+        "purpose": "Co-Evolve plus Human Proxy 17-task replay against accepted Final Evaluators",
+        "status": (
+            "dry_run_pass" if dry_run else ("pass" if not failures else "fail")
+        ),
+        "batch_name": batch_name,
+        "host": {
+            "hostname": socket.gethostname(),
+            "platform": platform.platform(),
+            "python": platform.python_version(),
+        },
+        "started_at_utc": started,
+        "finished_at_utc": datetime.now(timezone.utc).isoformat(),
+        "hidden_seed": seed_report,
+        "execution": {
+            "dry_run": dry_run,
+            "parallel_tasks": workers,
+            "sequential_repeats_per_task": repeat,
+            "network": "none",
+            "mounts": "read_only",
+            "payload_mapping": "identity",
+        },
+        "provenance": provenance,
+        "completeness": {
+            "expected_tasks": 17,
+            "contract_validated_tasks": len(contracts),
+            "replayed_tasks": replayed,
+            "failed_tasks": len(failures),
+            "complete": replayed == 17 and not failures,
+        },
+        "failures": failures,
+        "tasks": tasks,
+    }
+    _write_replay_report(output, report)
+    if failures:
+        raise RuntimeError(
+            f"Final Evaluator replay failed for {len(failures)} task(s); report: {output}"
+        )
+    return report
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Prepare or audit AutoLab Human Proxy experiment artifacts"
@@ -1175,6 +1813,18 @@ def main(argv: list[str] | None = None) -> int:
         child.add_argument("--problems-root", type=Path, required=True)
         if command == "audit-runs":
             child.add_argument("--context-dir", type=Path, required=True)
+    evaluate = subparsers.add_parser("evaluate-results")
+    evaluate.add_argument("--batch-name", required=True)
+    evaluate.add_argument("--runs-root", type=Path, required=True)
+    evaluate.add_argument("--accepted-root", type=Path, required=True)
+    evaluate.add_argument("--trusted-runs-root", type=Path, required=True)
+    evaluate.add_argument("--workers", type=int, default=4)
+    evaluate.add_argument("--repeat", type=int, default=2)
+    evaluate.add_argument("--output", type=Path, required=True)
+    seed_group = evaluate.add_mutually_exclusive_group(required=True)
+    seed_group.add_argument("--hidden-seed-file", type=Path)
+    seed_group.add_argument("--audit-seed")
+    evaluate.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     if args.command == "prepare":
         result = prepare_contexts(args.accepted_root, args.output_dir)
@@ -1188,13 +1838,26 @@ def main(argv: list[str] | None = None) -> int:
             args.batch_name,
             problems_root=args.problems_root,
         )
-    else:
+    elif args.command == "audit-runs":
         summary = audit_runs(
             args.control_runs_root,
             args.runs_root,
             args.batch_name,
             problems_root=args.problems_root,
             context_dir=args.context_dir,
+        )
+    else:
+        summary = evaluate_results(
+            batch_name=args.batch_name,
+            runs_root=args.runs_root,
+            accepted_root=args.accepted_root,
+            trusted_runs_root=args.trusted_runs_root,
+            workers=args.workers,
+            repeat=args.repeat,
+            output=args.output,
+            hidden_seed_file=args.hidden_seed_file,
+            audit_seed=args.audit_seed,
+            dry_run=args.dry_run,
         )
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
     return 0

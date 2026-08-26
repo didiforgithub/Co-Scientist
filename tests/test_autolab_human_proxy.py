@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import stat
+import subprocess
 import threading
 from pathlib import Path
 
@@ -14,6 +15,8 @@ from coscientist.experiments.autolab_human_proxy import (
     MAX_CONTEXT_CHARACTERS,
     audit_contexts,
     audit_runs,
+    evaluate_results,
+    main,
     prepare_contexts,
     prepare_runs,
 )
@@ -133,7 +136,12 @@ def _accepted_fixture(root: Path, *, oversize_task: str | None = None) -> Path:
                     )
                 ),
                 "final_ctx.template.json": json.dumps(
-                    {"task": task, "hidden_seed": "REQUIRED_PRIVATE"},
+                    {
+                        "task": task,
+                        "checker_dir": "REQUIRED_CHECKER_DIR",
+                        "hidden_seed": "REQUIRED_PRIVATE",
+                        "validation_mode": False,
+                    },
                     indent=2,
                 ),
                 "authored_design.md": f"# Design for {task}\nReject semantic hacks.\n",
@@ -180,6 +188,138 @@ def _accepted_fixture(root: Path, *, oversize_task: str | None = None) -> Path:
         json.dumps(report, indent=2), encoding="utf-8"
     )
     return root
+
+
+def _evaluation_fixture(
+    tmp_path: Path, *, completed: bool
+) -> tuple[Path, Path, Path, str]:
+    """Build a dedicated target batch plus independent trusted comparators."""
+
+    accepted = _accepted_fixture(tmp_path / "accepted")
+    runs_root = tmp_path / "target-runs"
+    trusted_root = tmp_path / "trusted-runs"
+    batch_name = "autolab_hp_4h_test"
+    rows = []
+    for group, tasks in AUTOLAB_GROUPS.items():
+        checker_batch = "autolab_all_4h" if group == "old10" else "autolab_proofgate_4h"
+        for task in tasks:
+            trusted = trusted_root / f"{checker_batch}__autolab_{task}"
+            (trusted / "checker" / "tests").mkdir(parents=True)
+            (trusted / "checker" / "tests" / "test.sh").write_text(
+                f"trusted checker {checker_batch} {task}\n", encoding="utf-8"
+            )
+            (trusted / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "resource_spec": {
+                            "verifier": {
+                                "image": f"autolab_{task}:latest",
+                                "cpus": 2.0,
+                                "memory_mb": 4096,
+                                "timeout_sec": 37.0,
+                                "allow_internet": False,
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            run_id = f"{batch_name}__autolab_{task}"
+            run = runs_root / run_id
+            run.mkdir(parents=True)
+            manifest = {
+                "arm": "autolab_coevolve_human_proxy",
+                "freeze_verifier": False,
+                "initial_verifier_origin": "autolab_shipped_tests/test.sh",
+                "final_verifier_version": 3,
+                "verifier_hardenings": 3,
+            }
+            if completed:
+                manifest["best_solution"] = {
+                    "source": f"final payload for {task}",
+                    "task_marker": task,
+                }
+                manifest["best_score"] = float(len(task))
+                (run / "events.jsonl").write_text(
+                    '{"kind":"run_stop"}\n', encoding="utf-8"
+                )
+            (run / "manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+            rows.append(
+                {
+                    "run_id": run_id,
+                    "input_dir": f"/problems/autolab_{task}",
+                    "status": "done" if completed else "pending",
+                }
+            )
+    batch_dir = runs_root / batch_name
+    batch_dir.mkdir()
+    (batch_dir / "batch.json").write_text(
+        json.dumps({"batch": batch_name, "runs": rows}), encoding="utf-8"
+    )
+    return runs_root, accepted, trusted_root, batch_name
+
+
+class _FakeDocker:
+    def __init__(
+        self, *, seed_forbidden: str | None = None, leak_seed_in_result: bool = False
+    ):
+        self.commands: list[list[str]] = []
+        self.seed_forbidden = seed_forbidden
+        self.leak_seed_in_result = leak_seed_in_result
+
+    def __call__(self, argv, **kwargs):
+        argv = [str(value) for value in argv]
+        self.commands.append(argv)
+        if self.seed_forbidden is not None:
+            assert self.seed_forbidden not in " ".join(argv)
+        if argv[:3] == ["docker", "image", "inspect"]:
+            task = argv[3].removeprefix("autolab_").removesuffix(":latest")
+            digest = hashlib.sha256(task.encode()).hexdigest()
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=json.dumps(
+                    {
+                        "Id": f"sha256:{digest}",
+                        "RepoDigests": [f"example/{task}@sha256:{digest}"],
+                        "Created": "2026-08-27T00:00:00Z",
+                    }
+                ),
+                stderr="",
+            )
+        assert argv[:2] == ["docker", "run"]
+        assert argv[argv.index("--network") + 1] == "none"
+        image = next(value for value in argv if value.startswith("sha256:"))
+        assert len(image) == 71
+        mounts = [argv[index + 1] for index, value in enumerate(argv) if value == "-v"]
+        assert all(mount.endswith(":ro") for mount in mounts)
+        runtime_mount = next(mount for mount in mounts if mount.endswith("/input/runtime_ctx.json:ro"))
+        payload_mount = next(mount for mount in mounts if mount.endswith("/input/payload.json:ro"))
+        runtime = json.loads(Path(runtime_mount.split(":", 1)[0]).read_text())
+        payload = json.loads(Path(payload_mount.split(":", 1)[0]).read_text())
+        assert runtime["checker_dir"] == "/checker"
+        assert runtime["validation_mode"] is False
+        task = payload["task_marker"]
+        result = {
+            "feasible": True,
+            "raw": float(len(task)),
+            "artifacts": {"stage": "scored", "task": task},
+        }
+        if self.leak_seed_in_result:
+            result["artifacts"]["forbidden"] = runtime["hidden_seed"]
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps({"result": result, "duration_seconds": 0.25}) + "\n",
+            stderr="",
+        )
+
+
+def _assert_secret_absent(value, secret: str) -> None:
+    assert secret not in json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
 def test_prepare_renders_deterministic_contexts_and_complete_hash_inventory(tmp_path):
@@ -1037,3 +1177,268 @@ def test_preseed_and_context_reads_enforce_size_limits(
             problems_root=tmp_path / "problems",
             context_dir=contexts,
         )
+
+
+def test_evaluate_results_dry_run_validates_exact_contract_without_final_best(
+    tmp_path,
+):
+    runs, accepted, trusted, batch = _evaluation_fixture(tmp_path, completed=False)
+    docker = _FakeDocker()
+    output = tmp_path / "dry-run-report.json"
+
+    report = evaluate_results(
+        batch_name=batch,
+        runs_root=runs,
+        accepted_root=accepted,
+        trusted_runs_root=trusted,
+        workers=4,
+        repeat=2,
+        output=output,
+        audit_seed="shipped-v0-control17-final-replay-audit-only-20260825-v1",
+        dry_run=True,
+        run_command=docker,
+    )
+
+    assert report["status"] == "dry_run_pass"
+    assert report["completeness"] == {
+        "expected_tasks": 17,
+        "contract_validated_tasks": 17,
+        "replayed_tasks": 0,
+        "failed_tasks": 0,
+        "complete": False,
+    }
+    assert len(report["tasks"]) == 17
+    assert len(docker.commands) == 17
+    assert all(command[:3] == ["docker", "image", "inspect"] for command in docker.commands)
+    old = next(row for row in report["tasks"] if row["task"] == "adaptive_compression")
+    new = next(row for row in report["tasks"] if row["task"] == "aes128_ctr")
+    assert old["checker"]["source_batch"] == "autolab_all_4h"
+    assert new["checker"]["source_batch"] == "autolab_proofgate_4h"
+    assert old["payload"] == {"mapping": "identity", "status": "not_available"}
+    assert old["metric"]["direction"] == "higher_is_better"
+    assert "bits per byte" in old["metric"]["native_meaning"]
+    assert old["docker"]["network"] == "none"
+    assert old["docker"]["image_used"].startswith("sha256:")
+    assert json.loads(output.read_text()) == report
+
+
+def test_evaluate_results_scores_identity_payload_repeats_and_keeps_file_seed_secret(
+    tmp_path,
+):
+    runs, accepted, trusted, batch = _evaluation_fixture(tmp_path, completed=True)
+    hidden_seed = "do-not-disclose-this-live-secret"
+    seed_file = tmp_path / "hidden-seed.txt"
+    seed_file.write_text(hidden_seed + "\n", encoding="utf-8")
+    docker = _FakeDocker(seed_forbidden=hidden_seed)
+    output = tmp_path / "final-report.json"
+
+    report = evaluate_results(
+        batch_name=batch,
+        runs_root=runs,
+        accepted_root=accepted,
+        trusted_runs_root=trusted,
+        workers=3,
+        repeat=2,
+        output=output,
+        hidden_seed_file=seed_file,
+        run_command=docker,
+    )
+
+    assert report["status"] == "pass"
+    assert report["completeness"] == {
+        "expected_tasks": 17,
+        "contract_validated_tasks": 17,
+        "replayed_tasks": 17,
+        "failed_tasks": 0,
+        "complete": True,
+    }
+    _assert_secret_absent(report, hidden_seed)
+    assert report["hidden_seed"] == {
+        "mode": "private_file",
+        "sha256": hashlib.sha256(hidden_seed.encode()).hexdigest(),
+        "persist_across_repeats": True,
+        "disclosed": False,
+    }
+    for row in report["tasks"]:
+        expected_payload = {
+            "source": f"final payload for {row['task']}",
+            "task_marker": row["task"],
+        }
+        assert row["status"] == "replayed"
+        assert row["payload"]["mapping"] == "identity"
+        assert row["payload"]["sha256"] == hashlib.sha256(
+            json.dumps(
+                expected_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode()
+        ).hexdigest()
+        assert row["raw_values"] == [float(len(row["task"]))] * 2
+        assert row["feasible_values"] == [True, True]
+        assert len(row["repeats"]) == 2
+        assert row["accepted_evaluator"]["verifier_sha256"] == _sha256(
+            accepted / row["group"] / row["task"] / "final_verifier.py"
+        )
+        assert row["accepted_evaluator"]["ctx_template_sha256"] == _sha256(
+            accepted / row["group"] / row["task"] / "final_ctx.template.json"
+        )
+        assert row["docker"]["image_reference"] == f"autolab_{row['task']}:latest"
+        assert row["docker"]["image_used"].startswith("sha256:")
+    run_commands = [command for command in docker.commands if command[:2] == ["docker", "run"]]
+    assert len(run_commands) == 34
+
+
+@pytest.mark.parametrize(
+    "damage,match",
+    [
+        ("missing_task", "exact|17|missing"),
+        ("extra_task", "exact|unexpected|ambiguous"),
+        ("wrong_status", "complete|done|status"),
+        ("missing_best", "best_solution|payload"),
+        ("accepted_drift", "hash"),
+        ("trusted_resource_drift", "internet|resource"),
+    ],
+)
+def test_evaluate_results_rejects_incomplete_ambiguous_or_polluted_inputs(
+    tmp_path, damage, match
+):
+    runs, accepted, trusted, batch = _evaluation_fixture(tmp_path, completed=True)
+    batch_path = runs / batch / "batch.json"
+    batch_doc = json.loads(batch_path.read_text())
+    task = "adaptive_compression"
+    target = runs / f"{batch}__autolab_{task}"
+    if damage == "missing_task":
+        batch_doc["runs"].pop()
+        batch_path.write_text(json.dumps(batch_doc), encoding="utf-8")
+    elif damage == "extra_task":
+        extra = runs / f"{batch}__autolab_not_a_task"
+        extra.mkdir()
+        (extra / "manifest.json").write_text("{}", encoding="utf-8")
+    elif damage == "wrong_status":
+        batch_doc["runs"][0]["status"] = "running"
+        batch_path.write_text(json.dumps(batch_doc), encoding="utf-8")
+    elif damage == "missing_best":
+        manifest = json.loads((target / "manifest.json").read_text())
+        del manifest["best_solution"]
+        (target / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    elif damage == "accepted_drift":
+        (accepted / "old10" / task / "final_verifier.py").write_text(
+            "# tampered after acceptance\n", encoding="utf-8"
+        )
+    else:
+        manifest_path = trusted / f"autolab_all_4h__autolab_{task}" / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["resource_spec"]["verifier"]["allow_internet"] = True
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises((ValueError, RuntimeError), match=match):
+        evaluate_results(
+            batch_name=batch,
+            runs_root=runs,
+            accepted_root=accepted,
+            trusted_runs_root=trusted,
+            workers=2,
+            repeat=2,
+            output=tmp_path / "report.json",
+            audit_seed="shipped-v0-control17-final-replay-audit-only-20260825-v1",
+            run_command=_FakeDocker(),
+        )
+
+
+def test_evaluate_results_cli_requires_one_explicit_seed_mode_and_redacts_file_seed(
+    tmp_path, monkeypatch, capsys
+):
+    runs, accepted, trusted, batch = _evaluation_fixture(tmp_path, completed=False)
+    secret = "cli-private-seed-that-must-not-be-printed"
+    seed_file = tmp_path / "seed"
+    seed_file.write_text(secret, encoding="utf-8")
+    output = tmp_path / "report.json"
+    from coscientist.experiments import autolab_human_proxy as experiment
+
+    docker = _FakeDocker(seed_forbidden=secret)
+    monkeypatch.setattr(experiment.subprocess, "run", docker)
+    rc = main(
+        [
+            "evaluate-results",
+            "--batch-name",
+            batch,
+            "--runs-root",
+            str(runs),
+            "--accepted-root",
+            str(accepted),
+            "--trusted-runs-root",
+            str(trusted),
+            "--workers",
+            "2",
+            "--repeat",
+            "2",
+            "--output",
+            str(output),
+            "--hidden-seed-file",
+            str(seed_file),
+            "--dry-run",
+        ]
+    )
+
+    assert rc == 0
+    assert secret not in capsys.readouterr().out
+    _assert_secret_absent(json.loads(output.read_text()), secret)
+
+
+def test_evaluate_results_rejects_a_verifier_output_that_echoes_private_seed(tmp_path):
+    runs, accepted, trusted, batch = _evaluation_fixture(tmp_path, completed=True)
+    secret = "private-seed-must-not-cross-output-boundary"
+    seed_file = tmp_path / "seed"
+    seed_file.write_text(secret, encoding="utf-8")
+    output = tmp_path / "report.json"
+
+    with pytest.raises(RuntimeError, match="failed"):
+        evaluate_results(
+            batch_name=batch,
+            runs_root=runs,
+            accepted_root=accepted,
+            trusted_runs_root=trusted,
+            workers=2,
+            repeat=1,
+            output=output,
+            hidden_seed_file=seed_file,
+            run_command=_FakeDocker(leak_seed_in_result=True),
+        )
+
+    _assert_secret_absent(json.loads(output.read_text()), secret)
+
+
+def test_evaluate_results_manifest_hash_binds_the_same_snapshot_as_payload(tmp_path):
+    runs, accepted, trusted, batch = _evaluation_fixture(tmp_path, completed=False)
+    task = "adaptive_compression"
+    manifest_path = runs / f"{batch}__autolab_{task}" / "manifest.json"
+    initial_raw = manifest_path.read_bytes()
+    docker = _FakeDocker()
+    mutated = False
+
+    def mutate_after_contract_read(argv, **kwargs):
+        nonlocal mutated
+        if not mutated:
+            value = json.loads(manifest_path.read_text())
+            value["final_verifier_version"] = 99
+            manifest_path.write_text(json.dumps(value), encoding="utf-8")
+            mutated = True
+        return docker(argv, **kwargs)
+
+    report = evaluate_results(
+        batch_name=batch,
+        runs_root=runs,
+        accepted_root=accepted,
+        trusted_runs_root=trusted,
+        workers=1,
+        repeat=1,
+        output=tmp_path / "report.json",
+        audit_seed="shipped-v0-control17-final-replay-audit-only-20260825-v1",
+        dry_run=True,
+        run_command=mutate_after_contract_read,
+    )
+
+    row = next(item for item in report["tasks"] if item["task"] == task)
+    assert row["run"]["final_verifier_version"] == 3
+    assert row["run"]["manifest_sha256"] == hashlib.sha256(initial_raw).hexdigest()
