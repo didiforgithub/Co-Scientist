@@ -221,8 +221,23 @@ decision 只能是 approve/reject/guide/none。它必须来自本轮对话中的
             if isinstance(raw_outcome, dict)
             else None
         )
+        if outcome is not None:
+            decision = outcome.decision
+            if not isinstance(decision, str) or decision.strip().lower() not in {
+                "approve",
+                "reject",
+                "guide",
+                "none",
+            }:
+                raise RuntimeError(
+                    f"unsupported Human Proxy decision: {decision!r}"
+                )
         if action in {"request_close", "confirm_close"} and outcome is None:
             raise RuntimeError(f"Human Proxy {action} requires an outcome")
+        if state is SessionState.CLOSE_REQUESTED and action != "confirm_close":
+            # The expert is still revising the discussion.  Do not expose or freeze a
+            # provisional judgement until it explicitly confirms the final summary.
+            outcome = None
         if action == "confirm_close":
             if state is not SessionState.CLOSE_REQUESTED:
                 raise RuntimeError("Human Proxy can confirm only a requested close")

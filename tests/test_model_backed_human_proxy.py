@@ -4,6 +4,8 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from coscientist.coevo.agent_system import AgentSystem
 from coscientist.coevo.container import AgentSession, GatewayConfig
 from coscientist.coevo.feishu_human import FeishuHumanSessionService
@@ -156,6 +158,19 @@ def test_model_proxy_freely_requests_then_confirms_close_with_reasoned_outcome(
     assert len(runner.calls) == 2
 
 
+@pytest.mark.parametrize("decision", [None, 7, "allow"])
+def test_model_proxy_rejects_invalid_outcome_decisions(decision):
+    with pytest.raises(RuntimeError, match="unsupported Human Proxy decision"):
+        ModelBackedHumanProxyAgent._parse_turn(
+            {
+                "message": "确认这个结论。",
+                "action": "confirm_close",
+                "outcome": {"decision": decision},
+            },
+            state=SessionState.CLOSE_REQUESTED,
+        )
+
+
 def test_model_proxy_prompt_forbids_execution_and_centers_environment_codesign(
     tmp_path,
 ):
@@ -227,6 +242,69 @@ def test_session_port_stages_the_model_agents_final_outcome_only_at_confirmation
     assert store.outcome("session_001") == outcome
     assert store.sessions()[0].state is SessionState.CLOSED
     assert len(runner.calls) == 2
+
+
+def test_keep_open_does_not_freeze_an_outcome_before_later_confirmation(tmp_path):
+    early = SessionOutcome(
+        decision="reject",
+        rejected_changes=["结论尚未讨论完整"],
+    )
+    final = SessionOutcome(
+        decision="approve",
+        approved_changes=["继续讨论后确认可以采用"],
+    )
+    runner = RecordingRunner(
+        [
+            {
+                "message": "先总结当前讨论。",
+                "action": "request_close",
+                "outcome": early.to_dict(),
+            },
+            {
+                "message": "总结还不准确，需要继续讨论。",
+                "action": "keep_open",
+                "outcome": early.to_dict(),
+            },
+            {
+                "message": "补充信息已经充分。",
+                "action": "request_close",
+                "outcome": final.to_dict(),
+            },
+            {
+                "message": "确认采用更新后的结论。",
+                "action": "confirm_close",
+                "outcome": final.to_dict(),
+            },
+        ]
+    )
+
+    class CoSideAgent:
+        def reply(self, **kwargs):
+            instruction = kwargs["agent_instruction"]
+            if "会话开场" in instruction:
+                return EvidenceReply(text="请一起检查 verifier 变化。")
+            if "总结" in instruction:
+                return EvidenceReply(
+                    text="这是当前总结，请确认是否准确。",
+                    proposed_outcome=SessionOutcome(decision="none"),
+                )
+            return EvidenceReply(text="收到补充信息，继续讨论。")
+
+    store = HumanSessionStore(tmp_path / "run")
+    port = HumanProxySessionPort(
+        service=FeishuHumanSessionService(
+            store=store,
+            transport=LoopbackTransport(),
+            agent=CoSideAgent(),
+        ),
+        proxy_agent=_agent(tmp_path, runner),
+        expert_id="human_proxy_agent",
+    )
+
+    result = port.consult(purpose="verifier_change", context={})
+
+    assert result == final
+    assert store.outcome("session_001") == final
 
 
 def test_agent_system_builds_proxy_from_text_without_importing_or_executing_it(
