@@ -273,9 +273,10 @@ Decide and write into /work:
 
 2. If you change the verifier, write `verifier.py` — same contract as before:
    def verify(payload, ctx) -> {{"feasible","raw","artifacts"}}, stdlib-only, robust to
-   garbage. Unless you are switching modality (below) it MUST still return feasible=True
-   with a finite raw on `seed_solution.json` (in /work), and it must SEPARATE a genuine
-   solution strictly above the degenerate probes. If V needs no change, do not write it.
+   garbage. `seed_solution.json` is only a starting candidate, not a trusted reference;
+   do not preserve its score merely to satisfy a gate. The orchestrator only smoke-tests
+   that your verifier runs safely on the seed and probes. Semantic quality is reviewed
+   by the Supervisor and Human/Proxy. If V needs no change, do not write it.
 
 3. If richer/guiding disclosure helps, write `feedback.py`:
        def feedback(payload, ctx, verify_result, history) -> dict  # {{"detail","artifacts"}}
@@ -1107,8 +1108,7 @@ class AgentSystem:
 
     def _apply_harden(self, ws: Path, *, trigger: str, verdict: dict) -> None:
         """Install whatever the smith authored: a new verifier and/or a feedback module,
-        possibly a full modality switch. Direction-neutral acceptance via the separation
-        invariant (``validate_evaluation``) — never the old "strictly harder" check."""
+        possibly a full modality switch, after mechanical safety and expert review."""
         svc = self.eval_service
         assert svc is not None
         new_vf = ws / "verifier.py"
@@ -1150,7 +1150,7 @@ class AgentSystem:
 
         err = svc.validate_evaluation(
             verify_src=verify_src, feedback_src=feedback_src,
-            seed=val_seed, reference=val_seed, probes=val_probes, ctx=val_ctx)
+            seed=val_seed, probes=val_probes, ctx=val_ctx)
         if err is not None:
             self.store.event("harden_rejected", reason=err[:200],
                              attempted_switch=is_switch)

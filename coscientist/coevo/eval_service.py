@@ -255,24 +255,15 @@ class EvalService:
         return self.evaluator.validate_source(src, sample_payload, self.ctx_provider())
 
     def validate_evaluation(self, *, verify_src: str, feedback_src: Optional[str],
-                            seed: dict, reference: Optional[dict],
-                            probes: list, ctx: Optional[dict] = None,
-                            eps: float = 1e-9) -> Optional[str]:
-        """Direction-neutral acceptance gate for an evolved evaluation.
+                            seed: dict, probes: list,
+                            ctx: Optional[dict] = None) -> Optional[str]:
+        """Mechanical smoke-test for an evolved evaluation before expert review.
 
-        Replaces the "strictly harder" assumption with a SEPARATION invariant that
-        holds for every evolution direction (tighten / expose-more / switch-modality):
-
-          (a) runs clean: ``verify`` executes without error on ``seed`` and on every
-              probe solution; if ``feedback_src`` is given it must run clean too.
-          (b) separation: the known-good ``reference`` (defaults to ``seed``) scores
-              strictly ABOVE every known-degenerate probe by margin >= ``eps``.
-
-        This accepts an unchanged verifier with richer feedback (expose-more), a
-        tighter verifier (separation widens), and a switched modality (the caller
-        passes the NEW seed/reference/probes in the new representation). It rejects
-        only a rewrite that collapses good vs degenerate. Returns an error string or
-        None if OK. Runs everything out-of-process via the Evaluator; never installs.
+        ``seed`` is only a starting candidate, not a trusted semantic reference.  This
+        gate therefore checks execution and interface safety only: ``verify`` must run
+        without error on the seed and probes, and an authored feedback module must
+        return a dict.  Whether the scores are meaningful belongs to the Supervisor and
+        Human/Proxy review.  Runs everything out-of-process; never installs.
         """
         use_ctx = ctx if ctx is not None else self.ctx_provider()
         env = self._eval_env or None
@@ -287,19 +278,10 @@ class EvalService:
                 [], feedback_src=feedback_src, env=env)
             if not isinstance(fb, dict):
                 return "feedback module did not return a dict on seed"
-        ref = reference if reference is not None else seed
-        rr = self.evaluator.run(ref, use_ctx, source=verify_src, env=env)
-        if rr.error:
-            return f"verify fails on reference: {rr.error[:160]}"
-        # (b) separation: reference strictly above every degenerate probe
         for i, p in enumerate(probes or []):
             sol = p.get("solution", {}) if isinstance(p, dict) else {}
             rp = self.evaluator.run(sol, use_ctx, source=verify_src, env=env)
             if rp.error:
-                # a probe that crashes the verifier is degenerate-low by construction
-                continue
-            if rr.raw <= rp.raw + eps:
                 desc = (p.get("description", "") if isinstance(p, dict) else "")[:80]
-                return (f"no separation: reference score {rr.raw:.6g} does not exceed "
-                        f"degenerate probe #{i} ({desc!r}) score {rp.raw:.6g}")
+                return f"verify fails on probe #{i} ({desc!r}): {rp.error[:160]}"
         return None

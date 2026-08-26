@@ -917,7 +917,7 @@ def test_launcher_assigns_unique_run_ids_and_resume(tmp_path, monkeypatch):
 
 # ---------------------------------------------------------------------------
 # free-form evaluator evolution: authored feedback, host-side creds, plateau→proof
-# modality switch, direction-neutral separation invariant, resume, checker ingest,
+# modality switch, evaluator smoke checks, resume, checker ingest,
 # and the GPU/image knob. All offline: no docker, no codex, no network, no GPU —
 # LLM creds are just env strings the host-side subprocess reads, the llm_client is
 # never actually called, and the GPU is asserted only in argv/constructor wiring.
@@ -1035,10 +1035,13 @@ def test_authored_feedback_is_versioned_and_shapes_disclosure(tmp_path, monkeypa
     assert pr.detail == "" and pr.artifacts == {"value": 8.0}
 
 
-def test_validate_evaluation_accepts_expose_more_rejects_collapse(tmp_path, monkeypatch):
-    """The separation invariant is direction-neutral: an unchanged verifier with a
-    RICHER feedback module (expose-more) validates; a verifier that COLLAPSES good vs
-    degenerate is rejected."""
+def test_validate_evaluation_accepts_runtime_safe_verifier_without_score_separation(
+        tmp_path, monkeypatch):
+    """A seed is only a starting candidate, not a trusted semantic reference.
+
+    Candidate evaluators are mechanically smoke-tested here; equal scores for the
+    seed and a degenerate probe must not be rejected before Human/Proxy review.
+    """
     system, A, _ = _authored_bootstrap(tmp_path, monkeypatch, verifier=_CAP_VERIFIER)
     svc = system.eval_service
 
@@ -1049,20 +1052,40 @@ def test_validate_evaluation_accepts_expose_more_rejects_collapse(tmp_path, monk
     # expose-more: same verifier, add guiding feedback, probes unchanged -> accepted.
     err = svc.validate_evaluation(
         verify_src=svc.current_source(), feedback_src=richer,
-        seed=system._seed, reference=system._seed, probes=system._probes,
+        seed=system._seed, probes=system._probes,
         ctx=system._ctx)
     assert err is None, f"expose-more must be accepted, got: {err}"
 
-    # a verifier that scores everything the same collapses the separation -> rejected.
+    # Semantic quality belongs to Supervisor + Human/Proxy review, not this gate.
+    # This verifier is unhelpful, but it is runtime-safe and therefore reaches review.
     collapse = (
         "def verify(payload, ctx):\n"
         "    return {'feasible': True, 'raw': 5.0, 'artifacts': {}}\n"
     )
     err2 = svc.validate_evaluation(
         verify_src=collapse, feedback_src=None,
-        seed=system._seed, reference=system._seed, probes=system._probes,
+        seed=system._seed, probes=system._probes,
         ctx=system._ctx)
-    assert err2 is not None and "separation" in err2
+    assert err2 is None
+
+
+def test_validate_evaluation_rejects_verifier_that_crashes_on_a_probe(
+        tmp_path, monkeypatch):
+    """Removing semantic score checks must not remove runtime safety checks."""
+    system, _, _ = _authored_bootstrap(tmp_path, monkeypatch, verifier=_CAP_VERIFIER)
+    crashing = (
+        "def verify(payload, ctx):\n"
+        "    if payload.get('value') == 9999:\n"
+        "        raise RuntimeError('probe crash')\n"
+        "    return {'feasible': True, 'raw': 0.0, 'artifacts': {}}\n"
+    )
+
+    err = system.eval_service.validate_evaluation(
+        verify_src=crashing, feedback_src=None,
+        seed=system._seed, probes=system._probes,
+        ctx=system._ctx)
+
+    assert err is not None and "fails on probe" in err
 
 
 def test_llm_creds_reach_eval_subprocess_never_the_container(tmp_path, monkeypatch):
@@ -1253,6 +1276,8 @@ def test_optimization_task_harden_prompt_withholds_reframe(tmp_path, monkeypatch
     assert "mode_switch.json" not in p, "reframe output leaked into an optimization prompt"
     assert "(c) SWITCH" not in p, "reframe option (c) leaked into an optimization prompt"
     assert "admits NO proof" in p, "the withheld-bias sentence is missing"
+    assert "strictly above the degenerate probes" not in p
+    assert "`seed_solution.json` is only a starting candidate" in p
     # the game stays construction; no switch happened.
     assert system._mode == "construction"
 
@@ -1306,9 +1331,9 @@ def test_solver_scratchpad_reaches_supervisor_harden_workspace(tmp_path, monkeyp
     assert "GOCACHE" in p
 
 
-def test_validate_evaluation_accepts_a_separating_modality_change(tmp_path, monkeypatch):
-    """The invariant accepts a full representation change (proof game) as long as a
-    genuine argument outscores the degenerate probes; a verifier that ties them fails."""
+def test_validate_evaluation_smoke_tests_modality_change_without_score_ordering(
+        tmp_path, monkeypatch):
+    """A representation change is mechanically checked without semantic ordering."""
     system, A, _ = _authored_bootstrap(tmp_path, monkeypatch, verifier=_CAP_VERIFIER)
     svc = system.eval_service
 
@@ -1319,19 +1344,19 @@ def test_validate_evaluation_accepts_a_separating_modality_change(tmp_path, monk
     ]
     err = svc.validate_evaluation(
         verify_src=_PROOF_VERIFIER, feedback_src=None,
-        seed=proof_seed, reference=proof_seed, probes=proof_probes, ctx={})
-    assert err is None, f"a separating modality change must be accepted, got: {err}"
+        seed=proof_seed, probes=proof_probes, ctx={})
+    assert err is None, f"a runtime-safe modality change must be accepted, got: {err}"
 
-    # a proof verifier that scores every argument the same collapses separation.
+    # A flat scorer is semantically weak, but runtime-safe; Human/Proxy reviews it.
     flat_proof = (
         "def verify(payload, ctx):\n"
         "    return {'feasible': True, 'raw': 7.0, 'artifacts': {}}\n"
     )
     err2 = svc.validate_evaluation(
         verify_src=flat_proof, feedback_src=None,
-        seed=proof_seed, reference=proof_seed,
+        seed=proof_seed,
         probes=[{"description": "x", "solution": {"argument": "y"}}], ctx={})
-    assert err2 is not None and "separation" in err2
+    assert err2 is None
 
 
 def test_resume_recovers_mode_and_feedback_source(tmp_path):
