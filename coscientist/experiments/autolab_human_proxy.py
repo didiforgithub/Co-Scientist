@@ -625,6 +625,7 @@ def _tree_inventory(
     *,
     max_file_bytes: int | None = None,
     max_total_bytes: int | None = None,
+    required_entry: str | None = "tests/test.sh",
 ) -> dict[str, str]:
     if max_file_bytes is None:
         max_file_bytes = MAX_CHECKER_FILE_BYTES
@@ -648,8 +649,10 @@ def _tree_inventory(
             inventory[path.relative_to(root).as_posix()] = _sha256_bytes(raw)
         elif not stat.S_ISDIR(mode):
             raise ValueError(f"checker contains a non-regular entry: {path}")
-    if "tests/test.sh" not in inventory:
-        raise ValueError(f"corrected Control checker lacks tests/test.sh: {root}")
+    if not inventory:
+        raise ValueError(f"checker inventory is empty: {root}")
+    if required_entry is not None and required_entry not in inventory:
+        raise ValueError(f"corrected Control checker lacks {required_entry}: {root}")
     return inventory
 
 
@@ -1656,7 +1659,7 @@ def _build_replay_contracts(
             if trusted_run.is_symlink() or not trusted_run.is_dir():
                 raise ValueError(f"trusted checker source run is missing for {task}")
             checker = trusted_run / "checker"
-            checker_inventory = _tree_inventory(checker)
+            checker_inventory = _tree_inventory(checker, required_entry=None)
             trusted_manifest = trusted_run / "manifest.json"
             resource, trusted_manifest_sha = _read_replay_resource(trusted_manifest)
             image = _inspect_immutable_image(resource["image"], run_command=run_command)

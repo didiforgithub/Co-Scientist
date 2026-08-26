@@ -206,8 +206,13 @@ def _evaluation_fixture(
         checker_batch = "autolab_all_4h" if group == "old10" else "autolab_proofgate_4h"
         for task in tasks:
             trusted = trusted_root / f"{checker_batch}__autolab_{task}"
-            (trusted / "checker" / "tests").mkdir(parents=True)
-            (trusted / "checker" / "tests" / "test.sh").write_text(
+            checker_entry = (
+                trusted / "checker" / "test.sh"
+                if task == "flash_attention"
+                else trusted / "checker" / "tests" / "test.sh"
+            )
+            checker_entry.parent.mkdir(parents=True)
+            checker_entry.write_text(
                 f"trusted checker {checker_batch} {task}\n", encoding="utf-8"
             )
             (trusted / "manifest.json").write_text(
