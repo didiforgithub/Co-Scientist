@@ -43,6 +43,20 @@ def _subprocess_env(extra: Optional[dict]) -> Optional[dict]:
     return {**os.environ, **{k: str(v) for k, v in extra.items() if v is not None}}
 
 
+def _write_private_json(path: Path, value: Any) -> None:
+    """Write subprocess input without exposing it through argv or broad permissions."""
+
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = -1
+            json.dump(value, stream)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    os.chmod(path, 0o600)
+
+
 # The flawed initial verifier. Note ``dof = N - 2`` — the modes are never
 # debited. This is the hole the evaluator-evolution loop must discover and fix.
 INITIAL_VERIFIER_SRC = '''\
@@ -96,8 +110,10 @@ _RUNNER = textwrap.dedent(
     spec = importlib.util.spec_from_file_location("verifier_mod", sys.argv[1])
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    payload = json.loads(sys.argv[2])
-    ctx = json.loads(sys.argv[3])
+    with open(sys.argv[2], encoding="utf-8") as fh:
+        inputs = json.load(fh)
+    payload = inputs["payload"]
+    ctx = inputs["ctx"]
     out = mod.verify(payload, ctx)
     print("__VERIFY_RESULT__" + json.dumps(out))
     """
@@ -116,10 +132,12 @@ _FEEDBACK_RUNNER = textwrap.dedent(
     spec = importlib.util.spec_from_file_location("feedback_mod", sys.argv[1])
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    payload = json.loads(sys.argv[2])
-    ctx = json.loads(sys.argv[3])
-    verify_result = json.loads(sys.argv[4])
-    history = json.loads(sys.argv[5])
+    with open(sys.argv[2], encoding="utf-8") as fh:
+        inputs = json.load(fh)
+    payload = inputs["payload"]
+    ctx = inputs["ctx"]
+    verify_result = inputs["verify_result"]
+    history = inputs["history"]
     out = mod.feedback(payload, ctx, verify_result, history)
     print("__FEEDBACK_RESULT__" + json.dumps(out))
     """
@@ -304,10 +322,12 @@ class Evaluator:
             vf = Path(d) / "verifier_mod.py"
             vf.write_text(src, encoding="utf-8")
             (Path(d) / "llm_client.py").write_text(_LLM_CLIENT_SRC, encoding="utf-8")
+            input_path = Path(d) / "verify_input.json"
+            _write_private_json(input_path, {"payload": payload, "ctx": ctx_x})
             try:
                 if self.exec_backend is None:
                     proc = subprocess.run(
-                        [sys.executable, "-c", _RUNNER, str(vf), json.dumps(payload), json.dumps(ctx)],
+                        [sys.executable, "-c", _RUNNER, str(vf), str(input_path)],
                         capture_output=True,
                         text=True,
                         timeout=eff_timeout,
@@ -317,7 +337,7 @@ class Evaluator:
                 else:
                     proc = self._docker_exec(
                         d, _RUNNER,
-                        ["verifier_mod.py", json.dumps(payload), json.dumps(ctx_x)],
+                        ["/w/verifier_mod.py", "/w/verify_input.json"],
                         timeout=eff_timeout, mounts=mounts)
             except subprocess.TimeoutExpired:
                 return RunResult(False, 0.0, {}, error="verifier timeout")
@@ -359,12 +379,20 @@ class Evaluator:
             ff = Path(d) / "feedback_mod.py"
             ff.write_text(feedback_src, encoding="utf-8")
             (Path(d) / "llm_client.py").write_text(_LLM_CLIENT_SRC, encoding="utf-8")
+            input_path = Path(d) / "feedback_input.json"
+            _write_private_json(
+                input_path,
+                {
+                    "payload": payload,
+                    "ctx": ctx_x,
+                    "verify_result": verify_result,
+                    "history": history,
+                },
+            )
             try:
                 if self.exec_backend is None:
                     proc = subprocess.run(
-                        [sys.executable, "-c", _FEEDBACK_RUNNER, str(ff),
-                         json.dumps(payload), json.dumps(ctx),
-                         json.dumps(verify_result), json.dumps(history)],
+                        [sys.executable, "-c", _FEEDBACK_RUNNER, str(ff), str(input_path)],
                         capture_output=True,
                         text=True,
                         timeout=eff_timeout,
@@ -374,8 +402,7 @@ class Evaluator:
                 else:
                     proc = self._docker_exec(
                         d, _FEEDBACK_RUNNER,
-                        ["feedback_mod.py", json.dumps(payload), json.dumps(ctx_x),
-                         json.dumps(verify_result), json.dumps(history)],
+                        ["/w/feedback_mod.py", "/w/feedback_input.json"],
                         timeout=eff_timeout, mounts=mounts)
             except subprocess.TimeoutExpired:
                 return {}

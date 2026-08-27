@@ -24,12 +24,44 @@ verifier) unchanged — it is only *wrapped*, not modified. V* never lives here.
 
 from __future__ import annotations
 
+import base64
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Optional
 
 from ..demo.evaluator import Evaluator
+
+
+def private_literal_variants(value: str) -> tuple[str, ...]:
+    """Return deterministic textual encodings that must not cross Eval delivery."""
+
+    if not isinstance(value, str) or not value:
+        return ()
+    raw = value.encode("utf-8")
+    variants = {
+        value,
+        raw.hex(),
+        base64.b64encode(raw).decode("ascii"),
+        base64.b64encode(raw).decode("ascii").rstrip("="),
+        base64.urlsafe_b64encode(raw).decode("ascii"),
+        base64.urlsafe_b64encode(raw).decode("ascii").rstrip("="),
+    }
+    try:
+        entropy = bytes.fromhex(value)
+    except ValueError:
+        entropy = b""
+    if entropy:
+        variants.update(
+            {
+                entropy.hex(),
+                base64.b64encode(entropy).decode("ascii"),
+                base64.b64encode(entropy).decode("ascii").rstrip("="),
+                base64.urlsafe_b64encode(entropy).decode("ascii"),
+                base64.urlsafe_b64encode(entropy).decode("ascii").rstrip("="),
+            }
+        )
+    return tuple(sorted((item for item in variants if item), key=lambda x: (-len(x), x)))
 
 
 class FeedbackLevel(str, Enum):
@@ -105,6 +137,10 @@ class EvalService:
     # underlying Evaluator so every verify/feedback/validate runs in that container
     # — the seam that keeps verifier resources SEPARATE from the Solver container.
     _verify_backend: Optional[dict] = None
+    # Optional protected strings scrubbed from exceptional evaluator errors before
+    # QueryResult, hooks, stores, or the Solver shim can observe them. Empty preserves
+    # the behavior of all existing arms.
+    private_literals: tuple[str, ...] = ()
     _t0: float = field(default_factory=time.monotonic)
     _clock: Callable[[], float] = time.monotonic
     _next_qid: int = 0
@@ -119,6 +155,18 @@ class EvalService:
         # verify/feedback/validate runs in that container. Default None ⇒ unchanged.
         if self._verify_backend is not None:
             self.evaluator.exec_backend = self._verify_backend
+        self.private_literals = tuple(
+            sorted(
+                {str(value) for value in self.private_literals if str(value)},
+                key=lambda value: (-len(value), value),
+            )
+        )
+
+    def _scrub_private(self, detail: str) -> str:
+        scrubbed = str(detail)
+        for literal in self.private_literals:
+            scrubbed = scrubbed.replace(literal, "[REDACTED]")
+        return scrubbed
 
     # ---- Solver-facing: the black box ----------------------------------
     def query(self, payload: dict, *, who: str = "solver") -> QueryResult:
@@ -134,8 +182,9 @@ class EvalService:
         r = self.evaluator.run(payload, self.ctx_provider(), env=self._eval_env or None)
 
         if r.error is not None:
+            detail = self._scrub_private(r.error)[-200:]
             result = QueryResult(
-                ok=False, score=None, feasible=False, detail=r.error[-200:],
+                ok=False, score=None, feasible=False, detail=detail,
                 query_id=qid, verifier_version=ver, feedback_level=self.feedback_level.value,
             )
         elif self.evaluator.current.feedback_src is None:

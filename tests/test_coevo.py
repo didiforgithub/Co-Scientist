@@ -14,15 +14,22 @@ Everything here runs offline, deterministic, no network and no keys:
 
 from __future__ import annotations
 
+import base64
 import json
+import stat
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 
 from coscientist.demo import taskspec
 from coscientist.demo.evaluator import Evaluator
 from coscientist.coevo.budget import Deadline
 from coscientist.coevo.driver import CoevoConfig, LogicalClock, build_run
-from coscientist.coevo.eval_service import EvalService, FeedbackLevel
+from coscientist.coevo.eval_service import (
+    EvalService,
+    FeedbackLevel,
+    private_literal_variants,
+)
 from coscientist.coevo.gateway import Gateway
 from coscientist.coevo.solver import StubSolver
 from coscientist.coevo.supervisor import Supervisor, SupervisorMode
@@ -72,6 +79,63 @@ def test_feedback_level_controls_disclosure():
     assert full.artifacts is not None and "reduced_chi2" in full.artifacts
     # the scalar is identical across levels — only disclosure changes.
     assert only.score == feas.score == full.score
+
+
+def test_eval_service_redacts_private_error_literals_before_hook_and_shim():
+    from coscientist.coevo.agent_system import AgentSystem
+
+    seed = "0123456789abcdef" * 4
+    variants = private_literal_variants(seed)
+    svc = EvalService(
+        evaluator=Evaluator.initial(),
+        ctx_provider=taskspec.workspace_context,
+        feedback_level=FeedbackLevel.FEASIBLE_SCORE,
+        private_literals=variants,
+    )
+    error = "failure " + " | ".join(variants)
+    svc.evaluator.run = lambda *_args, **_kwargs: SimpleNamespace(error=error)
+    delivered = []
+    svc.on_query = lambda _record, result: delivered.append(result.detail)
+
+    class Store:
+        def cost(self, **_kwargs):
+            pass
+
+    system = object.__new__(AgentSystem)
+    system.eval_service = svc
+    system.store = Store()
+    system._best_score = float("-inf")
+    system._best_payload = None
+    shim = AgentSystem._handle_shim(system, "eval", {"solution": {}})
+
+    assert "[REDACTED]" in shim["detail"]
+    assert delivered == [shim["detail"]]
+    assert all(value not in shim["detail"] for value in variants)
+
+
+def test_eval_service_private_error_redaction_is_disabled_by_default():
+    seed = "0123456789abcdef" * 4
+    svc = _service(FeedbackLevel.FEASIBLE_SCORE)
+    svc.evaluator.run = lambda *_args, **_kwargs: SimpleNamespace(
+        error=f"failure leaked={seed}"
+    )
+    assert seed in svc.query({}).detail
+
+
+def test_agent_system_derives_private_error_literals_from_hidden_seed():
+    from coscientist.coevo.agent_system import AgentSystem
+
+    seed = "0123456789abcdef" * 4
+    system = object.__new__(AgentSystem)
+    system._ctx = {"hidden_seed": seed}
+    variants = AgentSystem._eval_private_literals(system)
+    assert seed in variants
+    assert seed.encode().hex() in variants
+    assert base64.b64encode(seed.encode()).decode() in variants
+    assert base64.urlsafe_b64encode(seed.encode()).decode().rstrip("=") in variants
+    entropy = bytes.fromhex(seed)
+    assert base64.b64encode(entropy).decode() in variants
+    assert base64.urlsafe_b64encode(entropy).decode().rstrip("=") in variants
 
 
 def test_query_hook_logs_returned_shape():
@@ -915,6 +979,254 @@ def test_launcher_assigns_unique_run_ids_and_resume(tmp_path, monkeypatch):
     assert all(isinstance(r["pid"], int) for r in man["runs"])
 
 
+def test_launcher_freeze_verifier_survives_initial_pending_and_respawn_paths(
+        tmp_path, monkeypatch):
+    """Frozen-verifier mode is immutable and reaches every child launch path."""
+    from coscientist.coevo import launcher as L
+
+    calls = []
+
+    class FakePopen:
+        def __init__(self, argv, **kw):
+            calls.append(argv)
+            self.pid = 6000 + len(calls)
+
+    monkeypatch.setattr(L.subprocess, "Popen", FakePopen)
+    inputs = []
+    for name in ("task_a", "task_b"):
+        inp = tmp_path / "problems" / name
+        inp.mkdir(parents=True)
+        inputs.append(inp)
+
+    batch = L.Batch("frozen", runs_dir=tmp_path / "runs")
+    batch.start(inputs, hours=4.0, cpu_slots=1, freeze_verifier=True)
+    assert len(calls) == 1
+    assert "--freeze-verifier" in calls[0]
+
+    man = json.loads(batch.manifest_path.read_text())
+    assert man["schema_version"] == 3
+    assert man["freeze_verifier"] is True
+    assert all(r["freeze_verifier"] is True for r in man["runs"])
+    assert all(c["freeze_verifier"] is True
+               for c in man["run_contracts"].values())
+    assert all(batch._spec_of(r).freeze_verifier is True for r in man["runs"])
+
+    running = next(r for r in man["runs"] if r["status"] == "running")
+    run_dir = batch.runs_dir / running["run_id"]
+    run_dir.mkdir(parents=True)
+    (run_dir / "events.jsonl").write_text(
+        json.dumps({"kind": "run_stop", "best_score": 1.0}) + "\n")
+    monkeypatch.setattr(L, "_alive", lambda pid: False)
+    promote_at = running["last_launch_epoch"] + 100.0
+    batch._wave_tick(now=promote_at)
+    assert len(calls) == 2
+    assert "--freeze-verifier" in calls[1]
+
+    man = json.loads(batch.manifest_path.read_text())
+    promoted = next(r for r in man["runs"] if r["status"] == "running")
+    promoted_dir = batch.runs_dir / promoted["run_id"]
+    promoted_dir.mkdir(parents=True)
+    batch._wave_tick(now=promoted["last_launch_epoch"] + 100.0)
+    assert len(calls) == 3
+    assert "--freeze-verifier" in calls[2]
+
+
+def test_launcher_freeze_verifier_drift_blocks_resume_and_watcher_spawn(
+        tmp_path, monkeypatch):
+    """Neither idempotent start nor a watcher can weaken a frozen batch."""
+    import pytest
+    from coscientist.coevo import launcher as L
+
+    inputs = []
+    for name in ("task_a", "task_b"):
+        inp = tmp_path / "problems" / name
+        inp.mkdir(parents=True)
+        inputs.append(inp)
+    monkeypatch.setattr(L.Batch, "_spawn", lambda *a, **k: 7001)
+    batch = L.Batch("frozen", runs_dir=tmp_path / "runs")
+    batch.start(inputs, hours=4.0, cpu_slots=1, freeze_verifier=True)
+
+    monkeypatch.setattr(
+        batch, "_wave_tick",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("drift reached resume/watch scheduling")))
+    with pytest.raises(ValueError, match="freeze|frozen|contract"):
+        batch.start(inputs, hours=4.0, cpu_slots=1, freeze_verifier=False)
+
+    monkeypatch.undo()
+    man = json.loads(batch.manifest_path.read_text())
+    pending = next(r for r in man["runs"] if r["status"] == "pending")
+    pending["freeze_verifier"] = False
+    batch._write_manifest(man)
+    spec = batch._spec_of(pending)
+    monkeypatch.setattr(
+        L.subprocess, "Popen",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("drift reached Popen")))
+    with pytest.raises(ValueError, match="freeze|frozen|contract"):
+        batch._spawn(spec, budget_s=100.0, python="python",
+                     extra_args=[], cpu_mode=True)
+
+    running = next(r for r in man["runs"] if r["status"] == "running")
+    run_dir = batch.runs_dir / running["run_id"]
+    run_dir.mkdir(parents=True)
+    (run_dir / "events.jsonl").write_text(
+        json.dumps({"kind": "run_stop", "best_score": 1.0}) + "\n")
+    monkeypatch.setattr(L, "_alive", lambda pid: False)
+    with pytest.raises(ValueError, match="freeze|frozen|contract"):
+        batch._wave_tick(now=running["last_launch_epoch"] + 100.0)
+
+
+def test_launcher_existing_schema_two_defaults_missing_freeze_contract_to_false(
+        tmp_path, monkeypatch):
+    """A real pre-feature schema-v2 HP contract remains resumable as non-frozen."""
+    import hashlib
+    from coscientist.coevo import launcher as L
+
+    inp = tmp_path / "problem"
+    inp.mkdir()
+    context_dir = tmp_path / "contexts"
+    context_dir.mkdir()
+    context = context_dir / "problem.md"
+    context.write_text("accepted evaluator")
+    digest = hashlib.sha256(context.read_bytes()).hexdigest()
+    batch = L.Batch("existing", runs_dir=tmp_path / "runs")
+    run_id = "existing__problem"
+    input_abs = str(inp.resolve())
+    context_abs = str(context.resolve())
+    record = {
+        "run_id": run_id, "input_dir": input_abs,
+        "log": str(batch.batch_dir / f"{run_id}.log"), "pid": 7101,
+        "status": "running", "budget_s": 14400.0,
+        "deadline_epoch": 20000.0, "last_launch_epoch": 1000.0,
+        "respawns": 0, "resource_config": None, "gpu_device": "slot0",
+        "human_proxy_context": context_abs,
+        "human_proxy_context_sha256": digest,
+        "human_proxy_context_dir": str(context_dir.resolve()),
+        "batch_input_dirs": [input_abs],
+        "human_agent_timeout_s": 300.0,
+        "human_agent_model": "gpt-5.6-sol",
+        "human_agent_reasoning_effort": "high",
+        "solver_model": None, "solver_reasoning_effort": None,
+        "feedback": "with_artifacts", "solver_strength": "weak",
+    }
+    batch._write_manifest({
+        "schema_version": 2, "batch": "existing", "hours": 4.0,
+        "runs_dir": str(batch.runs_dir.resolve()), "python": "python",
+        "gpu_devices": ["slot0"], "cpu_mode": True, "extra_args": [],
+        "human_agent": {"timeout_s": 300.0, "model": "gpt-5.6-sol",
+                        "reasoning_effort": "high"},
+        "solver": None, "human_proxy_context_dir": str(context_dir.resolve()),
+        "inputs": [input_abs], "feedback": "with_artifacts",
+        "solver_strength": "weak",
+        "run_contracts": {run_id: {
+            "input_dir": input_abs, "human_proxy_context": context_abs,
+            "human_proxy_context_sha256": digest,
+        }},
+        "runs": [record],
+    })
+
+    man = batch._read_manifest()
+    spec = batch._spec_of(record)
+    assert spec.freeze_verifier is False
+    batch._verify_spawn_manifest_contract(spec)
+    monkeypatch.setattr(L, "_alive", lambda pid: True)
+    assert batch._wave_tick(now=1500.0) == [
+        {"run_id": run_id, "action": "alive"}]
+
+
+def test_launcher_schema_three_requires_exact_boolean_freeze_markers(
+        tmp_path, monkeypatch):
+    """Schema 3 rejects missing, non-boolean, or contradictory freeze markers."""
+    import copy
+    import pytest
+    from coscientist.coevo import launcher as L
+
+    inp = tmp_path / "problem"
+    inp.mkdir()
+    monkeypatch.setattr(L.Batch, "_spawn", lambda *a, **k: 7201)
+    batch = L.Batch("strict", runs_dir=tmp_path / "runs")
+    batch.start([inp], hours=4.0, cpu_slots=1, freeze_verifier=True)
+    pristine = json.loads(batch.manifest_path.read_text())
+    run_id = pristine["runs"][0]["run_id"]
+
+    def reject(mutator):
+        tampered = copy.deepcopy(pristine)
+        mutator(tampered)
+        batch._write_manifest(tampered)
+        with pytest.raises(ValueError, match="freeze|boolean|schema|contract"):
+            batch._read_manifest()
+
+    reject(lambda m: m.pop("freeze_verifier"))
+    reject(lambda m: m.__setitem__("freeze_verifier", "true"))
+    reject(lambda m: m.__setitem__("freeze_verifier", 1))
+    reject(lambda m: m["runs"][0].pop("freeze_verifier"))
+    reject(lambda m: m["runs"][0].__setitem__("freeze_verifier", "true"))
+    reject(lambda m: m["runs"][0].__setitem__("freeze_verifier", 1))
+    reject(lambda m: m["run_contracts"][run_id].pop("freeze_verifier"))
+    reject(lambda m: m["run_contracts"][run_id].__setitem__(
+        "freeze_verifier", "true"))
+    reject(lambda m: m["run_contracts"][run_id].__setitem__(
+        "freeze_verifier", 1))
+    reject(lambda m: m.__setitem__("freeze_verifier", False))
+    reject(lambda m: m["runs"][0].__setitem__("freeze_verifier", False))
+    reject(lambda m: m["run_contracts"][run_id].__setitem__(
+        "freeze_verifier", False))
+
+
+def test_launcher_preflights_all_run_contracts_before_live_or_terminal_tick(
+        tmp_path, monkeypatch):
+    """Watcher validates every run even when no process could be spawned."""
+    import pytest
+    from coscientist.coevo import launcher as L
+
+    inputs = []
+    for name in ("task_a", "task_b"):
+        inp = tmp_path / "problems" / name
+        inp.mkdir(parents=True)
+        inputs.append(inp)
+    monkeypatch.setattr(L.Batch, "_spawn", lambda *a, **k: 7301)
+    batch = L.Batch("preflight", runs_dir=tmp_path / "runs")
+    batch.start(inputs, hours=4.0, cpu_slots=2, freeze_verifier=True)
+    pristine = json.loads(batch.manifest_path.read_text())
+
+    for status in ("running", "done"):
+        man = json.loads(json.dumps(pristine))
+        man["runs"][1]["status"] = status
+        man["runs"][1]["feedback"] = "score_only"
+        batch._write_manifest(man)
+        monkeypatch.setattr(L, "_alive", lambda pid: True)
+        with pytest.raises(ValueError, match="feedback|contract"):
+            batch._wave_tick(now=2000.0)
+
+
+def test_launcher_idempotent_start_preflights_every_run_before_scheduling(
+        tmp_path, monkeypatch):
+    """An alive non-first run cannot hide immutable drift from repeated start."""
+    import pytest
+    from coscientist.coevo import launcher as L
+
+    inputs = []
+    for name in ("task_a", "task_b"):
+        inp = tmp_path / "problems" / name
+        inp.mkdir(parents=True)
+        inputs.append(inp)
+    monkeypatch.setattr(L.Batch, "_spawn", lambda *a, **k: 7401)
+    batch = L.Batch("resume_preflight", runs_dir=tmp_path / "runs")
+    settings = dict(hours=4.0, cpu_slots=2, freeze_verifier=True)
+    batch.start(inputs, **settings)
+    man = json.loads(batch.manifest_path.read_text())
+    man["runs"][1]["solver_strength"] = "strong"
+    batch._write_manifest(man)
+    monkeypatch.setattr(
+        batch, "_wave_tick",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("contract drift reached scheduling")))
+
+    with pytest.raises(ValueError, match="solver strength|contract"):
+        batch.start(inputs, **settings)
+
+
 def _launcher_human_proxy_fixture(tmp_path):
     inputs = []
     context_dir = tmp_path / "private_contexts"
@@ -996,6 +1308,7 @@ def test_launcher_binds_distinct_human_proxy_contexts_and_persists_hashes(
             "human_proxy_context": str(context.resolve()),
             "human_proxy_context_sha256": hashlib.sha256(
                 context.read_bytes()).hexdigest(),
+            "freeze_verifier": False,
         }
 
     # The exact same contract is a true idempotent resume, not a re-plan/re-spawn.
@@ -1289,6 +1602,7 @@ def test_launcher_cli_threads_first_class_human_and_solver_flags(tmp_path, monke
         "--human-agent-reasoning-effort", "high",
         "--solver-model", "gpt-5.6-sol",
         "--solver-reasoning-effort", "high",
+        "--freeze-verifier",
         "--feedback", "with_artifacts", "--solver-strength", "weak",
     ])
 
@@ -1298,6 +1612,7 @@ def test_launcher_cli_threads_first_class_human_and_solver_flags(tmp_path, monke
     assert seen["human_agent_reasoning_effort"] == "high"
     assert seen["solver_model"] == "gpt-5.6-sol"
     assert seen["solver_reasoning_effort"] == "high"
+    assert seen["freeze_verifier"] is True
     assert seen["feedback"] == "with_artifacts"
     assert seen["solver_strength"] == "weak"
 
@@ -1787,7 +2102,7 @@ def test_llm_creds_reach_eval_subprocess_never_the_container(tmp_path, monkeypat
     (codex_home / "auth.json").write_text('{"OPENAI_API_KEY": "irrelevant"}')
     gw = C.GatewayConfig(codex_home=codex_home, model="m")
 
-    captured = {}
+    captured = {"calls": []}
 
     class _Proc:
         returncode = 0
@@ -2094,6 +2409,86 @@ def test_resume_recovers_mode_and_feedback_source(tmp_path):
     # the v1 feedback module is rebuilt and shapes disclosure.
     assert system.eval_service.current_feedback_source() is not None
     assert system.eval_service.query({"value": 4}).detail == "guidance-42"
+
+
+def test_resume_pins_verifier_backend_to_immutable_manifest_image(tmp_path, monkeypatch):
+    from coscientist.coevo import agent_system as A
+    from coscientist.demo import evaluator as EV
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "resource.toml").write_text(
+        "[verifier]\nimage='retargeted:latest'\ncpus=3\nmemory_mb=4096\n"
+        "timeout_sec=77\nallow_internet=false\n"
+    )
+    run = tmp_path / "run"
+    bws = run / "bootstrap_ws"
+    vdir = run / "supervisor/verifier_versions"
+    checker = run / "checker"
+    bws.mkdir(parents=True)
+    vdir.mkdir(parents=True)
+    checker.mkdir()
+    verifier = (
+        "def verify(payload, ctx):\n"
+        "    return {'feasible': True, 'raw': 1.0, 'artifacts': {}}\n"
+    )
+    (bws / "verifier.py").write_text(verifier)
+    (bws / "ctx.json").write_text("{}")
+    (bws / "seed_solution.json").write_text("{}")
+    (bws / "probes.json").write_text("[]")
+    (bws / "solver_env.json").write_text("{}")
+    (bws / "reframe_policy.json").write_text("{}")
+    (vdir / "v0.py").write_text(verifier)
+    (run / "supervisor/versions.jsonl").write_text(
+        json.dumps({"version": 0, "origin": "accepted_final_evaluator"}) + "\n"
+    )
+    pinned = "sha256:" + "a" * 64
+    (run / "manifest.json").write_text(
+        json.dumps({"pinned_verifier_image_id": pinned})
+    )
+    (run / "events.jsonl").write_text("")
+
+    system = A.AgentSystem(raw_input_dir=raw, run_dir=run, budget_s=60)
+    system._resume_from_disk()
+    backend = system.eval_service.evaluator.exec_backend
+    assert backend["image"] == pinned
+    assert backend["cpus"] == 3.0
+    assert backend["memory_mb"] == 4096
+    assert backend["timeout_s"] == 77.0
+    assert backend["allow_internet"] is False
+
+    captured = {}
+
+    def fake_run(argv, **_kwargs):
+        captured["argv"] = list(argv)
+        return SimpleNamespace(
+            returncode=0,
+            stdout='__VERIFY_RESULT__{"feasible": true, "raw": 1.0, "artifacts": {}}\n',
+            stderr="",
+        )
+
+    monkeypatch.setattr(EV.subprocess, "run", fake_run)
+    result = system.eval_service.evaluator.run({}, {})
+    assert result.feasible
+    assert pinned in captured["argv"]
+    assert "retargeted:latest" not in captured["argv"]
+
+
+def test_resume_rejects_malformed_pinned_verifier_image(tmp_path):
+    from coscientist.coevo import agent_system as A
+
+    system = object.__new__(A.AgentSystem)
+    system.run_dir = tmp_path
+    system.resource_spec = A._resources.ResourceSpec.defaults()
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({"pinned_verifier_image_id": "retargeted:latest"})
+    )
+    try:
+        system._apply_pinned_verifier_image()
+    except RuntimeError as exc:
+        assert "pinned verifier image" in str(exc)
+    else:
+        raise AssertionError("malformed immutable image pin was accepted")
 
 
 def test_bootstrap_ingests_an_existing_checker_as_v0(tmp_path, monkeypatch):
@@ -2499,7 +2894,8 @@ def test_host_subprocess_verify_unchanged_without_backend(tmp_path, monkeypatch)
     from coscientist.demo import evaluator as EV
     from coscientist.demo.evaluator import Evaluator
 
-    seen = {"docker": False, "python": False}
+    secret = "host-private-seed-0123456789"
+    seen = {"docker": False, "python": False, "argv": [], "input_modes": []}
     real_run = EV.subprocess.run
 
     def fake_run(argv, **kw):
@@ -2507,16 +2903,94 @@ def test_host_subprocess_verify_unchanged_without_backend(tmp_path, monkeypatch)
             seen["docker"] = True
         if argv and argv[0] == EV.sys.executable:
             seen["python"] = True
+            seen["argv"].append(list(argv))
+            for item in argv:
+                path = Path(str(item))
+                if path.name.endswith("_input.json") and path.is_file():
+                    seen["input_modes"].append(stat.S_IMODE(path.stat().st_mode))
         return real_run(argv, **kw)
 
     monkeypatch.setattr(EV.subprocess, "run", fake_run)
     ev = Evaluator()  # exec_backend defaults to None
     ev.versions.append(EV.VerifierVersion(
-        0, "def verify(p, c):\n    return {'feasible': True, 'raw': 2.0, 'artifacts': {}}\n",
+        0, "def verify(p, c):\n"
+           "    ok = p.get('seed') == c.get('hidden_seed')\n"
+           "    return {'feasible': ok, 'raw': (2.0 if ok else 0.0), 'artifacts': {}}\n",
         "t", ""))
-    r = ev.run({"value": 1}, {})
+    r = ev.run({"seed": secret}, {"hidden_seed": secret})
+    fb = ev.run_feedback(
+        {"seed": secret}, {"hidden_seed": secret},
+        {"feasible": True, "raw": 2.0, "artifacts": {}}, [],
+        feedback_src=(
+            "def feedback(payload, ctx, verify_result, history):\n"
+            "    return {'detail': 'ok' if payload['seed'] == ctx['hidden_seed'] else 'bad'}\n"
+        ),
+    )
     assert r.feasible and r.raw == 2.0
+    assert fb["detail"] == "ok"
     assert seen["python"] is True and seen["docker"] is False
+    assert seen["input_modes"] == [0o600, 0o600]
+    assert all(secret not in str(arg) for argv in seen["argv"] for arg in argv)
+
+
+def test_docker_verifier_payload_and_ctx_use_private_input_file(tmp_path, monkeypatch):
+    from coscientist.demo import evaluator as EV
+
+    secret = "docker-private-seed-0123456789"
+    captured = {"calls": []}
+
+    def fake_run(argv, **_kwargs):
+        captured["calls"].append(list(argv))
+        work_mount = next(
+            argv[index + 1] for index, value in enumerate(argv[:-1])
+            if value == "-v" and str(argv[index + 1]).endswith(":/w")
+        )
+        host_workdir = Path(work_mount.rsplit(":/w", 1)[0])
+        input_path = host_workdir / Path(argv[-1]).name
+        captured.setdefault("input_modes", []).append(
+            stat.S_IMODE(input_path.stat().st_mode)
+        )
+        captured.setdefault("inputs", []).append(json.loads(input_path.read_text()))
+        is_feedback = input_path.name == "feedback_input.json"
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                '__FEEDBACK_RESULT__{"detail": "ok"}\n'
+                if is_feedback else
+                '__VERIFY_RESULT__{"feasible": true, "raw": 3.0, "artifacts": {}}\n'
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(EV.subprocess, "run", fake_run)
+    ev = Evaluator(exec_backend={"image": "sha256:" + "b" * 64})
+    ev.versions.append(EV.VerifierVersion(
+        0,
+        "def verify(payload, ctx):\n"
+        "    return {'feasible': True, 'raw': 3.0, 'artifacts': {}}\n",
+        "t",
+    ))
+    result = ev.run({"seed": secret}, {"hidden_seed": secret})
+    feedback = ev.run_feedback(
+        {"seed": secret}, {"hidden_seed": secret},
+        {"feasible": True, "raw": 3.0, "artifacts": {}}, [],
+        feedback_src="def feedback(payload, ctx, verify_result, history):\n    return {'detail': 'ok'}\n",
+    )
+
+    assert result.feasible and result.raw == 3.0
+    assert feedback == {"detail": "ok"}
+    assert captured["input_modes"] == [0o600, 0o600]
+    assert captured["inputs"][0] == {
+        "payload": {"seed": secret},
+        "ctx": {"hidden_seed": secret},
+    }
+    assert captured["inputs"][1]["payload"] == {"seed": secret}
+    assert captured["inputs"][1]["ctx"] == {"hidden_seed": secret}
+    assert all(
+        secret not in str(arg) for argv in captured["calls"] for arg in argv
+    )
+    assert captured["calls"][0][-2:] == ["/w/verifier_mod.py", "/w/verify_input.json"]
+    assert captured["calls"][1][-2:] == ["/w/feedback_mod.py", "/w/feedback_input.json"]
 
 
 def test_manifest_records_both_resource_slices(tmp_path, monkeypatch):

@@ -43,6 +43,7 @@ from __future__ import annotations
 import difflib
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional, Protocol
@@ -58,7 +59,7 @@ from .container import (
     docker_unavailable,
     one_shot_agent,
 )
-from .eval_service import EvalService, FeedbackLevel
+from .eval_service import EvalService, FeedbackLevel, private_literal_variants
 from .human_sessions import SessionOutcome
 from .store import RunStore
 
@@ -687,7 +688,8 @@ class AgentSystem:
         self.eval_service = EvalService(
             evaluator=self.evaluator, ctx_provider=lambda: self._ctx,
             feedback_level=self.feedback_level, _eval_env=dict(self._llm_env()),
-            _verify_backend=self._verify_backend())
+            _verify_backend=self._verify_backend(),
+            private_literals=self._eval_private_literals())
         self.eval_service.on_query = lambda rec, res: self.store.query(_query_line(rec))
         self.store.verifier_version(0, bs.verifier_src, origin="agent",
                                     note="supervisor bootstrap", rationale=bs.notes[:400],
@@ -718,6 +720,25 @@ class AgentSystem:
             image=self.solver_image, gpus=_resources._as_gpus(self.solver_gpus))
         spec = spec.merge_overrides(solver=legacy)
         self.resource_spec = spec
+
+    def _eval_private_literals(self) -> tuple[str, ...]:
+        """Protected evaluator-error strings derived only from private run context."""
+
+        hidden_seed = self._ctx.get("hidden_seed") if isinstance(self._ctx, dict) else None
+        return private_literal_variants(hidden_seed) if isinstance(hidden_seed, str) else ()
+
+    def _apply_pinned_verifier_image(self) -> None:
+        """Opt in to an immutable verifier image only for manifests that bind one."""
+
+        manifest = _read_json(self.run_dir / "manifest.json", default={})
+        if not isinstance(manifest, dict) or "pinned_verifier_image_id" not in manifest:
+            return
+        pinned = manifest["pinned_verifier_image_id"]
+        if not isinstance(pinned, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", pinned) is None:
+            raise RuntimeError("pinned verifier image ID is malformed")
+        self.resource_spec = self.resource_spec.merge_overrides(
+            verifier=_resources.ContainerResources(image=pinned)
+        )
 
     def _apply_solver_env_fallback(self, solver_env: dict) -> None:
         """Fold the agent-authored solver_env.json as a LAST-RESORT into the solver slice.
@@ -1449,6 +1470,7 @@ class AgentSystem:
             self._ctx = {**self._ctx, "checker_dir": self._checker_dir}
         solver_env = _read_json(bws / "solver_env.json", default={})
         self._resolve_resources()
+        self._apply_pinned_verifier_image()
         self._apply_solver_env_fallback(solver_env if isinstance(solver_env, dict) else {})
         # Restore the cold admissibility policy (default no-proof if absent — old runs
         # predating reframe_policy.json stay in construction, which is the safe game).
@@ -1467,7 +1489,8 @@ class AgentSystem:
         self.eval_service = EvalService(
             evaluator=self.evaluator, ctx_provider=lambda: self._ctx,
             feedback_level=self.feedback_level, _eval_env=dict(self._llm_env()),
-            _verify_backend=self._verify_backend())
+            _verify_backend=self._verify_backend(),
+            private_literals=self._eval_private_literals())
         self.eval_service.on_query = lambda rec, res: self.store.query(_query_line(rec))
         self._recover_best_from_disk()
         self.store.event("resume", from_version=self.eval_service.current_version(),

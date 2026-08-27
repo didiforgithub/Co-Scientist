@@ -75,7 +75,9 @@ from typing import Optional
 MIN_RUNTIME_FOR_RESPAWN_S = 45.0   # died faster than this since last launch => systematic
 MAX_RESPAWNS = 100                 # backstop against a crash-loop (SForge uses 100)
 MIN_REMAINING_TO_RESPAWN_S = 90.0  # don't relaunch for a sliver of budget
-BATCH_SCHEMA_VERSION = 2
+BATCH_SCHEMA_VERSION = 3
+RUN_CONTRACT_SCHEMA_VERSION = 2
+FREEZE_VERIFIER_SCHEMA_VERSION = 3
 
 
 
@@ -217,6 +219,7 @@ class LaunchSpec:
     solver_reasoning_effort: Optional[str] = None
     feedback: str = "with_artifacts"
     solver_strength: str = "weak"
+    freeze_verifier: bool = False
 
 
 class Batch:
@@ -241,6 +244,7 @@ class Batch:
               solver_reasoning_effort: Optional[str] = None,
               feedback: str = "with_artifacts",
               solver_strength: str = "weak",
+              freeze_verifier: bool = False,
               dry_run: bool = False) -> list[LaunchSpec]:
         """Launch the FIRST WAVE and record the rest as pending (wave scheduling).
 
@@ -325,7 +329,8 @@ class Batch:
                 solver_reasoning_effort=(solver_identity or {}).get(
                     "reasoning_effort"),
                 feedback=feedback,
-                solver_strength=solver_strength))
+                solver_strength=solver_strength,
+                freeze_verifier=freeze_verifier))
 
         # -- idempotent resume: continue only an EXACT persisted launch contract. --
         if not dry_run and self.manifest_path.is_file():
@@ -335,7 +340,9 @@ class Batch:
                 cpu_mode=cpu_mode, extra_args=child_extra_args,
                 human_agent=human_agent, solver_identity=solver_identity,
                 context_root=context_root, inputs=resolved_inputs,
-                feedback=feedback, solver_strength=solver_strength)
+                feedback=feedback, solver_strength=solver_strength,
+                freeze_verifier=freeze_verifier)
+            self._verify_all_run_manifest_contracts(man)
             # Verify current bytes even if every child is still live: this makes an
             # idempotent start a useful fail-closed contract check of the whole batch.
             for spec in specs:
@@ -404,6 +411,7 @@ class Batch:
                     "inputs": [str(p) for p in resolved_inputs],
                     "feedback": feedback,
                     "solver_strength": solver_strength,
+                    "freeze_verifier": freeze_verifier,
                     "run_contracts": {
                         spec.run_id: {
                             "input_dir": str(spec.input_dir),
@@ -412,6 +420,7 @@ class Batch:
                                 if spec.human_proxy_context else None),
                             "human_proxy_context_sha256": (
                                 spec.human_proxy_context_sha256),
+                            "freeze_verifier": spec.freeze_verifier,
                         }
                         for spec in specs
                     },
@@ -492,6 +501,7 @@ class Batch:
             "solver_reasoning_effort": spec.solver_reasoning_effort,
             "feedback": spec.feedback,
             "solver_strength": spec.solver_strength,
+            "freeze_verifier": spec.freeze_verifier,
         }
 
     def _validate_resume_contract(
@@ -499,7 +509,7 @@ class Batch:
             pool: list[str], cpu_mode: bool, extra_args: list[str],
             human_agent: dict, solver_identity: Optional[dict[str, str]],
             context_root: Optional[Path], inputs: list[Path], feedback: str,
-            solver_strength: str) -> None:
+            solver_strength: str, freeze_verifier: bool) -> None:
         persisted_runs = man.get("runs", [])
         persisted_contexts = [
             {
@@ -537,6 +547,8 @@ class Batch:
             "feedback": (man.get("feedback", "with_artifacts"), feedback),
             "solver strength": (man.get("solver_strength", "weak"),
                                 solver_strength),
+            "freeze verifier": (bool(man.get("freeze_verifier", False)),
+                                bool(freeze_verifier)),
         }
         for name, (persisted, requested) in checks.items():
             if persisted != requested:
@@ -565,7 +577,8 @@ class Batch:
             solver_model=r.get("solver_model"),
             solver_reasoning_effort=r.get("solver_reasoning_effort"),
             feedback=r.get("feedback", "with_artifacts"),
-            solver_strength=r.get("solver_strength", "weak"))
+            solver_strength=r.get("solver_strength", "weak"),
+            freeze_verifier=bool(r.get("freeze_verifier", False)))
 
     def _verify_human_proxy_context(self, spec: LaunchSpec) -> None:
         context = spec.human_proxy_context
@@ -634,13 +647,23 @@ class Batch:
             raise ValueError(
                 f"batch manifest missing before spawn: {self.manifest_path}")
         man = self._read_manifest()
+        self._verify_run_manifest_contract(man, spec)
+
+    def _verify_all_run_manifest_contracts(self, man: Optional[dict] = None) -> None:
+        """Preflight every immutable run contract from one manifest snapshot."""
+        snapshot = self._read_manifest() if man is None else man
+        for record in snapshot.get("runs", []):
+            self._verify_run_manifest_contract(snapshot, self._spec_of(record))
+
+    def _verify_run_manifest_contract(self, man: dict, spec: LaunchSpec) -> None:
+        """Compare one reconstructed run against its batch and immutable contract."""
         record = next(
             (r for r in man.get("runs", []) if r.get("run_id") == spec.run_id), None)
         if record is None:
             raise ValueError(
                 f"spawn contract has no run record for {spec.run_id}")
         schema_version = int(man.get("schema_version", 1))
-        if schema_version < BATCH_SCHEMA_VERSION:
+        if schema_version < RUN_CONTRACT_SCHEMA_VERSION:
             has_legacy_hp = bool(man.get("human_proxy_context_dir")) or any(
                 r.get("human_proxy_context") or r.get("human_proxy_context_sha256")
                 for r in man.get("runs", []))
@@ -651,6 +674,10 @@ class Batch:
             if spec.human_proxy_context is not None or \
                     spec.human_proxy_context_sha256 is not None:
                 raise ValueError("legacy no-HP batch cannot spawn an HP run")
+            if spec.freeze_verifier or bool(record.get("freeze_verifier", False)):
+                raise ValueError(
+                    "legacy batch cannot spawn a frozen-verifier run without an "
+                    "independent run contract")
             if str(Path(record.get("input_dir", "")).resolve()) != str(spec.input_dir):
                 raise ValueError(
                     f"legacy run input contract mismatch for {spec.run_id}")
@@ -660,17 +687,22 @@ class Batch:
         if not isinstance(root_contract, dict):
             raise ValueError(
                 f"top-level run contract missing for {spec.run_id}")
+        root_contract = dict(root_contract)
+        root_contract["freeze_verifier"] = bool(
+            root_contract.get("freeze_verifier", False))
         record_contract = {
             "input_dir": str(Path(record.get("input_dir", "")).resolve()),
             "human_proxy_context": record.get("human_proxy_context"),
             "human_proxy_context_sha256": record.get(
                 "human_proxy_context_sha256"),
+            "freeze_verifier": bool(record.get("freeze_verifier", False)),
         }
         spec_contract = {
             "input_dir": str(spec.input_dir),
             "human_proxy_context": (
                 str(spec.human_proxy_context) if spec.human_proxy_context else None),
             "human_proxy_context_sha256": spec.human_proxy_context_sha256,
+            "freeze_verifier": spec.freeze_verifier,
         }
         if root_contract != record_contract or root_contract != spec_contract:
             raise ValueError(
@@ -705,6 +737,8 @@ class Batch:
                 man.get("feedback", "with_artifacts"), spec.feedback),
             "solver strength contract": (
                 man.get("solver_strength", "weak"), spec.solver_strength),
+            "freeze verifier contract": (
+                bool(man.get("freeze_verifier", False)), spec.freeze_verifier),
         }
         for name, (root_value, run_value) in checks.items():
             if root_value != run_value:
@@ -730,6 +764,8 @@ class Batch:
                 "--resume",
                 "--runs-dir", str(self.runs_dir),
                 "--run-id", spec.run_id]
+        if spec.freeze_verifier:
+            argv.append("--freeze-verifier")
         if spec.resource_config is not None:
             argv += ["--resource-config", str(spec.resource_config)]
         if cpu_mode:
@@ -812,6 +848,7 @@ class Batch:
         now = time.time() if now is None else now
         _reap_children()      # reap our exited children so _alive doesn't see zombies
         man = self._read_manifest()
+        self._verify_all_run_manifest_contracts(man)
         runs = man.get("runs", [])
         pool = man.get("gpu_devices", [str(i) for i in range(8)])
         python = man.get("python", sys.executable)
@@ -1050,13 +1087,33 @@ class Batch:
                 schema_version > BATCH_SCHEMA_VERSION:
             raise ValueError(
                 f"unsupported batch manifest schema_version: {schema_version!r}")
-        if schema_version >= BATCH_SCHEMA_VERSION:
+        if schema_version >= RUN_CONTRACT_SCHEMA_VERSION:
             contracts = man.get("run_contracts")
             run_ids = [r.get("run_id") for r in man["runs"]
                        if isinstance(r, dict)]
             if not isinstance(contracts, dict) or set(contracts) != set(run_ids):
                 raise ValueError(
                     "invalid batch manifest run_contracts: keys must exactly match runs")
+        if schema_version >= FREEZE_VERIFIER_SCHEMA_VERSION:
+            top_freeze = man.get("freeze_verifier")
+            if type(top_freeze) is not bool:
+                raise ValueError(
+                    "invalid schema-3 freeze_verifier: batch marker must be boolean")
+            for record in man["runs"]:
+                if not isinstance(record, dict):
+                    raise ValueError("invalid batch manifest run record")
+                run_id = record.get("run_id")
+                run_freeze = record.get("freeze_verifier")
+                contract = man["run_contracts"].get(run_id)
+                contract_freeze = (contract.get("freeze_verifier")
+                                   if isinstance(contract, dict) else None)
+                if type(run_freeze) is not bool or type(contract_freeze) is not bool:
+                    raise ValueError(
+                        "invalid schema-3 freeze_verifier: every run and run_contract "
+                        "marker must be boolean")
+                if not (top_freeze == run_freeze == contract_freeze):
+                    raise ValueError(
+                        f"schema-3 freeze_verifier contract mismatch for {run_id}")
         return man
 
 
@@ -1220,6 +1277,8 @@ def main(argv: Optional[list[str]] = None) -> None:
                     help="first-class evaluator disclosure level for every run")
     sp.add_argument("--solver-strength", default="weak", choices=["weak", "strong"],
                     help="first-class Solver topology for every run")
+    sp.add_argument("--freeze-verifier", action="store_true",
+                    help="keep the pre-seeded verifier fixed for every run")
     sp.add_argument("--dry-run", action="store_true",
                     help="print the first-wave argv (each with its --*-gpus device=N "
                          "pin) + the pending queue; spawn nothing, write no manifest")
@@ -1297,6 +1356,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                                 args.solver_reasoning_effort),
                             feedback=args.feedback,
                             solver_strength=args.solver_strength,
+                            freeze_verifier=args.freeze_verifier,
                             dry_run=args.dry_run)
         if args.dry_run:
             kind = (f"pool of {args.cpu_slots} CPU slot(s)" if cpu_mode
