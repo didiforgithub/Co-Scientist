@@ -698,6 +698,97 @@ def test_privacy_scanner_includes_live_launcher_batch_manifest(tmp_path):
         audit_privacy(runs, BATCH, seeds)
 
 
+def test_solver_workspace_symlinks_are_scanned_without_following_and_allow_replay(
+    tmp_path,
+):
+    accepted, controls, trusted, problems, seeds, runs = _prepared(tmp_path)
+
+    fft_ws = runs / f"{BATCH}__autolab_fft_rust/solver_ws"
+    fft_ws.mkdir()
+    (fft_ws / "app_link").symlink_to("/app")
+
+    router_ws = runs / f"{BATCH}__autolab_agent_tool_routing/solver_ws"
+    router_ws.mkdir()
+    (router_ws / "candidate_top5.py").write_text("# candidate\n", encoding="utf-8")
+    (router_ws / "retriever.py").symlink_to("candidate_top5.py")
+
+    kv_ws = runs / f"{BATCH}__autolab_concurrent_kv_wal/solver_ws/diag.test"
+    kv_ws.mkdir(parents=True)
+    (kv_ws / "go.mod").symlink_to("/app/go.mod")
+    (kv_ws / "index.go").symlink_to("/work/tablefirst_index.go")
+
+    privacy = audit_privacy(runs, BATCH, seeds)
+    assert privacy["status"] == "pass"
+    invariance = audit_invariance(
+        controls,
+        accepted,
+        trusted,
+        seeds,
+        runs,
+        BATCH,
+        problems_root=problems,
+        run_command=_image_inspect,
+    )
+    assert invariance["status"] == "pass"
+    replay = replay_results(
+        control_runs_root=controls,
+        accepted_root=accepted,
+        trusted_runs_root=trusted,
+        seed_dir=seeds,
+        runs_root=runs,
+        batch_name=BATCH,
+        problems_root=problems,
+        output=tmp_path / "symlink-replay-dry-run.json",
+        dry_run=True,
+        run_command=_image_inspect,
+    )
+    assert replay["status"] == "dry_run_pass"
+
+
+def test_solver_workspace_symlink_target_is_privacy_scanned(tmp_path):
+    _accepted, _controls, _trusted, _problems, seeds, runs = _prepared(tmp_path)
+    secret = (seeds / "autolab_fft_rust.seed").read_text().strip()
+    solver_ws = runs / f"{BATCH}__autolab_fft_rust/solver_ws"
+    solver_ws.mkdir()
+    (solver_ws / "leaking_link").symlink_to(f"/work/{secret}")
+
+    with pytest.raises(RuntimeError, match="private|seed|leak"):
+        audit_privacy(runs, BATCH, seeds)
+
+
+def test_contract_symlink_remains_fail_closed(tmp_path):
+    accepted, controls, trusted, problems, seeds, runs = _prepared(tmp_path)
+    run = runs / f"{BATCH}__autolab_fft_rust"
+    verifier = run / "bootstrap_ws/verifier.py"
+    verifier.unlink()
+    verifier.symlink_to(accepted / "old10/fft_rust/final_verifier.py")
+
+    with pytest.raises((RuntimeError, ValueError), match="symlink|regular|unsafe"):
+        audit_privacy(runs, BATCH, seeds)
+    with pytest.raises((RuntimeError, ValueError), match="symlink|regular|unsafe"):
+        audit_invariance(
+            controls,
+            accepted,
+            trusted,
+            seeds,
+            runs,
+            BATCH,
+            problems_root=problems,
+            run_command=_image_inspect,
+        )
+
+
+def test_solver_workspace_mountpoint_symlink_remains_fail_closed(tmp_path):
+    _accepted, _controls, _trusted, _problems, seeds, runs = _prepared(tmp_path)
+    run = runs / f"{BATCH}__autolab_fft_rust"
+    external = tmp_path / "external-workspace"
+    external.mkdir()
+    (run / "solver_ws").symlink_to(external, target_is_directory=True)
+
+    with pytest.raises((RuntimeError, ValueError), match="symlink|unsafe"):
+        audit_privacy(runs, BATCH, seeds)
+
+
 def test_solver_isolation_contract_and_refresh_exclude_private_state(tmp_path):
     summary = audit_solver_isolation_contract()
     assert summary["status"] == "pass"
@@ -1486,6 +1577,23 @@ def test_chunked_audit_seed_scan_detects_variant_across_chunk_boundary(tmp_path)
     leak.parent.mkdir(parents=True)
     prefix = b"x" * (1024 * 1024 - 7)
     leak.write_bytes(prefix + FINAL_REPLAY_AUDIT_SEED.encode("utf-8") + b"tail")
+
+    with pytest.raises(RuntimeError, match="audit seed|search"):
+        experiment._assert_audit_seed_absent(runs, BATCH)
+
+
+def test_audit_seed_scan_checks_solver_workspace_symlink_text_without_following(
+    tmp_path,
+):
+    from coscientist.experiments import autolab_ground_truth_solver_only as experiment
+    from coscientist.experiments.autolab_human_proxy import FINAL_REPLAY_AUDIT_SEED
+
+    _accepted, _controls, _trusted, _problems, _seeds, runs = _prepared(tmp_path)
+    solver_ws = runs / f"{BATCH}__autolab_fft_rust/solver_ws"
+    solver_ws.mkdir()
+    (solver_ws / "audit-seed-link").symlink_to(
+        f"/work/{FINAL_REPLAY_AUDIT_SEED}"
+    )
 
     with pytest.raises(RuntimeError, match="audit seed|search"):
         experiment._assert_audit_seed_absent(runs, BATCH)

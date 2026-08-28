@@ -742,6 +742,71 @@ def _scan_stable_regular_patterns(
     raise AssertionError("unreachable")
 
 
+def _read_symlink_snapshot_once(path: Path | str, *, label: str) -> bytes | None:
+    """Read a symlink's text without following it or accepting a mutable snapshot."""
+
+    lexical = Path(path)
+    safe_parent = _reject_symlink_components(lexical.parent)
+    safe_path = safe_parent / lexical.name
+    try:
+        before = os.lstat(safe_path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError(f"{label} could not be inspected safely: {safe_path}") from exc
+    if not stat.S_ISLNK(before.st_mode):
+        raise ValueError(f"{label} is not a symlink: {safe_path}")
+    try:
+        target = os.readlink(safe_path)
+        after = os.lstat(safe_path)
+    except FileNotFoundError as exc:
+        raise _SnapshotChanged(f"{label} disappeared during snapshot") from exc
+    except OSError as exc:
+        raise ValueError(f"{label} could not be read safely: {safe_path}") from exc
+    if _snapshot_identity(after) != _snapshot_identity(before):
+        raise _SnapshotChanged(f"{label} changed during snapshot read")
+    return os.fsencode(target)
+
+
+def _read_stable_symlink_target(path: Path | str, *, label: str) -> bytes | None:
+    for attempt in range(_SNAPSHOT_RETRIES):
+        try:
+            return _read_symlink_snapshot_once(path, label=label)
+        except _SnapshotChanged:
+            if attempt + 1 == _SNAPSHOT_RETRIES:
+                raise RuntimeError(f"{label} did not reach a stable snapshot") from None
+    raise AssertionError("unreachable")
+
+
+def _is_solver_workspace_entry(path: Path, run: Path) -> bool:
+    try:
+        relative = path.relative_to(run / "solver_ws")
+    except ValueError:
+        return False
+    # The solver_ws mount point itself remains a real directory.  Only entries the
+    # Solver created *inside* that directory may be no-follow symlinks.
+    return bool(relative.parts)
+
+
+def _audit_tree_entry_mode(path: Path, *, run: Path, label: str) -> int | None:
+    """Classify an audit entry while allowing only no-follow solver_ws symlinks."""
+
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(mode):
+        if not _is_solver_workspace_entry(path, run):
+            raise RuntimeError(f"{label} found a symlink outside solver_ws: {path}")
+        # Validate every parent component and take a stable no-follow snapshot of the
+        # link itself.  Consumers may inspect the returned target text, but must never
+        # dereference it on the host.
+        _read_stable_symlink_target(path, label=label)
+        return mode
+    _reject_symlink_components(path)
+    return mode
+
+
 def audit_privacy(
     runs_root: Path | str, batch_name: str, seed_dir: Path | str
 ) -> dict[str, Any]:
@@ -769,7 +834,9 @@ def audit_privacy(
     variants = {task: _privacy_variants(secret) for task, secret in values.items()}
     scanned_files = 0
 
-    def scan_file(path: Path, *, allowed_secret_owner: str | None = None) -> None:
+    def scan_entry(
+        path: Path, *, run: Path, allowed_secret_owner: str | None = None
+    ) -> None:
         nonlocal scanned_files
         seed_patterns = {
             variant
@@ -777,11 +844,26 @@ def audit_privacy(
             if owner != allowed_secret_owner
             for variant in owner_variants
         }
-        matched = _scan_stable_regular_patterns(
-            path,
-            patterns=path_literals | seed_patterns,
-            label="privacy audit file",
-        )
+        patterns = path_literals | seed_patterns
+        mode = _audit_tree_entry_mode(path, run=run, label="privacy audit entry")
+        if mode is None or stat.S_ISDIR(mode):
+            return
+        if stat.S_ISLNK(mode):
+            target = _read_stable_symlink_target(path, label="privacy audit symlink")
+            if target is None:
+                return
+            matched = next(
+                (pattern for pattern in patterns if pattern and pattern in target),
+                None,
+            )
+        elif stat.S_ISREG(mode):
+            matched = _scan_stable_regular_patterns(
+                path,
+                patterns=patterns,
+                label="privacy audit file",
+            )
+        else:
+            raise RuntimeError(f"privacy audit found unsafe entry: {path}")
         if matched is None and not os.path.lexists(path):
             return
         if matched in path_literals:
@@ -796,17 +878,9 @@ def audit_privacy(
             raise RuntimeError(f"privacy audit run missing: {task}")
         allowed_secret_path = run / "bootstrap_ws/ctx.json"
         for path in run.rglob("*"):
-            _reject_symlink_components(path)
-            try:
-                mode = os.lstat(path).st_mode
-            except FileNotFoundError:
-                continue
-            if stat.S_ISDIR(mode):
-                continue
-            if not stat.S_ISREG(mode):
-                raise RuntimeError(f"privacy audit found unsafe entry: {path}")
-            scan_file(
+            scan_entry(
                 path,
+                run=run,
                 allowed_secret_owner=(task if path == allowed_secret_path else None),
             )
     # The launcher creates ``runs_root/<batch>/batch.json`` after prelaunch.  It is
@@ -827,7 +901,7 @@ def audit_privacy(
                 continue
             if not stat.S_ISREG(mode):
                 raise RuntimeError(f"live launcher batch contains unsafe entry: {path}")
-            scan_file(path)
+            scan_entry(path, run=live_batch_root)
     return {
         "arm": ARM,
         "batch_name": batch_name,
@@ -1608,7 +1682,7 @@ def audit_invariance(
         if not run.is_dir():
             raise RuntimeError(f"invariance run is missing: {task}")
         for path in run.rglob("*"):
-            _reject_symlink_components(path)
+            _audit_tree_entry_mode(path, run=run, label="invariance audit entry")
         manifest = _read_json_object(run / "manifest.json", label="run manifest")
         _assert_no_human_config(manifest, label=f"run manifest {task}")
         for key, expected in _manifest(info).items():
@@ -1737,26 +1811,39 @@ def audit_invariance(
 
 def _assert_audit_seed_absent(runs_root: Path, batch_name: str) -> None:
     variants = _privacy_variants(FINAL_REPLAY_AUDIT_SEED)
-    roots = [_run(runs_root, batch_name, task) for task in _tasks()]
+    roots = [(_run(runs_root, batch_name, task), True) for task in _tasks()]
     batch_root = runs_root / batch_name
     if batch_root.exists():
-        roots.append(batch_root)
-    for root in roots:
+        roots.append((batch_root, False))
+    for root, allow_solver_links in roots:
         for path in root.rglob("*"):
-            _reject_symlink_components(path)
-            try:
-                mode = os.lstat(path).st_mode
-            except FileNotFoundError:
+            mode = _audit_tree_entry_mode(
+                path,
+                run=(root if allow_solver_links else root / "__no_solver_workspace__"),
+                label="search-time artifact",
+            )
+            if mode is None:
                 continue
             if stat.S_ISDIR(mode):
                 continue
-            if not stat.S_ISREG(mode):
+            if stat.S_ISLNK(mode):
+                target = _read_stable_symlink_target(
+                    path, label="search-time symlink"
+                )
+                if target is None:
+                    continue
+                matched = next(
+                    (variant for variant in variants if variant and variant in target),
+                    None,
+                )
+            elif stat.S_ISREG(mode):
+                matched = _scan_stable_regular_patterns(
+                    path,
+                    patterns=variants,
+                    label="search-time artifact",
+                )
+            else:
                 raise RuntimeError(f"search-time artifact is unsafe: {path}")
-            matched = _scan_stable_regular_patterns(
-                path,
-                patterns=variants,
-                label="search-time artifact",
-            )
             if matched is not None:
                 raise RuntimeError(
                     "held-out audit seed leaked into a search-time artifact"
