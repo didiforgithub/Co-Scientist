@@ -269,7 +269,12 @@ ceiling and the solver should push the construction further, not abandon it.{ref
 
 Decide and write into /work:
 
-1. `verdict.json` — {{"gaming": bool, "reasoning": "..."}}.
+1. `verdict.json` — {{"gaming": bool, "ask_human": bool, "reasoning": "..."}}.
+   Set `ask_human` to true ONLY when this proposed change needs external human/proxy
+   calibration (for example an ambiguous contract, a high-impact mode change, or
+   evidence that you cannot resolve from the bounded run artifacts). Routine anti-gaming
+   hardening with a clear contract should set it to false. Omitting it is equivalent to
+   false for backwards compatibility.
 
 2. If you change the verifier, write `verifier.py` — same contract as before:
    def verify(payload, ctx) -> {{"feasible","raw","artifacts"}}, stdlib-only, robust to
@@ -1159,13 +1164,20 @@ class AgentSystem:
                               reasoning=str(verdict.get("reasoning", ""))[:400])
             return
 
-        # The proposal is valid but not yet installed.  A configured Human Session
-        # freezes the evaluator at its current version while the expert inspects the
-        # exact source/diff and talks to the evidence agent.  Only an explicit final
-        # `approve` installs this proposal; guidance/rejection is persisted for the
-        # next Supervisor attempt.  Once a Human/Proxy port is configured, an absent
-        # response (including an exhausted five-session budget) is not approval.
-        if self.human_port is not None:
+        # The proposal is valid. Human/Proxy consultation is an explicit Supervisor
+        # decision, not an automatic gate on every harden. Routine, well-understood
+        # anti-gaming fixes can install autonomously; ambiguous/high-impact changes
+        # request review by setting verdict.json["ask_human"] = true. An absent field
+        # is false so old Supervisor outputs remain autonomous rather than silently
+        # consuming scarce Human Proxy sessions.
+        # Require a JSON boolean, not a truthy string such as "false".
+        ask_human = verdict.get("ask_human") is True
+        self.store.event(
+            "supervisor_human_decision",
+            requested=ask_human,
+            reason="verdict.ask_human" if ask_human else "not_requested",
+        )
+        if self.human_port is not None and ask_human:
             current_source = svc.current_source()
             proposal_diff = "".join(
                 difflib.unified_diff(

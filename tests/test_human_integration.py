@@ -142,7 +142,8 @@ def test_nonapproved_human_verdict_holds_valid_verifier_change(tmp_path, decisio
     system = _system_with_live_v0(tmp_path, human_port=port)
 
     system._apply_harden(
-        _proposal(tmp_path), trigger="proactive", verdict={"gaming": True}
+        _proposal(tmp_path), trigger="proactive",
+        verdict={"gaming": True, "ask_human": True}
     )
 
     assert system.eval_service.current_version() == 0
@@ -173,7 +174,8 @@ def test_explicit_human_approval_installs_change_only_after_consult_returns(tmp_
 
     system.human_port = ApprovingPort()
     system._apply_harden(
-        _proposal(tmp_path), trigger="proactive", verdict={"gaming": True}
+        _proposal(tmp_path), trigger="proactive",
+        verdict={"gaming": True, "ask_human": True}
     )
 
     assert seen_versions == [0], "evaluator must remain frozen while the session is open"
@@ -185,11 +187,32 @@ def test_configured_human_mode_holds_change_when_no_approval_is_available(tmp_pa
     system = _system_with_live_v0(tmp_path, human_port=FakeHumanPort([None]))
 
     system._apply_harden(
-        _proposal(tmp_path), trigger="budget_exhausted", verdict={"gaming": True}
+        _proposal(tmp_path), trigger="budget_exhausted",
+        verdict={"gaming": True, "ask_human": True}
     )
 
     assert system.eval_service.current_version() == 0
     assert system.hardenings == 0
+
+
+def test_configured_human_mode_is_autonomous_when_supervisor_does_not_ask(tmp_path):
+    port = FakeHumanPort([SessionOutcome(decision="reject")])
+    system = _system_with_live_v0(tmp_path, human_port=port)
+
+    system._apply_harden(
+        _proposal(tmp_path), trigger="proactive", verdict={"gaming": True}
+    )
+
+    assert system.eval_service.current_version() == 1
+    assert system.hardenings == 1
+    assert port.calls == []
+    events = [json.loads(line) for line in
+              (system.run_dir / "events.jsonl").read_text().splitlines()]
+    assert any(
+        e["kind"] == "supervisor_human_decision"
+        and e["requested"] is False
+        for e in events
+    )
 
 
 def test_disabled_human_mode_preserves_autonomous_install_behavior(tmp_path):
