@@ -44,7 +44,7 @@ class DshSolver(CodexSolver):
         # DSH selects its model through its profile/configuration. The model
         # field remains part of the shared Solver API but is intentionally not
         # translated into an undocumented CLI flag.
-        argv = [self.binary, "--profile", "headless", "--json", "-"]
+        argv = [self.binary, "--profile", "headless", "-"]
         timeout = max(1.0, ctx.deadline.remaining())
         if ctx.store is not None:
             ctx.store.event("dsh_launch", timeout_s=round(timeout, 1), profile="headless")

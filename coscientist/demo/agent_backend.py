@@ -93,7 +93,7 @@ class DshBackend:
     def run_session(self, *, workspace: Path, prompt: str, model: Optional[str], timeout_s: float) -> SessionResult:
         # DSH resolves the agent cwd from the process cwd. Feed the task on
         # stdin so prompts containing shell-like tokens are never re-parsed.
-        argv = [self.binary, "--profile", self.profile, "--json", "-"]
+        argv = [self.binary, "--profile", self.profile, "-"]
         return _run_cli(argv, cwd=workspace, prompt=prompt, timeout_s=timeout_s)
 
 
