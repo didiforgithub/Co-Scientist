@@ -18,8 +18,8 @@ from .codex_solver import CodexSolver
 class DshSolver(CodexSolver):
     """Drive ``dsh --profile headless`` in the existing Solver workspace."""
 
-    name = "dsh"
-    binary = "dsh"
+    name: str = "dsh"
+    binary: str = "dsh"
 
     def _available(self):
         if shutil.which(self.binary) is None:
