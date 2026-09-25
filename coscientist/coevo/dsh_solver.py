@@ -46,12 +46,12 @@ class DshSolver(CodexSolver):
         # field remains part of the shared Solver API but is intentionally not
         # translated into an undocumented CLI flag.
         binary = shutil.which(self.binary) or str(Path.home() / ".local" / "bin" / self.binary)
-        argv = [binary, "--profile", "headless", "-"]
+        argv = [binary, "--profile", "headless", "--", self._prompt()]
         timeout = max(1.0, ctx.deadline.remaining())
         if ctx.store is not None:
             ctx.store.event("dsh_launch", timeout_s=round(timeout, 1), profile="headless")
         try:
-            proc = subprocess.run(argv, cwd=str(ws), input=self._prompt(), env=env,
+            proc = subprocess.run(argv, cwd=str(ws), env=env,
                                   capture_output=True, text=True, timeout=timeout)
             self._note = (proc.stdout or "")[-400:] if proc.returncode == 0 \
                 else (proc.stderr or "dsh nonzero")[-400:]

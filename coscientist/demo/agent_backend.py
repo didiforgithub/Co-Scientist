@@ -91,10 +91,10 @@ class DshBackend:
     profile: str = "headless"
 
     def run_session(self, *, workspace: Path, prompt: str, model: Optional[str], timeout_s: float) -> SessionResult:
-        # DSH resolves the agent cwd from the process cwd. Feed the task on
-        # stdin so prompts containing shell-like tokens are never re-parsed.
+        # Released DSH accepts a positional task, not a stdin sentinel.
+        # Pass one argv element so shell-like tokens remain literal.
         binary = shutil.which(self.binary) or str(Path.home() / ".local" / "bin" / self.binary)
-        argv = [binary, "--profile", self.profile, "-"]
+        argv = [binary, "--profile", self.profile, "--", prompt]
         return _run_cli(argv, cwd=workspace, prompt=prompt, timeout_s=timeout_s)
 
 
