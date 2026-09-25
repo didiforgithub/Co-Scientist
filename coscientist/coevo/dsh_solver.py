@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 
 from .codex_solver import CodexSolver
 
@@ -22,7 +23,7 @@ class DshSolver(CodexSolver):
     binary: str = "dsh"
 
     def _available(self):
-        if shutil.which(self.binary) is None:
+        if shutil.which(self.binary) is None and not (Path.home() / ".local" / "bin" / self.binary).is_file():
             return f"DSH CLI not found on PATH ({self.binary!r})"
         if self.gateway is None:
             return "no gateway wired to DshSolver"
@@ -44,7 +45,8 @@ class DshSolver(CodexSolver):
         # DSH selects its model through its profile/configuration. The model
         # field remains part of the shared Solver API but is intentionally not
         # translated into an undocumented CLI flag.
-        argv = [self.binary, "--profile", "headless", "-"]
+        binary = shutil.which(self.binary) or str(Path.home() / ".local" / "bin" / self.binary)
+        argv = [binary, "--profile", "headless", "-"]
         timeout = max(1.0, ctx.deadline.remaining())
         if ctx.store is not None:
             ctx.store.event("dsh_launch", timeout_s=round(timeout, 1), profile="headless")
