@@ -17,9 +17,15 @@ def main():
   if 'cache_dir / "extensions"' not in s: s=s.replace(needle,needle+'            (cache_dir / "extensions").mkdir(mode=0o777)\n',1); v.write_text(s)
  docker='/mdata/zhangjiayi/cosci-h200-runtime/bin/docker'; end=time.time()+a.hours*3600; best=None; best_score=float('-inf'); gen=0
  def ev(ws):
-  q=subprocess.run([docker,'run','--rm','--gpus',f'device={a.gpu}','-v',f'{ws}:/work','-w','/work','cosci-k16-h200:20260907','python3','/work/run_verify.py','/work/solution_out.json'],capture_output=True,text=True,timeout=3500,env={**os.environ,'DOCKER_HOST':'unix:///var/run/cosci-h200-docker.sock'}); lines=q.stdout.strip().splitlines()
-  try:return json.loads(lines[-1])
-  except:return {'raw':None,'feasible':False,'error':(q.stderr or q.stdout)[-1000:]}
+  q=subprocess.run([docker,"run","--rm","--gpus",f"device={a.gpu}","-v",f"{ws}:/work","-w","/work","cosci-k16-h200:20260907","python3","/work/run_verify.py","/work/solution_out.json"],capture_output=True,text=True,timeout=3500,env={**os.environ,"DOCKER_HOST":"unix:///var/run/cosci-h200-docker.sock"}); out_text=q.stdout.strip()
+  try:
+   return json.loads(out_text)
+  except Exception:
+   decoder=json.JSONDecoder()
+   for pos in [j for j,c in enumerate(out_text) if c==chr(123)]:
+    try: return decoder.raw_decode(out_text[pos:])[0]
+    except Exception: pass
+   return {"raw":None,"feasible":False,"error":(q.stderr or q.stdout)[-1000:]}
  while time.time()<end-20:
   gen+=1; cand=[]
   for i in range(a.agents):
