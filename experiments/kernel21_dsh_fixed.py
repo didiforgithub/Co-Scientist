@@ -9,7 +9,7 @@ def main():
   for x in src.iterdir():
    if x.name=='__pycache__': continue
    (shutil.copytree if x.is_dir() else shutil.copy2)(x,run/x.name,dirs_exist_ok=True) if x.is_dir() else shutil.copy2(x,run/x.name)
-  seed=next(Path(a.run_root).parent.joinpath('20260922_kernel21_search42_r1/runs').glob(f'*__gt__{a.task}/bootstrap_ws/seed_solution.json'))
+  seed=next(Path(a.evaluator_root).parents[2].joinpath('20260922_kernel21_search42_r1/runs').glob(f'*__gt__{a.task}/bootstrap_ws/seed_solution.json'))
   shutil.copy2(seed,run/'solution_out.json')
   v=run/'verifier.py'; s=v.read_text(); needle='            cache_dir.mkdir(mode=0o777)\n';
   if 'cache_dir / "extensions"' not in s: s=s.replace(needle,needle+'            (cache_dir / "extensions").mkdir(mode=0o777)\n',1); v.write_text(s)
