@@ -57,6 +57,9 @@ def _make_solver(name: str):
     if name == "codex":
         from .codex_solver import CodexSolver
         return CodexSolver()
+    if name == "dsh":
+        from .dsh_solver import DshSolver
+        return DshSolver()
     raise ValueError(f"unknown solver: {name!r}")
 
 
@@ -320,7 +323,7 @@ def run_agent_system(args) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Co-Scientist coevo — target multi-agent system")
-    ap.add_argument("--solver", default="stub", choices=["stub", "none", "no-agent", "codex"],
+    ap.add_argument("--solver", default="stub", choices=["stub", "none", "no-agent", "codex", "dsh"],
                     help="solver logic (default: stub, offline & deterministic)")
     ap.add_argument("--supervisor", default="no-human-no-proxy",
                     choices=["no-human-no-proxy", "none", "proxy", "human"],

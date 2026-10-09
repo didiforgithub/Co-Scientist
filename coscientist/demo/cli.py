@@ -109,7 +109,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Co-Scientist two-loop co-evolution demo")
     ap.add_argument("--agent", default="stub",
                     choices=["stub", "none", "no-agent", "codex", "claude", "claude-code",
-                             "harbor", "harbor-claude", "harbor-claude-code", "harbor-codex"],
+                             "harbor", "harbor-claude", "harbor-claude-code", "harbor-codex", "dsh"],
                     help="proposer backend for BOTH loops (default: stub, offline). "
                          "harbor* backends run each session in a container (needs docker+harbor).")
     ap.add_argument("--isolation", default="separate", choices=["separate", "shared"],

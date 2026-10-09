@@ -83,6 +83,22 @@ class CodexBackend:
 
 
 @dataclass
+class DshBackend:
+    """Run DeepSeek Harness in its one-shot headless profile."""
+
+    binary: str = "dsh"
+    name: str = "dsh"
+    profile: str = "headless"
+
+    def run_session(self, *, workspace: Path, prompt: str, model: Optional[str], timeout_s: float) -> SessionResult:
+        # Released DSH accepts a positional task, not a stdin sentinel.
+        # Pass one argv element so shell-like tokens remain literal.
+        binary = shutil.which(self.binary) or str(Path.home() / ".local" / "bin" / self.binary)
+        argv = [binary, "--profile", self.profile, "--", prompt]
+        return _run_cli(argv, cwd=workspace, prompt=prompt, timeout_s=timeout_s)
+
+
+@dataclass
 class ClaudeCodeBackend:
     binary: str = "claude"
     name: str = "claude-code"
@@ -234,6 +250,8 @@ def make_backend(
         return StubBackend(handlers=handlers)
     if name == "codex":
         return CodexBackend()
+    if name == "dsh":
+        return DshBackend()
     if name in ("claude", "claude-code"):
         return ClaudeCodeBackend()
     if name in ("harbor", "harbor-claude", "harbor-claude-code"):
